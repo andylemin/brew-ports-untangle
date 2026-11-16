@@ -1,0 +1,4 @@
+Name     Selected   Options
+====     ========   =======
+python3  python312  none python311 python312
+gcc      none       mp-gcc14 none
