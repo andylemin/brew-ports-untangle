@@ -1,0 +1,21 @@
+# Local planning documents, never published
+.roo/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Build and release artifacts
+dist/
+build/
+*.pyz
+
+# macOS
+.DS_Store
+
+# Editor and tool state
+.vscode/
+.idea/
