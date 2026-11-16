@@ -1,0 +1,10 @@
+{
+  "metadata": {
+    "type": "org.macports/snapshot/v1",
+    "created": "2026-11-13 10:00:00",
+    "note": "brew-ports RUN"
+  },
+  "ports": [
+    {"name": "curl", "requested": true, "state": "installed", "variants": "+ssl", "requested_variants": "+ssl"}
+  ]
+}
