@@ -1,0 +1,48 @@
+{
+  "arch": "arm64",
+  "built_on": {
+    "os": "Macintosh",
+    "os_version": "macOS 15"
+  },
+  "homebrew_version": "4.5.10",
+  "installed_as_dependency": false,
+  "installed_on_request": true,
+  "loaded_from_api": false,
+  "runtime_dependencies": {},
+  "source": {
+    "path": "/Users/alice/Library/Caches/Homebrew/api-source/Homebrew/homebrew-cask/0000/Cask/docker-desktop.rb",
+    "tap": "homebrew/cask",
+    "tap_git_head": null,
+    "version": "4.43.2,199162"
+  },
+  "time": 1752860591,
+  "uninstall_artifacts": [
+    {
+      "uninstall": [
+        {
+          "delete": [
+            "/Library/PrivilegedHelperTools/com.docker.socket"
+          ],
+          "launchctl": [
+            "com.docker.helper"
+          ],
+          "quit": "com.docker.docker"
+        }
+      ]
+    },
+    {
+      "app": [
+        "Docker.app"
+      ]
+    },
+    {
+      "binary": [
+        "/Applications/Docker.app/Contents/Resources/bin/docker",
+        {
+          "target": "/usr/local/bin/docker"
+        }
+      ]
+    }
+  ],
+  "uninstall_flight_blocks": true
+}

@@ -1,0 +1,46 @@
+{
+  "aliases": [],
+  "arch": "arm64",
+  "built_as_bottle": true,
+  "built_on": {
+    "clt": "26.3.0.0.1.1771626560",
+    "cpu_family": "dunno",
+    "os": "Macintosh",
+    "os_version": "macOS 15.7",
+    "preferred_perl": "5.34",
+    "xcode": "26.3"
+  },
+  "changed_files": [],
+  "compiler": "clang",
+  "homebrew_version": "6.0.2-120-g67cbed1",
+  "installed_on_request": true,
+  "loaded_from_api": true,
+  "loaded_from_internal_api": true,
+  "poured_from_bottle": true,
+  "runtime_dependencies": [
+    {
+      "bottle_rebuild": 0,
+      "declared_directly": true,
+      "full_name": "oniguruma",
+      "pkg_version": "6.9.10",
+      "revision": 0,
+      "version": "6.9.10"
+    }
+  ],
+  "source": {
+    "path": "/Users/alice/Library/Caches/Homebrew/api/internal/packages.arm64_sequoia.jws.json",
+    "spec": "stable",
+    "tap": "homebrew/core",
+    "tap_git_head": null,
+    "versions": {
+      "compatibility_version": null,
+      "head": null,
+      "stable": "1.8.2",
+      "version_scheme": 0
+    }
+  },
+  "source_modified_time": 1781962615,
+  "time": 1784608824,
+  "unused_options": [],
+  "used_options": []
+}

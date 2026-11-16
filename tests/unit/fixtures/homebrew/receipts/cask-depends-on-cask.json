@@ -1,0 +1,43 @@
+{
+  "arch": "arm64",
+  "built_on": {
+    "os": "Macintosh",
+    "os_version": "macOS 26"
+  },
+  "homebrew_version": "7.0.11",
+  "installed_on_request": true,
+  "loaded_from_api": true,
+  "loaded_from_internal_api": true,
+  "runtime_dependencies": {
+    "cask": [
+      {
+        "declared_directly": true,
+        "full_name": "macfuse-like",
+        "version": "1.2.7"
+      }
+    ],
+    "formula": [
+      {
+        "declared_directly": true,
+        "full_name": "libfido2",
+        "pkg_version": "1.16.0",
+        "version": "1.16.0"
+      }
+    ]
+  },
+  "source": {
+    "path": "/Users/alice/Library/Caches/Homebrew/api/cask.jws.json",
+    "tap": "alice/casks",
+    "tap_git_head": null,
+    "version": "2.0"
+  },
+  "time": 1784608824,
+  "uninstall_artifacts": [
+    {
+      "app": [
+        "Sshfs Helper.app"
+      ]
+    }
+  ],
+  "uninstall_flight_blocks": false
+}

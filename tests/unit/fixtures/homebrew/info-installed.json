@@ -1,0 +1,99 @@
+{
+  "formulae": [
+    {
+      "name": "jq", "full_name": "jq", "tap": "homebrew/core", "oldnames": [], "aliases": [],
+      "homepage": "https://jqlang.org/", "desc": "Lightweight and flexible command-line JSON processor",
+      "dependencies": ["oniguruma"], "keg_only": false,
+      "installed": [{"version": "1.8.2", "installed_on_request": true, "poured_from_bottle": true,
+                     "runtime_dependencies": [{"full_name": "oniguruma", "version": "6.9.10", "declared_directly": true}]}],
+      "linked_keg": "1.8.2", "pinned": false, "outdated": false, "deprecated": false, "disabled": false
+    },
+    {
+      "name": "oniguruma", "full_name": "oniguruma", "tap": "homebrew/core", "oldnames": [], "aliases": [],
+      "homepage": "https://github.com/kkos/oniguruma", "desc": "Regular expressions library",
+      "dependencies": [], "keg_only": false,
+      "installed": [{"version": "6.9.10", "installed_on_request": false, "poured_from_bottle": true, "runtime_dependencies": []}],
+      "linked_keg": "6.9.10", "pinned": false, "outdated": false, "deprecated": false, "disabled": false
+    },
+    {
+      "name": "wget", "full_name": "wget", "tap": "homebrew/core", "oldnames": [], "aliases": [],
+      "homepage": "https://www.gnu.org/software/wget/", "desc": "Internet file retriever",
+      "dependencies": ["libidn2", "openssl@3"], "keg_only": false,
+      "installed": [{"version": "1.24.5"}, {"version": "1.25.0_2", "installed_on_request": true}],
+      "linked_keg": "1.25.0_2", "pinned": true, "outdated": true, "deprecated": false, "disabled": false
+    },
+    {
+      "name": "postgresql@16", "full_name": "postgresql@16", "tap": "homebrew/core", "oldnames": [], "aliases": [],
+      "homepage": "https://www.postgresql.org/", "desc": "Object-relational database system",
+      "dependencies": [], "keg_only": true,
+      "installed": [{"version": "16.10", "installed_on_request": true}],
+      "linked_keg": null, "pinned": false, "outdated": false, "deprecated": false, "disabled": false
+    },
+    {
+      "name": "gitea-runner", "full_name": "gitea-runner", "tap": "homebrew/core", "oldnames": ["act_runner"], "aliases": [],
+      "homepage": "https://gitea.com/gitea/act_runner", "desc": "Action runner for Gitea",
+      "dependencies": [], "keg_only": false,
+      "installed": [],
+      "linked_keg": null, "pinned": false, "outdated": false, "deprecated": false, "disabled": false
+    },
+    {
+      "name": "libfido2", "full_name": "libfido2", "tap": "homebrew/core", "oldnames": [], "aliases": [],
+      "homepage": "https://developers.yubico.com/libfido2/", "desc": "Provides library functionality for FIDO U2F & FIDO 2.0",
+      "dependencies": [], "keg_only": false,
+      "installed": [{"version": "1.16.0", "installed_on_request": false}],
+      "linked_keg": "1.16.0", "pinned": false, "outdated": false, "deprecated": false, "disabled": false
+    },
+    {
+      "name": "unrelated", "full_name": "unrelated", "tap": "homebrew/core", "oldnames": [], "aliases": [],
+      "installed": [], "linked_keg": null, "keg_only": false
+    }
+  ],
+  "casks": [
+    {
+      "token": "docker-desktop", "full_token": "docker-desktop", "old_tokens": ["docker"], "tap": "homebrew/cask",
+      "homepage": "https://www.docker.com/products/docker-desktop", "desc": "App to build and share containerised applications",
+      "installed": "4.43.2,199162", "auto_updates": true, "pinned": false, "outdated": false,
+      "deprecated": false, "disabled": false, "depends_on": {"macos": {">=": ["14"]}},
+      "artifacts": [
+        {"uninstall": [{"delete": ["/Library/PrivilegedHelperTools/com.docker.socket"], "launchctl": ["com.docker.helper"], "quit": "com.docker.docker"}]},
+        {"app": ["Docker.app"], "target": "@APPDIR@/Docker.app"},
+        {"binary": ["@APPDIR@/Docker.app/Contents/Resources/bin/docker", {"target": "@PREFIX@/bin/docker"}], "target": "@PREFIX@/bin/docker"},
+        {"postflight_steps": [{"steps": []}]}
+      ]
+    },
+    {
+      "token": "appcleaner", "full_token": "appcleaner", "old_tokens": [], "tap": "homebrew/cask",
+      "homepage": "https://freemacsoft.net/appcleaner/", "desc": "Application uninstaller",
+      "installed": "3.7", "auto_updates": true, "outdated": false, "depends_on": {},
+      "artifacts": [
+        {"uninstall": [{"launchctl": "net.freemacsoft.AppCleaner-SmartDelete", "quit": "net.freemacsoft.AppCleaner"}]},
+        {"app": ["AppCleaner.app"], "target": "@APPDIR@/AppCleaner.app"}
+      ]
+    },
+    {
+      "token": "0-ad", "full_token": "0-ad", "old_tokens": [], "tap": "homebrew/cask",
+      "homepage": "https://play0ad.com/", "desc": "Real-time strategy game",
+      "installed": "0.28.0", "auto_updates": null, "outdated": false, "depends_on": {},
+      "artifacts": [{"app": ["0 A.D..app"], "target": "@APPDIR@/0 A.D..app"}]
+    },
+    {
+      "token": "aptible", "full_token": "aptible", "old_tokens": [], "tap": "homebrew/cask",
+      "homepage": "https://www.aptible.com/", "desc": "Command-line tool for Aptible Deploy",
+      "installed": "1.0.7", "auto_updates": null, "outdated": false, "depends_on": {"formula": ["libfido2"]},
+      "artifacts": [{"uninstall": [{"pkgutil": "com.aptible.toolbelt"}]}, {"pkg": ["aptible-cli.pkg"]}]
+    },
+    {
+      "token": "sshfs-helper", "full_token": "alice/casks/sshfs-helper", "old_tokens": [], "tap": "alice/casks",
+      "homepage": "https://example.com/sshfs-helper", "desc": "Mount remote folders",
+      "installed": "2.0", "auto_updates": false, "outdated": false, "depends_on": {"cask": ["alice/casks/macfuse-like"]},
+      "artifacts": [{"app": ["Sshfs Helper.app"], "target": "@APPDIR@/Sshfs Helper.app"}, {"preflight": null}]
+    },
+    {
+      "token": "macfuse-like", "full_token": "alice/casks/macfuse-like", "old_tokens": [], "tap": "alice/casks",
+      "homepage": "https://example.com/macfuse-like", "desc": "File system extensions",
+      "installed": "1.2.7", "auto_updates": false, "outdated": false, "depends_on": {},
+      "artifacts": [{"uninstall": [{"kext": "io.example.filesystems", "launchctl": "io.example.fs.agent"}]},
+                    {"postflight, uninstall_postflight": null}]
+    }
+  ]
+}

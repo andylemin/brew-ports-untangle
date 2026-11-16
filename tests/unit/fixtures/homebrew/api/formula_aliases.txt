@@ -1,0 +1,4 @@
+gsed|gnu-sed
+openssl|openssl@3
+openssl@3.5|openssl@3
+rg|ripgrep

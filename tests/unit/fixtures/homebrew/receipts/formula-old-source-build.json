@@ -1,0 +1,22 @@
+{
+  "arch": "x86_64",
+  "built_as_bottle": false,
+  "built_on": {
+    "os": "Macintosh",
+    "os_version": "macOS 12.6"
+  },
+  "homebrew_version": "3.6.0",
+  "poured_from_bottle": false,
+  "runtime_dependencies": [
+    {
+      "full_name": "alice/tools/libfoo",
+      "version": "2.0"
+    }
+  ],
+  "source": {
+    "path": "/usr/local/Homebrew/Library/Taps/alice/homebrew-tools/Formula/cython.rb",
+    "spec": "stable",
+    "tap": "alice/tools"
+  },
+  "time": 1662000000
+}

@@ -1,0 +1,4 @@
+gnu-sed:gsed
+jq:jq
+ripgrep:rg
+wget:wget
