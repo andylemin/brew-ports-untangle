@@ -1,0 +1,12 @@
+{
+  "tag_name": "v2.12.7",
+  "name": "MacPorts 2.12.7",
+  "assets": [
+    {"name": "MacPorts-2.12.7.tar.bz2", "browser_download_url": "https://github.com/macports/macports-base/releases/download/v2.12.7/MacPorts-2.12.7.tar.bz2"},
+    {"name": "MacPorts-2.12.7-15-Sequoia.pkg", "browser_download_url": "https://github.com/macports/macports-base/releases/download/v2.12.7/MacPorts-2.12.7-15-Sequoia.pkg"},
+    {"name": "MacPorts-2.12.7-15-Sequoia.pkg.asc", "browser_download_url": "https://github.com/macports/macports-base/releases/download/v2.12.7/MacPorts-2.12.7-15-Sequoia.pkg.asc"},
+    {"name": "MacPorts-2.12.7-26-Tahoe.pkg.asc", "browser_download_url": "https://github.com/macports/macports-base/releases/download/v2.12.7/MacPorts-2.12.7-26-Tahoe.pkg.asc"},
+    {"name": "MacPorts-2.12.7-26-Tahoe.pkg", "browser_download_url": "https://github.com/macports/macports-base/releases/download/v2.12.7/MacPorts-2.12.7-26-Tahoe.pkg"},
+    {"name": "MacPorts-2.12.7-27-GoldenGate.pkg", "browser_download_url": "https://example.com/mirror/MacPorts-2.12.7-27-GoldenGate.pkg"}
+  ]
+}

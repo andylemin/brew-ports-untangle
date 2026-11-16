@@ -1,0 +1,23 @@
+Package "MacPorts-2.12.7-26-Tahoe.pkg":
+   Status: signed by a developer certificate issued by Apple for distribution
+   Notarization: trusted by the Apple notary service
+   Signed with a trusted timestamp on: 2025-08-03 11:04:12 +0000
+   Certificate Chain:
+    1. Developer ID Installer: Joshua Root (QTA3A3B7F3)
+       Expires: 2027-02-01 22:12:15 +0000
+       SHA256 Fingerprint:
+           00 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF 00 11 22 33 44 55
+           66 77 88 99 AA BB CC DD EE FF
+       ------------------------------------------------------------------------
+    2. Developer ID Certification Authority
+       Expires: 2031-09-17 00:00:00 +0000
+       SHA256 Fingerprint:
+           10 21 32 43 54 65 76 87 98 A9 BA CB DC ED FE 0F 10 21 32 43 54 65
+           76 87 98 A9 BA CB DC ED FE 0F
+       ------------------------------------------------------------------------
+    3. Apple Root CA
+       Expires: 2035-02-09 21:40:36 +0000
+       SHA256 Fingerprint:
+           20 31 42 53 64 75 86 97 A8 B9 CA DB EC FD 0E 1F 20 31 42 53 64 75
+           86 97 A8 B9 CA DB EC FD 0E 1F
+
