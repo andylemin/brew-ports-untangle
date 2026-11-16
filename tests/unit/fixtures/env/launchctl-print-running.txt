@@ -1,0 +1,53 @@
+<DOMAIN>/<LABEL> = {
+	active count = 1
+	path = <PLIST>
+	type = LaunchAgent
+	state = running
+
+	program = <PROGRAM>
+	arguments = {
+		<PROGRAM>
+		--datadir=<DATADIR>
+	}
+
+	working directory = /
+
+	stdout path = /dev/null
+	stderr path = /dev/null
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		XPC_SERVICE_NAME => <LABEL>
+	}
+
+	domain = <DOMAIN> [100008]
+	asid = 100008
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = <PID>
+	immediate reason = speculative
+	forks = 3
+	execs = 1
+	initialized = 1
+	trampolined = 1
+	started suspended = 0
+	proxy started suspended = 0
+	last exit code = (never exited)
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+	probabilistic guard malloc policy = {
+		activation rate = 1/1000
+		sample rate = 1/0
+	}
+
+	properties = keepalive | runatload | inferred program
+}

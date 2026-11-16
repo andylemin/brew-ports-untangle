@@ -1,0 +1,12 @@
+
+# MacPorts Installer addition on 2023-07-17_at_10:12:40: adding an appropriate PATH variable for use with MacPorts.
+export PATH="<PORTS>/bin:<PORTS>/sbin:$PATH"
+export PATH="$HOME/bin:$PATH"
+# Finished adapting your PATH environment variable for use with MacPorts.
+
+
+# MacPorts Installer addition on 2023-07-17_at_10:12:40: adding an appropriate MANPATH variable for use with MacPorts.
+export MANPATH="<PORTS>/share/man:$MANPATH"
+# Finished adapting your MANPATH environment variable for use with MacPorts.
+
+eval "$(<BREW>/bin/brew shellenv)"

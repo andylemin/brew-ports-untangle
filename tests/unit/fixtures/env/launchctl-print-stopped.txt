@@ -1,0 +1,24 @@
+<DOMAIN>/<LABEL> = {
+	active count = 0
+	path = <PLIST>
+	type = LaunchAgent
+	state = not running
+
+	program = <PROGRAM>
+	arguments = {
+		<PROGRAM>
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	domain = <DOMAIN>
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 2
+	last exit code = 0
+
+	spawn type = daemon (3)
+	properties = runatload | inferred program
+}
