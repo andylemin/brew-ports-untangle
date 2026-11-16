@@ -8,16 +8,17 @@ don't work? Maybe you don't know you have both, because you ran commands from
 the internet, and now some things don't work?
 
 Using two package managers on a Mac (`brew` and `port`) causes lots of issues.
-They install packages and libraries in different locations, and both try to put
-their libraries first on the path. Homebrew packages can then build or link
-against MacPorts libraries, and the other way round. You also usually end up
-with two copies of the same packages, half of them never used.
+They install libraries and packages in different locations, and both try to put
+theirs first on the PATH. Homebrew packages can then build or link against MacPorts
+libraries, and the other way round - this causes issues when updating packages.
+
+You also usually end up with two copies of the same packages, half of them never used.
 
 `brew-ports` inventories every installation and checks each package manager's
 database. It recommends a manager to keep and migrates your packages to it,
 asking before each phase.
 
-With `--remove-manager`, it also removes the other manager entirely.
+`--remove-manager` also removes the other manager entirely.
 
 > **Status:** every command exists, and unit tests run each one against
 > simulated hosts, but the tool has not yet migrated a real Mac. Until it has,
@@ -26,7 +27,7 @@ With `--remove-manager`, it also removes the other manager entirely.
 
 ## Why
 
-Package managers that share one Mac interfere in three ways:
+Package managers that share one Mac interfere with eachother:
 
 - Each manager installs a separate set of shared libraries and interpreters,
   so `openssl`, `python`, and `glib` exist twice and drift apart.
@@ -41,13 +42,12 @@ brew-ports needs:
 
 - macOS 13 or newer, on Apple Silicon or Intel.
 - The Command Line Tools (`xcode-select --install`), which both managers need.
-  brew-ports runs without them, so `doctor` can report them missing, but `plan`
-  and `apply` refuse to start.
+  brew-ports runs without them, so `doctor` can report them missing.
 - An administrator account for the commands that change the system. They ask
   for your password once per run, through `sudo`.
 
 A release bundles CPython 3.15, so brew-ports needs neither manager nor the
-Command Line Tools, even while removing a manager.
+Command Line Tools, even while removing a manager or python.
 
 ## Getting started
 
@@ -61,8 +61,8 @@ tar -xzf "brew-ports-0.1.0-macos-$arch.tar.gz" -C ~/.local
 ~/.local/brew-ports-0.1.0/bin/brew-ports scan
 ```
 
-- Use `curl`, not a browser. A browser marks the download as quarantined, and
-  Gatekeeper then refuses to run the Python inside it.
+- Use `curl`. A browser marks the download as quarantined, and
+  Gatekeeper refuses to run Python inside it.
 - Unpack it outside every Homebrew and MacPorts prefix. If brew-ports runs from
   inside one, `doctor` reports `system-running-inside-prefix`, and `plan`
   refuses to start.
