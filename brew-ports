@@ -1,0 +1,23 @@
+#!/bin/sh
+# Run brew-ports from this checkout on the pinned CPython that `tools/fetch-python.sh ARCH build/python`
+# unpacks, or on the interpreter BREW_PORTS_PYTHON names.
+set -eu
+
+self=$0
+while [ -L "${self}" ]; do
+  link=$(readlink "${self}")
+  case ${link} in
+    /*) self=${link} ;;
+    *) self=$(dirname "${self}")/${link} ;;
+  esac
+done
+root=$(cd "$(dirname "${self}")" && pwd -P)
+python=${BREW_PORTS_PYTHON:-${root}/build/python/bin/python3}
+if ! "${python}" -c 'import sys; sys.exit(sys.version_info < (3, 15))' 2>/dev/null; then
+  echo "brew-ports: ${python} is not Python 3.15 or newer; run tools/fetch-python.sh $(uname -m) build/python," \
+    "or set BREW_PORTS_PYTHON" >&2
+  exit 3
+fi
+exec "${python}" -I -c \
+  'import sys; sys.path.insert(0, sys.argv.pop(1)); from brew_ports.cli import main; sys.exit(main())' \
+  "${root}" "$@"

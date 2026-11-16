@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  bundles:
+    name: release bundles
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag names the package version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: test "$TAG" = "v$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' brew_ports/__init__.py)"
+      - name: Interpreter
+        run: tools/fetch-python.sh "$(uname -m)" build/python
+      - name: Unit tests
+        run: build/python/bin/python3 -B -m unittest discover -s tests/unit -t .
+      - name: Build
+        run: tools/build-release.sh arm64 x86_64
+      - name: Smoke test
+        run: |
+          for arch in arm64 x86_64; do
+            if ! /usr/bin/arch -"$arch" /usr/bin/true 2>/dev/null; then
+              echo "this runner cannot run $arch code: the $arch bundle is built but not run"
+              continue
+            fi
+            mkdir -p "$RUNNER_TEMP/$arch"
+            tar -xzf dist/brew-ports-*-macos-"$arch".tar.gz -C "$RUNNER_TEMP/$arch" --strip-components 1
+            /usr/bin/arch -"$arch" "$RUNNER_TEMP/$arch/bin/brew-ports" --version
+          done
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$TAG" dist/brew-ports-*-macos-*.tar.gz dist/SHA256SUMS
+          --title "$TAG" --generate-notes --verify-tag
