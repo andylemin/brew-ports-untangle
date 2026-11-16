@@ -1,0 +1,17 @@
+[
+  {"brew": "node", "ports": "nodejs", "note": "Node.js; the interpreter rule picks the nodejs<major> port"},
+  {"brew": "qt", "ports": "qt6", "note": "Qt 6"},
+  {"brew": "pkg-config", "ports": "pkgconfig", "note": "freedesktop pkg-config; Homebrew's is an alias of pkgconf"},
+  {"brew": "gnu-tar", "ports": "gnutar", "note": "GNU tar: gtar from Homebrew, gnutar from MacPorts"},
+  {"brew": "wireshark", "ports": "wireshark4", "note": "Wireshark 4"},
+  {"brew": "sqlite", "ports": "sqlite3", "note": "SQLite 3"},
+  {"brew": "glib", "ports": "glib2", "note": "GLib 2"},
+  {"brew": "icu4c", "ports": "icu", "note": "ICU; Homebrew names its versions icu4c@<major>"},
+  {"brew": "sdl2", "ports": "libsdl2", "note": "SDL 2"},
+  {"brew": "sdl2-compat", "ports": "libsdl2", "note": "SDL 2; Homebrew's sdl2 is an alias of sdl2-compat"},
+  {"brew": "gnupg", "ports": "gnupg2", "note": "GnuPG 2"},
+  {"brew": "make", "ports": "gmake", "note": "GNU make"},
+  {"brew": "jpeg-turbo", "ports": "libjpeg-turbo", "note": "libjpeg-turbo"},
+  {"brew": "pixman", "ports": "libpixman", "note": "pixman"},
+  {"brew": "tcl-tk", "ports": "tcl", "companions": ["tk"], "note": "Tcl and Tk; MacPorts ships Tk as the port tk"}
+]
