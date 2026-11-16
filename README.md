@@ -1,10 +1,23 @@
 # brew-ports-untangle
 
 `brew-ports` untangles a Mac that has both Homebrew and MacPorts, or more than
-one Homebrew prefix. It inventories every installation and checks each package
+one Homebrew prefix.
+
+Do you have both Homebrew and MacPorts packages installed, and find that things
+don't work? Maybe you don't know you have both, because you ran commands from
+the internet, and now some things don't work?
+
+Using two package managers on a Mac (`brew` and `port`) causes lots of issues.
+They install packages and libraries in different locations, and both try to put
+their libraries first on the path. Homebrew packages can then build or link
+against MacPorts libraries, and the other way round. You also usually end up
+with two copies of the same packages, half of them never used.
+
+`brew-ports` inventories every installation and checks each package manager's
 database. It recommends a manager to keep and migrates your packages to it,
-asking before each phase. With `--remove-manager`, it also removes the other
-manager, so the Mac ends with one.
+asking before each phase.
+
+With `--remove-manager`, it also removes the other manager entirely.
 
 > **Status:** every command exists, and unit tests run each one against
 > simulated hosts, but the tool has not yet migrated a real Mac. Until it has,
