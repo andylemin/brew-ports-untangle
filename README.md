@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo-wordmark.svg" alt="brew-ports" width="520">
+</p>
+
 # brew-ports-untangle
 
 `brew-ports` untangles a Mac that has both Homebrew and MacPorts, or more than
@@ -27,7 +31,7 @@ asking before each phase.
 
 ## Why
 
-Package managers that share one Mac interfere with eachother:
+Package managers that share one Mac interfere with each other:
 
 - Each manager installs a separate set of shared libraries and interpreters,
   so `openssl`, `python`, and `glib` exist twice and drift apart.
