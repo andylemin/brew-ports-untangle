@@ -1,0 +1,4 @@
+# The checkers CI runs, pinned so every run judges the code by the same rules.
+# brew-ports itself needs only the Python standard library.
+mypy==2.4.1
+pylint==4.1.3

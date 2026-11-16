@@ -1,0 +1,159 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: quality gates
+    runs-on: ubuntu-24.04
+    container: python:3.15-slim
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends doxygen shellcheck
+          pip install --no-cache-dir --disable-pip-version-check -r tools/requirements-dev.txt
+      - name: pylint
+        # Tests reach into the modules they test. tests/unit/fixtures holds no __init__.py, so pylint
+        # reaches it only by name.
+        run: |
+          pylint --rcfile pyproject.toml brew_ports tools/check_docs.py
+          pylint --rcfile pyproject.toml --disable=protected-access tests tests/unit/fixtures
+      - name: mypy
+        run: mypy --config-file pyproject.toml
+      - name: Doc blocks
+        run: python3 -I tools/check_docs.py brew_ports tests
+      - name: Doxygen
+        run: |
+          mkdir -p build
+          doxygen docs/Doxyfile
+      - name: shellcheck
+        run: shellcheck brew-ports tools/*.sh
+
+  actionlint:
+    name: workflow lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+  unit:
+    name: unit tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Interpreter
+        run: tools/fetch-python.sh "$(uname -m)" build/python
+      - name: Unit tests
+        run: build/python/bin/python3 -B -m unittest discover -s tests/unit -t . -v
+      - name: Bundle
+        run: |
+          tools/build-release.sh "$(uname -m)"
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xzf dist/brew-ports-*-macos-"$(uname -m)".tar.gz -C "$RUNNER_TEMP/bundle" --strip-components 1
+          "$RUNNER_TEMP/bundle/bin/brew-ports" --help
+
+  # Both migration jobs start from the same mixed host: MacPorts base from the
+  # signed package, three ports, and three formulae beside the runner's Homebrew.
+  ports-to-brew:
+    name: integration (ports to brew)
+    needs: unit
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle
+        run: |
+          tools/build-release.sh "$(uname -m)"
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xzf dist/brew-ports-*-macos-"$(uname -m)".tar.gz -C "$RUNNER_TEMP/bundle" --strip-components 1
+          echo "$RUNNER_TEMP/bundle/bin" >> "$GITHUB_PATH"
+      - name: Install MacPorts base
+        run: brew-ports bootstrap-ports --yes
+      - name: Mixed host
+        run: |
+          sudo /opt/local/bin/port -N -b install jq gsed wget
+          brew install wget tree jq
+      - name: scan
+        run: brew-ports scan --json > scan.out.json
+      - name: doctor (exit 1 expected)
+        run: |
+          code=0; brew-ports doctor --json > doctor.out.json || code=$?
+          test "$code" -eq 1
+      - name: recommend (exit 1 expected, both managers hold packages)
+        run: |
+          code=0; brew-ports recommend --json > recommend.out.json || code=$?
+          test "$code" -eq 1
+      - name: plan
+        run: brew-ports plan --target brew --only jq,gsed --yes --out plan.json
+      - name: apply --dry-run
+        run: brew-ports apply plan.json --dry-run
+      - name: apply
+        run: brew-ports apply plan.json --yes
+      - name: verify
+        run: brew-ports verify plan.json
+      - name: The ports are replaced, the rest stays
+        run: |
+          for port in jq gsed; do
+            if /opt/local/bin/port -q installed "$port" | grep -q .; then echo "port $port is still installed"; exit 1; fi
+          done
+          /opt/local/bin/port -q installed wget | grep -q .
+          brew list --formula jq gnu-sed wget tree
+      - name: Run directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-ports-to-brew
+          path: ~/Library/Application Support/brew-ports/runs/
+          if-no-files-found: warn
+
+  brew-to-ports:
+    name: integration (brew to ports)
+    needs: unit
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle
+        run: |
+          tools/build-release.sh "$(uname -m)"
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xzf dist/brew-ports-*-macos-"$(uname -m)".tar.gz -C "$RUNNER_TEMP/bundle" --strip-components 1
+          echo "$RUNNER_TEMP/bundle/bin" >> "$GITHUB_PATH"
+      - name: Install MacPorts base
+        run: brew-ports bootstrap-ports --yes
+      - name: Mixed host
+        run: |
+          sudo /opt/local/bin/port -N -b install jq gsed wget
+          brew install wget tree jq
+      - name: plan
+        run: brew-ports plan --target ports --only wget,tree --casks drop --yes --out plan.json
+      - name: apply
+        run: brew-ports apply plan.json --yes
+      - name: The formulae are replaced, the rest stays
+        run: |
+          for formula in wget tree; do
+            if brew list --formula "$formula" >/dev/null 2>&1; then echo "formula $formula is still installed"; exit 1; fi
+          done
+          brew list --formula jq
+          for port in wget tree jq gsed; do /opt/local/bin/port -q installed "$port" | grep -q .; done
+      - name: Run directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-brew-to-ports
+          path: ~/Library/Application Support/brew-ports/runs/
+          if-no-files-found: warn

@@ -1,0 +1,38 @@
+# Settings of the quality gates that CI runs (.github/workflows/ci.yml). brew-ports needs only the Python
+# standard library, and it is not installed with pip.
+
+[tool.pylint.main]
+py-version = "3.15"
+
+[tool.pylint.format]
+max-line-length = 120
+max-module-lines = 2125
+
+[tool.pylint.basic]
+# A test method's name is its specification; every other function carries a Doxygen block.
+no-docstring-rgx = "^(test_|setUp$|tearDown$|setUpClass$|tearDownClass$)"
+
+# The size limits are the largest the code holds, so nothing grows past them; each module, class or
+# function at a limit is a candidate for splitting, never a target.
+[tool.pylint.design]
+max-args = 19
+max-attributes = 36
+max-branches = 19
+max-locals = 27
+max-public-methods = 44
+max-returns = 10
+max-statements = 59
+
+[tool.pylint.refactoring]
+max-nested-blocks = 6
+
+[tool.pylint."messages control"]
+# An exception class or a record needs no public methods.
+disable = ["too-few-public-methods"]
+
+[tool.mypy]
+python_version = "3.15"
+files = ["brew_ports", "tools/check_docs.py"]
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true

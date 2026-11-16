@@ -1,0 +1,34 @@
+# Doxygen settings for the brew-ports API and developer pages. Run from the repository root:
+#   doxygen docs/Doxyfile
+# CI fails on any warning. Docstrings are read as Doxygen blocks (PYTHON_DOCSTRING = NO), so the first
+# line is the brief and @param, @returns and @throws are parsed. tools/check_docs.py checks what Doxygen
+# cannot: a block on every function and class, and @returns exactly when a function returns a value.
+
+PROJECT_NAME           = brew-ports
+PROJECT_BRIEF          = "Untangle a Mac that has both Homebrew and MacPorts"
+OUTPUT_DIRECTORY       = build/doxygen
+INPUT                  = README.md CONTRIBUTING.md SECURITY.md docs brew_ports
+FILE_PATTERNS          = *.py *.md
+RECURSIVE              = YES
+EXCLUDE_PATTERNS       = */__pycache__/*
+USE_MDFILE_AS_MAINPAGE = README.md
+
+OPTIMIZE_OUTPUT_JAVA   = YES
+PYTHON_DOCSTRING       = NO
+JAVADOC_AUTOBRIEF      = YES
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = YES
+EXTRACT_STATIC         = YES
+
+GENERATE_HTML          = YES
+GENERATE_LATEX         = NO
+HTML_OUTPUT            = html
+HAVE_DOT               = NO
+CLASS_GRAPH            = NO
+
+QUIET                  = YES
+WARNINGS               = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_IF_INCOMPLETE_DOC = YES
+WARN_NO_PARAMDOC       = NO
+WARN_AS_ERROR          = FAIL_ON_WARNINGS
