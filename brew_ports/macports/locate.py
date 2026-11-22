@@ -616,8 +616,8 @@ def choose_target(instances: Sequence[Instance], host_arch: str, target_prefix: 
         ident = system.identity(target_prefix)
         match = next((i for i in ports if ident is not None and tuple(i.identity) == ident), None)
         if match is not None and host_arch == "arm64" and match.arch == "x86_64":
-            raise TargetRefused(f"{match.prefix} is an x86_64 MacPorts on an arm64 host: the Command Line Tools "
-                                "cannot build for it")
+            raise TargetRefused(f"MacPorts at {match.prefix} is an Intel installation on an Apple Silicon Mac, and "
+                                "ports cannot be built for it. Choose another --target-prefix")
         return match
     default = system.identity(default_prefix)
     for inst in ports:

@@ -16,6 +16,7 @@ from . import doctor, env, system
 from .homebrew import actions as brew_actions, locate as brew_locate
 from .macports import actions as mp_actions
 from .model import Action, Instance, Issue, Manager, Mapping, OnFailure, Package, Phase, Service
+from .report import at
 from .runner import RM, arch_argv
 from .state import slug
 
@@ -42,8 +43,9 @@ HOMEBREW_PREFIX_FILES = (
     "Cellar", "Caskroom", "bin/brew", "etc/bash_completion.d/brew", "share/doc/homebrew", "share/man/man1/brew.1",
     "share/man/man1/brew-cask.1", "share/man/man1/README.md", "share/zsh/site-functions/_brew",
     "share/zsh/site-functions/_brew_cask", "share/fish/vendor_completions.d/brew.fish", "var/homebrew")
-PHASE_NAMES = {0: "preflight", 1: "snapshot", 2: "repair the target manager", 3: "install", 4: "gate",
-               5: "remove source packages", 6: "remove the source managers", 7: "environment", 8: "verify and report"}
+PHASE_NAMES = {0: "checks before starting", 1: "save a record for undo", 2: "repair the installation that stays",
+               3: "install the replacements", 4: "check the replacements", 5: "uninstall the old packages",
+               6: "uninstall the old managers", 7: "clean up the shell files", 8: "final check"}
 
 
 # The target's dependency closure ----------------------------------------------------------------
@@ -190,10 +192,10 @@ class TargetView:
         pkg = self.installed(name)
         old = pkg.version if pkg else "?"
         if self.brew:
-            return f"{old} -> {outdated_versions.get(self.key(name)) or 'the catalogue version'}"
+            return f"{old} -> {outdated_versions.get(self.key(name)) or 'the newest version'}"
         entry = self.portindex.get(name) if self.portindex is not None else None
         if entry is None:
-            return f"{old} -> the PortIndex version"
+            return f"{old} -> the newest version"
         new = f"{entry.version}_{entry.revision}"
         if pkg is not None and entry.epoch != pkg.epoch:
             return f"{old} (epoch {pkg.epoch}) -> {new} (epoch {entry.epoch})"
@@ -244,7 +246,7 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
     for name, roots in targets.items():
         pkg = view.installed(name)
         if pkg is not None and pkg.outdated:
-            add(name, "a mapped target", roots)
+            add(name, "a replacement", roots)
             if view.key(name) not in out.explicit:
                 out.explicit.append(view.key(name))
     for name in reinstalled:
@@ -550,7 +552,7 @@ def cross_prefix_rebuilds(linkage: dict[str, Any], target: Instance, instances: 
                 if name not in rebuild:
                     rebuild.append(name)
             else:
-                remaining.append(f"{path} -> {where} ({ref.get('class')})")
+                remaining.append(f"{name} ({path}) still uses {where}, which stays: nothing to do")
     return rebuild, remaining
 
 
@@ -570,14 +572,14 @@ def unsafe(path: str, target: Instance, home: str) -> str | None:
     ident = tuple(target.identity) if target.identity else ()
     # An identity is (st_dev, st_ino); no other shape can match the prefix.
     if len(ident) == 2 and system.lies_under(norm, ident):
-        return "it is or lies under the target prefix"
+        return f"it belongs to {at(target)}, which stays"
     if system.text_names_prefix(norm, list(target.spellings) + [target.prefix], False):
-        return "it is or lies under the target prefix"
+        return f"it belongs to {at(target)}, which stays"
     if norm in PROTECTED:
-        return "it is a system directory"
+        return "it is a system folder"
     home = os.path.normpath(home)
     if norm == home or home.startswith(norm.rstrip("/") + "/"):
-        return "it is the home directory or a parent of it"
+        return "it is your home folder, or holds it"
     return None
 
 
@@ -671,7 +673,7 @@ def homebrew_shared_caches(home: str, library: str) -> list[str]:
             os.path.join(library, "Caches", "Homebrew"), os.path.join(home, ".cache", "Homebrew")]
 
 
-def _marker_missing(inst: Instance) -> str | None:
+def marker_missing(inst: Instance) -> str | None:
     """Return why nothing under the prefix may be deleted: it lacks its manager's marker files
 
     @param inst  the named instance
@@ -679,11 +681,11 @@ def _marker_missing(inst: Instance) -> str | None:
     """
     if inst.manager is Manager.PORTS:
         if not os.path.exists(os.path.join(inst.prefix, "etc", "macports", "macports.conf")):
-            return f"{inst.prefix} holds no etc/macports/macports.conf"
+            return f"{inst.prefix} has no etc/macports/macports.conf, so it does not look like MacPorts"
         return None
     if not (os.path.lexists(os.path.join(inst.prefix, "bin", "brew"))
             or os.path.isdir(os.path.join(inst.prefix, "Cellar"))):
-        return f"{inst.prefix} holds neither bin/brew nor Cellar"
+        return f"{inst.prefix} has neither bin/brew nor a Cellar, so it does not look like Homebrew"
     return None
 
 
@@ -719,12 +721,11 @@ def _dedicated_notes(inst: Instance, deletes: Sequence[str], target: Instance, h
     except OSError:
         names = []
     left = [n for n in names if os.path.normpath(os.path.join(prefix, n)) not in listed]
-    held = f"; besides the paths above it holds {', '.join(left)} at plan time" if left else ""
-    out = [_note(prefix, "remaining", f"then, after a second confirmation that --yes answers, every entry left in "
-                 f"{prefix} is archived into <run>/data-archive/ unless an archive above holds it, and deleted; a no "
-                 f"keeps {prefix} with them{held}")]
+    held = f"; besides the paths above it holds {', '.join(left)} as this plan is made" if left else ""
+    out = [_note(prefix, "remaining", f"then `apply` asks again (--yes answers) before it saves in the run folder and "
+                 f"deletes whatever is left in {prefix}; a no keeps {prefix} with it{held}")]
     why = unsafe(prefix, target, home)
-    out.append(_note(prefix, f"skipped.{slug(prefix)}", f"never deleted: {prefix} ({why})") if why else
+    out.append(_note(prefix, f"skipped.{slug(prefix)}", f"{prefix} stays: {why}") if why else
                _note(prefix, "prefix", f"then {prefix} itself (rm -d), once nothing is left in it"))
     return out
 
@@ -732,7 +733,7 @@ def _dedicated_notes(inst: Instance, deletes: Sequence[str], target: Instance, h
 def _caches_notes(named: Sequence[Instance], survivors: Sequence[Instance], home: str) -> list[Action]:
     """Return the note of the shared Homebrew caches and logs, which phase 6 deletes last when no Homebrew stays
 
-    @param named      the instances `--remove-old` names
+    @param named      the old installations the plan uninstalls
     @param survivors  the instances that stay
     @param home       the user's home directory
     @returns          the note; none while a Homebrew instance stays, or when none of the caches exists
@@ -741,19 +742,20 @@ def _caches_notes(named: Sequence[Instance], survivors: Sequence[Instance], home
     present = [p for p in homebrew_shared_caches(home, SYSTEM_LIBRARY) if os.path.lexists(p)]
     if not brews or not present or any(i.manager is Manager.BREW for i in survivors):
         return []
-    return [_note(brews[0].prefix, "caches", "last, once no Homebrew instance survives the phase, the caches and logs "
-                  f"every Homebrew instance shares are deleted without an archive: {', '.join(present)}")]
+    return [_note(brews[0].prefix, "caches", "last, when no Homebrew is left on this Mac, the caches and logs that all "
+                  f"Homebrew installations share are deleted, without a saved copy: {', '.join(present)}")]
 
 
 def phase6(named: Sequence[Instance], target: Instance, services: Sequence[Service], environ: dict[str, str],
            survivors: Sequence[Instance]) -> list[Action]:
-    """Return manual previews of phase 6 for every instance `--remove-old` names
+    """Return manual previews of phase 6 for every old installation the plan uninstalls
 
     They show the archives, the deletions and the paths the safety rules refuse as they stand at plan time,
     then what goes last: a dedicated Homebrew prefix's remaining entries and the prefix, and the shared Homebrew
-    caches; `apply` recomputes every action of this phase.
+    caches; `apply` recomputes every action of this phase. The planner names no installation that lacks its
+    manager's marker files, which `apply` would leave whole.
 
-    @param named      the instances `--remove-old` names
+    @param named      the old installations the plan uninstalls
     @param target     the target instance, which the safety rules protect
     @param services   the scan's services
     @param environ    the environment, for `HOME`
@@ -764,18 +766,17 @@ def phase6(named: Sequence[Instance], target: Instance, services: Sequence[Servi
     out: list[Action] = []
     for inst in named:
         brew = inst.manager is Manager.BREW
-        out.append(_note(inst.prefix, "checks", "before anything is archived: no package left (fresh inventory), "
-                         f"no process using {inst.prefix} (sudo lsof), free space for the archives plus 1 GiB"))
+        out.append(_note(inst.prefix, "checks", f"first `apply` checks that no package is left in {inst.prefix}, that "
+                         "no running program uses it, and that the disk has room for the saved copies plus 1 GiB"))
         archives = homebrew_archive_list(inst) if brew else macports_archive_list(inst, home)
         for path in archives:
             out.append(Action(action_id=f"6.archive.{slug(path)}", kind="command",
                               argv=[TAR, "-czf", "-", "-C", "/", path.lstrip("/")], sudo=True,
-                              description=f"archive {path} into <run>/data-archive/{slug(path)}.tar.gz",
+                              description=f"save {path} in the run folder as data-archive/{slug(path)}.tar.gz",
                               manual=True, instance_prefix=inst.prefix))
         if brew:
-            out.append(_note(inst.prefix, "repository", "the repository's local state (status, local commits, stash) "
-                             "is archived as <run>/data-archive/"
-                             f"{slug(inst.repository or inst.prefix)}.repository.tar.gz when git shows any"))
+            out.append(_note(inst.prefix, "repository", "Homebrew's own repository is saved in the run folder too when "
+                             "git shows local changes in it (status, local commits, stash)"))
             deletes = homebrew_delete_list(inst, services)
         else:
             others = any(i.manager is Manager.PORTS and i.prefix != inst.prefix for i in survivors)
@@ -783,11 +784,10 @@ def phase6(named: Sequence[Instance], target: Instance, services: Sequence[Servi
             if not others:
                 out.append(_note(inst.prefix, "macports-user", "the macports user and group are deleted first when "
                                  f"their home lies under {inst.prefix}"))
-        marker = _marker_missing(inst)
         for path in deletes:
-            why = marker or unsafe(path, target, home)
+            why = unsafe(path, target, home)
             if why:
-                out.append(_note(inst.prefix, f"skipped.{slug(path)}", f"never deleted: {path} ({why})"))
+                out.append(_note(inst.prefix, f"skipped.{slug(path)}", f"{path} stays: {why}"))
                 continue
             sudo = not brew or not os.access(os.path.dirname(path) or "/", os.W_OK)
             out.append(Action(action_id=f"6.delete.{slug(path)}", kind="command", argv=[RM, "-rf", path],
@@ -796,8 +796,7 @@ def phase6(named: Sequence[Instance], target: Instance, services: Sequence[Servi
             out.append(_note(inst.prefix, "links", "then every link under %s/{bin,sbin,lib,include,share,etc,opt,"
                              "Frameworks} into its Cellar, Caskroom or opt, /etc/paths.d/homebrew when it names only "
                              "%s/bin, and the Applications links into the Cellar" % (inst.prefix, inst.prefix)))
-            if marker is None:
-                out += _dedicated_notes(inst, deletes, target, home)
+            out += _dedicated_notes(inst, deletes, target, home)
         jobs = [s for s in services if not s.owned and s.instance_prefix == inst.prefix]
         for svc in jobs:
             out.append(_note(inst.prefix, f"job.{slug(svc.plist)}",
@@ -810,14 +809,14 @@ def phase6(named: Sequence[Instance], target: Instance, services: Sequence[Servi
 
 def assemble(phase2_actions: list[Action], phase3_actions: list[Action], phase6_actions: list[Action],
              remove: bool) -> list[Phase]:
-    """Return phases 0 to 8, with phase 6 only when `--remove-old` names an instance
+    """Return phases 0 to 8, with phase 6 only when the plan uninstalls an old installation
 
     `apply` computes the phases without actions.
 
     @param phase2_actions  the repairs of the target
     @param phase3_actions  the installs, upgrades, marks and rebuilds
     @param phase6_actions  the manual previews of the removals
-    @param remove          whether `--remove-old` names an instance
+    @param remove          whether the plan uninstalls an old installation
     @returns               the phases, with the ones that ask first marked `confirm`
     """
     actions = {2: phase2_actions, 3: phase3_actions, 6: phase6_actions}

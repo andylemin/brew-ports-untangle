@@ -69,8 +69,10 @@ class BrewUpgradesTest(PlannerCase):
         self.make_target(pinned=True)
         outcome = self.plan()
         self.assert_exit(outcome, 1)
-        self.assertIn("the pinned openssl@3 would be upgraded (a dependency of wget), which the mappings of wget need: "
-                      "run `brew unpin openssl@3`", self.text(outcome))
+        self.assertEqual(outcome.problems[:2], [
+            "brew-ports: no plan was made: 1 thing to settle first",
+            "    installing the replacement of wget would upgrade openssl@3 (a dependency of wget), which you pinned. "
+            f"Run `{self.target.binary} unpin openssl@3`, or plan with `--leave wget`"])
         self.assertEqual(outcome.draft.target_upgrades, ["openssl@3", "curl"])
 
     def test_keeping_the_root_clears_the_blocker(self):
@@ -215,7 +217,7 @@ class RebuildTest(PlannerCase):
         self.assertNotIn("3.keeper.rebuild", ids(plan, 3))
         kept = self.plan(keep=["zlib"])
         self.assertNotIn("3.tool.rebuild", ids(kept.plan, 3))
-        self.assertIn(f"remaining cross-prefix link: {binary} -> {lib} (other)", self.text(kept))
+        self.assertIn(f"  tool ({binary}) still uses {lib}, which stays: nothing to do", kept.report)
 
     def test_a_link_into_a_rack_under_an_old_name_is_rebuilt(self):
         keg = self.usr_local + "/Cellar/oldwget/1.25.0"
@@ -230,9 +232,9 @@ class RebuildTest(PlannerCase):
 
 
 class Phase6Test(PlannerCase):
-    """The phase 6 previews of the instances `--remove-old` names"""
+    """The phase 6 previews of the old installations a plan uninstalls"""
 
-    def test_previews_of_a_named_macports_instance(self):
+    def test_previews_of_a_macports_instance(self):
         src = self.local
         for sub in ("var/db/mysql8", "var/macports/registry", "var/log", "etc/macports"):
             os.makedirs(os.path.join(src, sub), exist_ok=True)
@@ -243,7 +245,7 @@ class Phase6Test(PlannerCase):
         self.world.services.append(service("org.macports.mysql8", "/Library/LaunchDaemons/org.macports.mysql8.plist",
                                            src, package="mysql8", kind="port", scope="system"))
         self.brew_target()
-        plan = self.plan(remove_manager=[src]).plan
+        plan = self.plan().plan
         acts = actions(plan, 6)
         by_id = {a.action_id: a for a in acts}
         self.assertTrue(all(a.manual for a in acts))
@@ -263,11 +265,13 @@ class Phase6Test(PlannerCase):
     def test_prefix_without_marker_is_never_deleted(self):
         self.ports_source(port("wget", self.local, "1.25.0"))
         self.brew_target()
-        acts = actions(self.plan(remove_manager=[]).plan, 6)
-        self.assertFalse([a for a in acts if a.action_id.startswith("6.delete.")])
-        self.assertTrue(any("holds no etc/macports/macports.conf" in a.description for a in acts))
+        self.unmark(self.local)
+        plan = self.plan().plan
+        self.assertEqual(actions(plan, 6), [])
+        self.assertEqual((plan.options["remove_manager"], [p.number for p in plan.phases]),
+                         ("", [0, 1, 2, 3, 4, 5, 7, 8]))
 
-    def test_previews_of_a_named_homebrew_instance(self):
+    def test_previews_of_a_homebrew_instance(self):
         prefix = self.usr_local
         for sub in ("Cellar/wget/1.25.0", "Homebrew/Library/Taps/homebrew", "var/homebrew/linked", "etc", "bin"):
             os.makedirs(os.path.join(prefix, sub), exist_ok=True)
@@ -276,7 +280,7 @@ class Phase6Test(PlannerCase):
         self.brew_source(formula("wget", prefix, version="1.25.0"), repository=prefix + "/Homebrew")
         self.brew_target()
         with mock.patch("brew_ports.homebrew.locate.USR_LOCAL", prefix):
-            acts = actions(self.plan(remove_manager=[prefix]).plan, 6)
+            acts = actions(self.plan().plan, 6)
         deleted = [a.argv[-1] for a in acts if a.action_id.startswith("6.delete.")]
         self.assertEqual(deleted, [prefix + "/Homebrew", prefix + "/Cellar", prefix + "/bin/brew",
                                    prefix + "/var/homebrew"])
@@ -301,28 +305,33 @@ class Phase6Test(PlannerCase):
         self.brew_source(formula("wget", prefix, version="1.25.0"), prefix=prefix)
         self.ports_target()
         with mock.patch("brew_ports.plan_phases.SYSTEM_LIBRARY", library):
-            outcome = self.plan(remove_manager=[prefix], casks="drop", environ={"HOME": home})
+            outcome = self.plan(environ={"HOME": home})
         self.assert_exit(outcome, 0)
         acts = actions(outcome.plan, 6)
         tag = prefix.replace("/", "%")
         notes = {a.action_id: a.description for a in acts if a.kind == "note"}
         self.assertEqual(notes[f"6.note.{tag}.remaining"], (
-            f"then, after a second confirmation that --yes answers, every entry left in {prefix} is archived into "
-            f"<run>/data-archive/ unless an archive above holds it, and deleted; a no keeps {prefix} with them; "
-            "besides the paths above it holds bin, etc, var at plan time"))
+            f"then `apply` asks again (--yes answers) before it saves in the run folder and deletes whatever is left "
+            f"in {prefix}; a no keeps {prefix} with it; besides the paths above it holds bin, etc, var as this plan "
+            "is made"))
         self.assertEqual(notes[f"6.note.{tag}.prefix"], f"then {prefix} itself (rm -d), once nothing is left in it")
         self.assertEqual((acts[-1].action_id, acts[-1].description), (
-            f"6.note.{tag}.caches", "last, once no Homebrew instance survives the phase, the caches and logs every "
-            f"Homebrew instance shares are deleted without an archive: {', '.join(caches)}"))
+            f"6.note.{tag}.caches", "last, when no Homebrew is left on this Mac, the caches and logs that all "
+            f"Homebrew installations share are deleted, without a saved copy: {', '.join(caches)}"))
+        self.assertFalse([text for text in notes.values() if "<run>" in text])
 
     def test_phase_6_only_when_an_instance_goes(self):
         self.ports_source(port("wget", self.local, "1.25.0"))
         self.brew_target()
-        self.assertEqual([p.number for p in self.plan().plan.phases], [0, 1, 2, 3, 4, 5, 7, 8])
-        phases = self.plan(remove_manager=[]).plan.phases
+        self.assertEqual([p.number for p in self.plan(keep_managers=True).plan.phases], [0, 1, 2, 3, 4, 5, 7, 8])
+        phases = self.plan().plan.phases
         self.assertEqual([p.number for p in phases], [0, 1, 2, 3, 4, 5, 6, 7, 8])
         self.assertEqual([p.number for p in phases if p.confirm], [1, 2, 3, 5, 6, 7])
         self.assertEqual([p.actions for p in phases if p.number in (0, 1, 4, 5, 7, 8)], [[]] * 6)
+        self.assertEqual([p.name for p in phases], [
+            "checks before starting", "save a record for undo", "repair the installation that stays",
+            "install the replacements", "check the replacements", "uninstall the old packages",
+            "uninstall the old managers", "clean up the shell files", "final check"])
 
 
 class UnsafeTest(PlannerCase):

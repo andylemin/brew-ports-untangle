@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import io
 import os
+import shutil
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from unittest import mock
@@ -219,6 +220,7 @@ class FakeAsk:
         self.yes = yes
         self.confirm_answer = confirm_answer
         self.asked: list[str] = []
+        self.confirms: list[str] = []
 
     def choose(self, question: str, choices: Sequence[str], default: str) -> str:
         """Answer a question with choices: the first fragment it holds gives the answer, else the default
@@ -237,13 +239,14 @@ class FakeAsk:
                 return answer
         return default
 
-    def confirm(self, _question: str, default: bool = False) -> bool:
+    def confirm(self, question: str, default: bool = False) -> bool:
         """Answer a yes-or-no question: yes under `--yes`, else `confirm_answer` on a terminal
 
-        @param _question  the question, never shown
-        @param default    the answer without a terminal
-        @returns          the answer
+        @param question  the question, recorded in `confirms`
+        @param default   the answer without a terminal
+        @returns         the answer
         """
+        self.confirms.append(question)
         if self.yes:
             return True
         return self.confirm_answer if self.tty else default
@@ -298,7 +301,8 @@ def blocker(code: str, prefix: str | None, *blocks: Blocks, severity: Severity =
 
 
 def run(state_dir: state.StateDir, bundle: scan.ScanBundle, opts: planner.PlanOptions, *, ask: Any = None,
-        issues: Sequence[model.Issue] = (), environ: dict[str, str] | None = None) -> planner.PlanOutcome:
+        issues: Sequence[model.Issue] = (), environ: dict[str, str] | None = None,
+        verbose: bool = False) -> planner.PlanOutcome:
     """Run `planner.build` in a fresh run directory, with `doctor.detect_all` answering `issues`
 
     @param state_dir  the state directory the run directory goes into
@@ -307,12 +311,14 @@ def run(state_dir: state.StateDir, bundle: scan.ScanBundle, opts: planner.PlanOp
     @param ask        answers the terminal questions; None for a FakeAsk without a terminal
     @param issues     the findings
     @param environ    variables added to the runner's environment
+    @param verbose    whether the report holds what `--verbose` adds
     @returns          the outcome
     """
     run_dir = state_dir.new_run()
     runner = fake_runner(run_dir, environ=environ)
     with mock.patch("brew_ports.doctor.detect_all", return_value=list(issues)):
-        return planner.build(bundle, opts, runner, ask=ask or FakeAsk(tty=False), state_dir=state_dir, run_dir=run_dir)
+        return planner.build(bundle, opts, runner, ask=ask or FakeAsk(tty=False), state_dir=state_dir, run_dir=run_dir,
+                             verbose=verbose)
 
 
 def actions(plan: model.Plan, number: int) -> list[model.Action]:
@@ -383,18 +389,48 @@ class PlannerCase(TempDirTest):
         self.target = self.world.add(inst, *packages, index=portindex(self.tmp, drop, add))
         return self.target
 
+    def unlist(self) -> None:
+        """Leave the Homebrew target without a package list, as a scan finds one whose API cache is empty"""
+        prefix = self.target.prefix
+        self.world.catalogues[prefix] = Catalogue.from_payload({}, source="names", prefix=prefix, home=self.tmp,
+                                                               today=TODAY)
+
+    def mark(self, where: model.Instance | str) -> None:
+        """Give an installation the file or folder that shows which manager it is, which a deletion needs to see
+
+        @param where  the installation, or its prefix
+        """
+        inst = where if isinstance(where, model.Instance) else next(
+            found for found in self.world.instances if found.prefix == where)
+        if inst.manager is BREW:
+            os.makedirs(os.path.join(inst.prefix, "Cellar"), exist_ok=True)
+            return
+        os.makedirs(os.path.join(inst.prefix, "etc", "macports"), exist_ok=True)
+        with open(os.path.join(inst.prefix, "etc", "macports", "macports.conf"), "w", encoding="utf-8") as fh:
+            fh.write(f"prefix {inst.prefix}\n")
+
+    def unmark(self, prefix: str) -> None:
+        """Take from an installation what `mark` gave it, so that it does not look like its manager's
+
+        @param prefix  the installation's prefix
+        """
+        shutil.rmtree(os.path.join(prefix, "Cellar"), ignore_errors=True)
+        shutil.rmtree(os.path.join(prefix, "etc"), ignore_errors=True)
+
     def ports_source(self, *packages: model.Package, prefix: str | None = None, **kw: Any) -> model.Instance:
-        """Add a MacPorts source with its packages
+        """Add a MacPorts source with its packages, and the file that shows it is MacPorts
 
         @param packages  the source's packages
         @param prefix    the source's prefix; None for the host's `/opt/local`
         @param kw        `Instance` fields
         @returns         the source
         """
-        return self.world.add(instance(PORTS, prefix or self.local, **kw), *packages)
+        inst = self.world.add(instance(PORTS, prefix or self.local, **kw), *packages)
+        self.mark(inst)
+        return inst
 
     def brew_source(self, *packages: model.Package, prefix: str | None = None, **kw: Any) -> model.Instance:
-        """Add a Homebrew source with its packages and the fixture catalogue
+        """Add a Homebrew source with its packages, the fixture catalogue and the folder that shows it is Homebrew
 
         @param packages  the source's packages
         @param prefix    the source's prefix; None for the host's `/usr/local`
@@ -405,11 +441,14 @@ class PlannerCase(TempDirTest):
         facts = {k: kw.pop(k) for k in list(kw) if k in ("root_owned", "outdated_formulae", "kegs")}
         if "inventory_error" in kw:
             facts["inventory_error"] = kw["inventory_error"]
-        inst = instance(BREW, prefix or self.usr_local, **kw)
-        return self.world.add(inst, *packages, cat=catalogue(self.tmp), **facts)
+        inst = self.world.add(instance(BREW, prefix or self.usr_local, **kw), *packages, cat=catalogue(self.tmp),
+                              **facts)
+        self.mark(inst)
+        return inst
 
     def plan(self, ask: Any = None, issues: Sequence[model.Issue] = (), environ: dict[str, str] | None = None,
-             target_prefix: Any = "default", target: Manager | None = None, **kw: Any) -> planner.PlanOutcome:
+             target_prefix: Any = "default", target: Manager | None = None, *, verbose: bool = False,
+             **kw: Any) -> planner.PlanOutcome:
         """Plan the host against its target
 
         @param ask            answers the terminal questions; None for a FakeAsk without a terminal
@@ -417,27 +456,43 @@ class PlannerCase(TempDirTest):
         @param environ        variables added to the runner's environment
         @param target_prefix  `--target-prefix`; `default` gives the target's prefix
         @param target         the target manager; None for the target's
+        @param verbose        whether the report holds what `--verbose` adds
         @param kw             other `PlanOptions` fields
         @returns              the outcome
         """
         prefix = self.target.prefix if target_prefix == "default" else target_prefix
         manager = target or self.target.manager
         return run(self.sd, self.world.bundle(), options(manager, prefix, **kw), ask=ask, issues=issues,
-                   environ=environ)
+                   environ=environ, verbose=verbose)
 
     def assert_exit(self, outcome: planner.PlanOutcome, code: int) -> None:
-        """Assert a plan's exit code, with its report as the failure message
+        """Assert a plan's exit code, with everything it printed as the failure message
 
         @param outcome  the plan's outcome
         @param code     the exit code expected
         """
-        self.assertEqual(outcome.exit_code, code, "\n".join(outcome.report))
+        self.assertEqual(outcome.exit_code, code, self.text(outcome))
 
     @staticmethod
     def text(outcome: planner.PlanOutcome) -> str:
-        """Return the report of an outcome as one text
+        """Return everything a plan printed as one text
 
         @param outcome  the plan's outcome
-        @returns        the report lines, joined by newlines
+        @returns        the lines for standard output, then those for the error stream, joined by newlines
         """
-        return "\n".join(outcome.report)
+        return "\n".join(outcome.report + outcome.problems)
+
+    @staticmethod
+    def section(outcome: planner.PlanOutcome, title: str) -> list[str]:
+        """Return one section of a plan's report
+
+        @param outcome  the plan's outcome
+        @param title    the section's first line
+        @returns        the section's lines, from its title to the blank line that ends it; none without the title
+        """
+        lines = outcome.report
+        if title not in lines:
+            return []
+        start = lines.index(title)
+        end = lines.index("", start) if "" in lines[start:] else len(lines)
+        return lines[start:end]

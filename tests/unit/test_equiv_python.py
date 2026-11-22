@@ -1,4 +1,4 @@
-"""The Python rule in both directions, language mappings under `--lang-packages`, and the plan's Python"""
+"""The Python rule in both directions, language mappings with and without `--pipx`, and the plan's Python"""
 
 import unittest
 
@@ -22,7 +22,7 @@ class PythonCase(TempDirTest):
         self.seen = []
 
     def pipx(self, pages=None, **kw):
-        """Return a Homebrew context under `--lang-packages pipx` whose curl reaches only `pages`
+        """Return a Homebrew context under `--pipx` whose curl reaches only `pages`
 
         @param pages  the PyPI answers by URL; None for none, so every lookup is a 404
         @param kw     more context fields
@@ -109,7 +109,7 @@ class PortsIntoHomebrewTest(PythonCase):
         self.assert_mapped(m, "pip", "pyserial", HIGH)
         self.assertEqual(m.companions, ["pipx"])
         self.assertTrue(resolver.accepted(m, ctx))
-        self.assertEqual(self.seen, [])                 # --map names the project: no homepage check
+        self.assertEqual(self.seen, [])                 # --replace names the project: no homepage check
         report = brew_context(self.tmp, maps={"py313-serial": "pyserial"})
         named = resolve(source, report)
         self.assert_mapped(named, "pip", "pyserial", LOW)
@@ -170,7 +170,7 @@ class HomebrewIntoMacPortsTest(PythonCase):
                             add=[{"name": "py313-glib", "version": "2.90.1", "homepage": "https://docs.gtk.org/glib/"}])
         m = resolve(formula("glib"), ctx)
         self.assert_mapped(m, "none", None, NONE)
-        self.assertEqual(m.evidence[0], "no equivalent in MacPorts catalogue")
+        self.assertEqual(m.evidence[0], "nothing of that name, or like it, is in MacPorts' package list")
         self.assert_evidence(m, "python: glib needs python@3.13 only to build, so it is no Python package")
 
     def test_a_python_prefix_formula_drops_its_prefix(self):

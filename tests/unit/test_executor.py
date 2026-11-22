@@ -351,7 +351,8 @@ class PreflightTest(ApplyTest):
         self.scenario_brew()
         self.issues = [self.issue("ports-damaged-registry", self.source.prefix, (Blocks.UNINSTALL,))]
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
-        self.assertIn("blocked by ports-damaged-registry", self.out)
+        self.assertIn(f"this stops the move: ports-damaged-registry title ({self.source.prefix})\n    evidence\n"
+                      "    Fix: repair it\n", self.out)
         self.assertFalse(os.path.exists(self.sd.dirty_path))
         self.assertFalse(snapshot.is_complete(self.run_dir))
         self.assertFalse(self.runners[-1].sudo_ready)
@@ -365,7 +366,7 @@ class PreflightTest(ApplyTest):
         self.issues = [self.issue("ports-damaged-registry", self.source.prefix, (Blocks.UNINSTALL,))]
         self.host.instances = [self.target]                  # the scan cannot find the half-deleted prefix
         self.assertEqual(self.apply(resume=first.run_id, stop_after=0), executor.EXIT_PREFLIGHT)
-        self.assertIn("blocked by ports-damaged-registry", self.out)     # the identity alone deletes nothing
+        self.assertIn("this stops the move: ports-damaged-registry title", self.out)   # the identity deletes nothing
         first.journal.append({"phase": 6, "action_id": f"6.delete.{tag}", "argv": ["/bin/rm", "-rf"], "exit": 0})
         self.assertEqual(self.apply(resume=first.run_id, stop_after=0), executor.EXIT_OK, self.out)
 
@@ -378,7 +379,7 @@ class PreflightTest(ApplyTest):
         later = os.stat(self.sd.dirty_path).st_mtime + 10
         os.utime(self.plan_path, (later, later))             # a new plan, made after the run
         self.assertEqual(self.apply(stop_after=0), executor.EXIT_PREFLIGHT)
-        self.assertIn("blocked by system-low-disk-space", self.out)
+        self.assertIn("this stops the move: system-low-disk-space title", self.out)
 
     def test_undrivable_source_names_the_repair(self):
         self.scenario_brew()
@@ -396,7 +397,7 @@ class PreflightTest(ApplyTest):
                                                                    "replacement_formula": "gojq"}
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
         self.assertIn("Homebrew refuses to install formula jq: disabled since 2026-11-01 (unmaintained)", self.out)
-        self.assertIn("--map jq=gojq; re-plan", self.out)
+        self.assertIn("plan with `--replace jq=gojq`; re-plan", self.out)
 
     def test_sudo_that_caches_nothing_exits_3(self):
         self.scenario_brew()
@@ -413,7 +414,7 @@ class GateTest(ApplyTest):
         self.scenario_brew()
         self.modules["brew_ports.verify"] = b.verify_module({True: [("installed", "jq -> jq", "jq is not installed")]})
         self.assertEqual(self.apply(), executor.EXIT_ACTION)
-        for text in ("the gate failed: no source package was removed", "--keep jq", f"rollback {self.run_dir.run_id}",
+        for text in ("the gate failed: no source package was removed", "--leave jq", f"rollback {self.run_dir.run_id}",
                      "FAIL jq -> jq (replacements installed): jq is not installed"):
             self.assertIn(text, self.out)
         self.assertEqual(self.responder.ran("port", "uninstall"), [])
@@ -484,7 +485,7 @@ class MarkerTest(ApplyTest):
         self.scenario_brew()
         self.assertEqual(self.apply(yes=False, tty=True, answers=[True, False]), executor.EXIT_ACTION)
         self.assertEqual(len(self.ctx.asked), 2)
-        self.assertIn("Run phase 3 (install)?", self.ctx.asked[1])
+        self.assertIn("Run phase 3 (install the replacements)?", self.ctx.asked[1])
         self.assertEqual(self.responder.ran("brew", "install"), [])
         self.assertIn("apply --resume", self.out)
 
@@ -493,7 +494,7 @@ class PhaseSixTest(ApplyTest):
     """Phase 6 through the stand-in for `remove_manager`"""
 
     def plan_with_phase6(self):
-        """Plan the move of scenario A with `--remove-old` for its MacPorts source"""
+        """Plan the move of scenario A, which uninstalls its MacPorts source afterwards"""
         self.scenario_brew()
         note = model.Action(action_id=f"6.note.{state.slug(self.source.prefix)}.checks", kind="note", argv=[],
                             sudo=False, description="the checks", manual=True)
@@ -514,6 +515,45 @@ class PhaseSixTest(ApplyTest):
         survivors_bundle, = self.modules["brew_ports.envclean"].bundles
         self.assertIsNot(survivors_bundle, call["bundle"])
         self.assertEqual(self.host.scans, 5)                 # phases 0, 4, 6, 7 and 8
+
+    def test_a_no_leaves_the_manager_installed_and_the_run_goes_on(self):
+        self.plan_with_phase6()
+        code = self.apply(yes=False, tty=True, answers=[True, True, True, False])
+        self.assertEqual(code, executor.EXIT_OK, self.out)
+        self.assertEqual(len(self.ctx.asked), 4)
+        self.assertIn("Run phase 6 (uninstall the old managers)", self.ctx.asked[3])
+        where = f"MacPorts at {self.source.prefix}"
+        self.assertIn(f"  a no leaves {where} installed, without its packages, and the run goes on\n", self.out)
+        self.assertIn(f"  {where} stays installed, as you answered; a new plan can uninstall it later\n", self.out)
+        self.assertEqual(self.modules["brew_ports.remove_manager"].calls, [])
+        self.assertEqual([e["prefixes"] for e in self.entry(executor.DECLINED)], [[self.source.prefix]])
+        results = self.results()
+        self.assertEqual([results.get((n, f"{n}.complete")) for n in (6, 7, 8)], ["ok", "ok", "ok"])
+
+    def test_a_resume_after_a_no_does_not_ask_again(self):
+        self.plan_with_phase6()
+        code = self.apply(yes=False, tty=True, answers=[True, True, True, False], stop_after=6)
+        self.assertEqual(code, executor.EXIT_OK, self.out)
+        # A finding that stops the uninstall of a manager is beside the point for one that stays.
+        self.issues = [doctor._issue("ports-damaged-registry", Severity.HIGH, "title", None, self.source.prefix,
+                                     evidence=[], remedies=[], blocks=(Blocks.REMOVE,))]
+        code = self.apply(resume=self.run_dir.run_id, yes=False, tty=True, answers=[True])
+        self.assertEqual(code, executor.EXIT_OK, self.out)
+        self.assertEqual([q.split(" (")[0] for q in self.ctx.asked], ["Run phase 5"])
+        self.assertIn(f"  MacPorts at {self.source.prefix} stays installed, as you answered\n", self.out)
+        self.assertEqual(self.modules["brew_ports.remove_manager"].calls, [])
+
+    def test_no_terminal_and_no_yes_still_stops_at_phase_6(self):
+        self.scenario_brew()
+        note = model.Action(action_id=f"6.note.{state.slug(self.source.prefix)}.checks", kind="note", argv=[],
+                            sudo=False, description="the checks", manual=True)
+        self.host.services = []
+        self.save_plan(b.plan(self.target, [self.source], phase6=[note], remove=[self.source.prefix]))
+        self.assertEqual(self.apply(stop_after=1), executor.EXIT_OK, self.out)
+        self.assertEqual(self.apply(resume=self.run_dir.run_id, yes=False), executor.EXIT_ACTION)
+        self.assertIn("phase 6 was not confirmed (no terminal: --yes answers every phase)", self.out)
+        self.assertEqual(self.entry(executor.DECLINED), [])
+        self.assertEqual(self.modules["brew_ports.remove_manager"].calls, [])
 
     def test_a_resumed_phase_6_says_so(self):
         self.plan_with_phase6()
@@ -550,7 +590,7 @@ class ReportTest(ApplyTest):
         self.assertIn("USER=<user>", text)
         self.assertNotIn("/Users/alice", text)
         self.assertTrue(text.startswith(f"# brew-ports apply {self.run_dir.run_id}"))
-        self.assertIn("## phase 5: remove source packages", text)
+        self.assertIn("## phase 5: uninstall the old packages", text)
         self.assertEqual(self.modules["brew_ports.envclean"].applied, [[edit]])
 
 

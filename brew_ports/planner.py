@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import doctor, model, plan_phases, plan_report, plan_sets, progress, scan, state
+from . import doctor, envclean, model, plan_phases, plan_report, plan_sets, progress, report, scan, state
 from .context import Context
 from .env import interpreters as env_interpreters
 from .equiv import repology as repology_mod, resolver
@@ -20,6 +20,7 @@ from .homebrew import locate as brew_locate
 from .macports import locate as mp_locate
 from .model import Confidence, Instance, Issue, Manager, Mapping, Plan
 from .plan_sets import DROPPED, KEPT, MIGRATED, UNMIGRATABLE, WITHDRAWN, Key, Root, SourceGraph, Unit
+from .report import COMMAND_OF, at, manager_name, place, possessive, some, typed
 from .runner import ActionFailed, BaseRunner, EscalationFailed, PreflightError, start_run
 
 EXIT_OK = 0
@@ -31,6 +32,16 @@ EXIT_ACTION = 4
 PLAN_FILE = "plan.json"
 REFUSED_FILE = "plan-refused.json"
 NO_RECORD = plan_sets.NO_RECORD
+ONLY_DELETES_NOTHING = ("--only moves just the named packages, so no old installation is deleted. "
+                        "Leave out --only or --delete")
+# Where `--refresh` stands when a pass plans, and how a missing package list then ends its error.
+BEFORE, DECLINED, UNASKED, DONE = "before", "declined", "unasked", "done"
+NO_LIST = {
+    None: ". Plan again with --refresh added, which fetches it first",
+    DECLINED: ". Plan again and answer yes to the update that --refresh offers, which fetches it",
+    UNASKED: ". --refresh asks before it fetches one, and there is no terminal to ask on: plan again with --yes added",
+    DONE: ", although the update ran. `brew-ports doctor` shows what is wrong with it",
+}
 LANGUAGE_FILE = "language-%s.txt"
 LANGUAGE_HELP = {
     "pip": "# Python packages: `pipx install <name>` for one that installs commands, `python3 -m venv` for a "
@@ -41,7 +52,7 @@ LANGUAGE_HELP = {
 }
 
 
-def _names(values: Sequence[str] | None) -> list[str]:
+def split_names(values: Sequence[str] | None) -> list[str]:
     """Split repeated comma lists: `--only a,b --only c` -> ['a', 'b', 'c']
 
     @param values  the values of a repeated option, each a comma list; None when the option is absent
@@ -69,18 +80,18 @@ class PlanOptions:
     target: Manager
     target_prefix: str | None = None
     only: list[str] = field(default_factory=list)
-    keep: list[str] = field(default_factory=list)
-    drop: list[str] = field(default_factory=list)
-    maps: list[str] = field(default_factory=list)          # raw SOURCE=TARGET values
-    accept_medium: bool = False
+    keep: list[str] = field(default_factory=list)          # --leave
+    drop: list[str] = field(default_factory=list)          # --uninstall
+    maps: list[str] = field(default_factory=list)          # --replace: raw OLD=NEW values
+    accept_medium: bool = False                            # --accept-closest
     yes: bool = False
-    casks: str | None = None                            # None: the default keep, not given explicitly
-    lang_packages: str = "report"
+    casks: str | None = None                            # keep, drop or map; None: the default keep, not given
+    lang_packages: str = "report"                          # pipx with --pipx
     start_services: bool = False
-    remove_manager: list[str] | None = None             # None: absent; []: every source instance
+    keep_managers: bool = False                            # uninstall no old installation
+    delete: list[str] = field(default_factory=list)        # the old installations to delete whatever their state
     repology: bool = False
     refresh: bool = False
-    dry_run: bool = False
     out: str | None = None
     rescan: bool = False
 
@@ -89,15 +100,14 @@ class PlanOptions:
         """Build the options from the `plan` subparser's namespace
 
         @param args  the parsed `plan` command line
-        @returns     the options, with the comma lists of `--only`, `--keep`, `--drop` and `--remove-old` split
+        @returns     the options, with the comma lists of `--only`, `--leave`, `--uninstall` and `--delete` split
         """
-        remove = None if args.remove_manager is None else _names([args.remove_manager])
-        return cls(target=Manager(args.target), target_prefix=args.target_prefix, only=_names(args.only),
-                   keep=_names(args.keep), drop=_names(args.drop), maps=list(args.map or []),
+        return cls(target=Manager(args.target), target_prefix=args.target_prefix, only=split_names(args.only),
+                   keep=split_names(args.keep), drop=split_names(args.drop), maps=list(args.map or []),
                    accept_medium=args.accept_medium, yes=args.yes, casks=args.casks,
-                   lang_packages=args.lang_packages, start_services=args.start_services, remove_manager=remove,
-                   repology=args.repology, refresh=args.refresh, dry_run=args.dry_run, out=args.out,
-                   rescan=args.rescan)
+                   lang_packages=args.lang_packages, start_services=args.start_services,
+                   keep_managers=args.keep_managers, delete=split_names(args.delete), repology=args.repology,
+                   refresh=args.refresh, out=args.out, rescan=args.rescan)
 
     @property
     def cask_policy(self) -> str:
@@ -111,7 +121,7 @@ class PlanOptions:
         """Return the options as `Plan.options` text, with the target prefix and removed instances resolved
 
         @param target_prefix  the prefix of the chosen target
-        @param removed        the prefixes of the instances `--remove-old` names
+        @param removed        the prefixes of the old installations the plan uninstalls after the move
         @returns              each option's text by name: a flag `true` or `false`, a list joined with commas
         """
         return {"target": self.target.value, "target_prefix": target_prefix, "only": ",".join(self.only),
@@ -119,8 +129,8 @@ class PlanOptions:
                 "accept_medium": _flag(self.accept_medium), "yes": _flag(self.yes), "casks": self.cask_policy,
                 "casks_explicit": _flag(self.casks is not None), "lang_packages": self.lang_packages,
                 "start_services": _flag(self.start_services), "remove_manager": ",".join(removed),
-                "repology": _flag(self.repology), "refresh": _flag(self.refresh), "dry_run": _flag(self.dry_run),
-                "out": self.out or ""}
+                "keep_managers": _flag(self.keep_managers), "delete": ",".join(self.delete),
+                "repology": _flag(self.repology), "refresh": _flag(self.refresh), "out": self.out or ""}
 
 
 @dataclass
@@ -129,10 +139,11 @@ class PlanOutcome:
 
     plan: Plan | None            # the plan, on exit 0 only
     exit_code: int
-    report: list[str]
+    report: list[str]            # the lines for standard output
     result_file: str | None      # "plan.json" or "plan-refused.json"
     path: str | None = None
     draft: Plan | None = None    # the refused plan, when one was built
+    problems: list[str] = field(default_factory=list)   # why there is no plan: the lines for the error stream
 
 
 class _Defaults:
@@ -203,9 +214,20 @@ class Draft:
     refusals: list[str] = field(default_factory=list)       # why the plan is refused (exit 1)
     blocking: list[Issue] = field(default_factory=list)     # the findings that block it (exit 3)
     notes: list[str] = field(default_factory=list)
+    todo: list[str] = field(default_factory=list)           # what the user has to do before `apply`
+    unreadable: set[str] = field(default_factory=set)       # the old installations whose packages cannot be read
     language_files: dict[str, str] = field(default_factory=dict)
     stops: list[model.Service] = field(default_factory=list)  # owned services phase 5 stops
-    removed: list[Instance] = field(default_factory=list)   # instances --remove-old names
+    removed: list[Instance] = field(default_factory=list)   # the old installations the plan uninstalls
+    candidates: list[Instance] = field(default_factory=list)  # those it uninstalls if the move leaves them empty
+    stays: dict[str, str] = field(default_factory=dict)     # prefix -> why an old installation is not uninstalled
+    settled: bool = False                                   # the sets are computed, so `removed` and `stays` hold
+    only: bool = False                                      # --only: a move of the named packages
+    accept_closest: bool = False                            # --accept-closest
+    start_services: bool = False                            # --start-services
+    pipx: bool = False                                      # --pipx
+    nothing: list[str] = field(default_factory=list)        # why there is nothing to plan, which is no error
+    installed: set[str] = field(default_factory=set)        # the names of the target's active packages
     units: dict[Key, Unit] = field(default_factory=dict)    # every source unit
 
 
@@ -222,11 +244,54 @@ def _migrated_mapping(root: Root) -> Mapping:
     return root.mapping
 
 
+def listed(bundle: scan.ScanBundle, target: Instance) -> bool:
+    """Return whether the scan holds a package list of the target, in which replacements are looked up
+
+    A Homebrew without one still has a catalogue, whose source is `none`.
+
+    @param bundle  the scan
+    @param target  the installation the packages move into
+    @returns       True when it has a package list
+    """
+    if target.manager is Manager.BREW:
+        catalogue = bundle.catalogue(target.prefix)
+        return catalogue is not None and catalogue.source != "none"
+    return bundle.portindex(target.prefix) is not None
+
+
+def _has(found: Sequence[Instance], manager: str) -> str:
+    """Return what follows "there is no <manager> at <path>": the installations of it that this Mac has
+
+    @param found    its installations
+    @param manager  `Homebrew` or `MacPorts`
+    @returns        the rest of the sentence
+    """
+    if not found:
+        return f": {manager} is not installed"
+    return f": this Mac has {' and '.join(at(inst) for inst in found)}"
+
+
+def _elsewhere(manager: str, usual: str, found: Sequence[Instance]) -> str:
+    """Return the error of a move into a manager that this Mac has, but not at its usual place
+
+    @param manager  `Homebrew` or `MacPorts`
+    @param usual    its usual place on this Mac
+    @param found    its installations, none of them at the usual place
+    @returns        what was found, and how to name the installation the packages move into
+    """
+    names = " and ".join(place(i) for i in found)
+    if len(found) == 1:
+        return (f"this Mac has no {manager} at {usual}, only {names}. To move the packages into that one, plan with "
+                f"--target-prefix {found[0].prefix}")
+    return (f"this Mac has no {manager} at {usual}. It has {names}: say which one the packages move into with "
+            "--target-prefix")
+
+
 class _Composer:
     """One pass of `plan` over one scan"""
 
     def __init__(self, bundle: scan.ScanBundle, options: PlanOptions, runner: Any, *, ask: Any,
-                 state_dir: state.StateDir | None, run_dir: state.RunDir | None) -> None:
+                 state_dir: state.StateDir | None, run_dir: state.RunDir | None, refresh: str | None = None) -> None:
         """Start a pass with an empty draft
 
         @param bundle     the scan
@@ -235,6 +300,8 @@ class _Composer:
         @param ask        answers the terminal questions
         @param state_dir  the state directory, or None
         @param run_dir    the run directory, or None
+        @param refresh    where `--refresh` stands: `BEFORE` its question, which a missing package list never
+                          stops, `DECLINED`, `UNASKED` or `DONE`; None without the option
         """
         self.bundle = bundle
         self.result = bundle.result
@@ -244,9 +311,11 @@ class _Composer:
         self.ask = ask
         self.state_dir = state_dir
         self.run_dir = run_dir
+        self.refresh = refresh
         self.host_arch = runner.host_arch
         self.environ: dict[str, str] = dict(runner.environ)
-        self.draft = Draft()
+        self.draft = Draft(only=bool(options.only), accept_closest=options.accept_medium,
+                           start_services=options.start_services, pipx=options.lang_packages == "pipx")
         self.sources: list[Instance] = []
         self.graphs: dict[str, SourceGraph] = {}
         self.maps: dict[str, str] = {}
@@ -255,7 +324,9 @@ class _Composer:
         self.dropped: set[Key] = set()
         self.extra_kept: dict[Key, str] = {}
         self.issues: list[Issue] = []
-        self.removed: list[Instance] = []          # the instances --remove-old names
+        self.removed: list[Instance] = []          # the old installations the plan uninstalls after the move
+        self.forced: list[Instance] = []           # those of them that --delete names
+        self.refusals: list[str] = []              # the refusals that the sets do not find
         self.told = False                          # the first question carries the overview
         # Placeholders until compose() reaches the step that computes each; no earlier step reads them.
         self.ctx = resolver.Context(target=self.manager)
@@ -281,7 +352,7 @@ class _Composer:
             self.compose()
         except _Stop as stop:
             self.draft.exit_code = stop.code
-            self.draft.errors.extend(stop.lines)
+            (self.draft.nothing if stop.code == EXIT_OK else self.draft.errors).extend(stop.lines)
             self.draft.blocking.extend(stop.blocking)
         return self.draft
 
@@ -294,7 +365,10 @@ class _Composer:
             self.maps = resolver.parse_maps(self.options.maps)
         except ValueError as exc:
             raise _Stop(EXIT_USAGE, [str(exc)]) from None
+        self.check_out()
         self.choose_target()
+        if not self.sources:
+            raise _Stop(EXIT_OK, [f"This Mac has only {place(self.target)}: there is nothing to move."])
         self.make_graphs()
         self.check_names()
         self.ctx = self.make_context()
@@ -308,6 +382,20 @@ class _Composer:
         self.final_blocking()
         self.finish()
 
+    def check_out(self) -> None:
+        """Refuse an `--out` that cannot hold a file, before any question is asked
+
+        @throws _Stop  exit 2 when it names a folder, or a file in a folder that does not exist
+        """
+        out = self.options.out
+        if not out:
+            return
+        path = os.path.abspath(os.path.expanduser(out))
+        if os.path.isdir(path):
+            raise _Stop(EXIT_USAGE, [f"--out {out}: that is a folder. Name the file the plan is saved as"])
+        if not os.path.isdir(os.path.dirname(path)):
+            raise _Stop(EXIT_USAGE, [f"--out {out}: the folder {os.path.dirname(path)} does not exist"])
+
     # Roles ----------------------------------------------------------------------------------
 
     def choose_target(self) -> None:
@@ -320,11 +408,7 @@ class _Composer:
         if self.options.target is Manager.BREW:
             target = brew_locate.choose_target(instances, self.host_arch, prefix, self.environ)
             if target is None:
-                where = f" at {prefix}" if prefix else ""
-                raise _Stop(EXIT_PREFLIGHT, [
-                    f"no Homebrew instance to install into{where}: install Homebrew (the .pkg of "
-                    "https://github.com/Homebrew/brew/releases, or the instructions at https://brew.sh), "
-                    "then plan again"])
+                raise _Stop(EXIT_PREFLIGHT, [self.no_homebrew(prefix)])
         else:
             try:
                 target = mp_locate.choose_target(instances, self.host_arch, prefix)
@@ -333,16 +417,34 @@ class _Composer:
             if target is None:
                 ports = [i for i in instances if i.manager is Manager.PORTS]
                 if prefix:
-                    text = f"no MacPorts instance at {prefix}"
+                    text = f"there is no MacPorts at {prefix}" + _has(ports, "MacPorts")
                 elif ports:
-                    text = ("several MacPorts instances and none at /opt/local: name the target with "
-                            "--target-prefix")
+                    text = _elsewhere("MacPorts", mp_locate.DEFAULT_PREFIX, ports)
                 else:
-                    text = "MacPorts is not installed: run `brew-ports bootstrap-ports`, then plan again"
+                    text = "MacPorts is not installed. Run `brew-ports bootstrap-ports`, then plan again"
                 raise _Stop(EXIT_PREFLIGHT, [text])
         self.draft.target = target
         self.draft.sources = [i for i in instances if i is not target and i.prefix != target.prefix]
         self.sources = self.draft.sources
+        self.draft.installed = {p.name for p in self.result.packages if p.instance_prefix == target.prefix
+                                and (p.kind != "port" or p.active)}
+
+    def no_homebrew(self, prefix: str | None) -> str:
+        """Return why no Homebrew can take the packages, with what this Mac has in its place
+
+        @param prefix  the `--target-prefix` value, or None
+        @returns       the error: where a working Homebrew was looked for, what was found, and what to do
+        """
+        brews = [i for i in self.result.instances if i.manager is Manager.BREW]
+        default = brew_locate.ARM64_PREFIX if self.host_arch == "arm64" else brew_locate.USR_LOCAL
+        if prefix:
+            return f"there is no Homebrew at {prefix}" + _has(brews, "Homebrew")
+        if not brews:
+            return "Homebrew is not installed. Install it (https://brew.sh), then plan again"
+        here = next((i for i in brews if i.prefix == default), None)
+        if here is not None:
+            return f"nothing can move into {place(here)} as it is. `brew-ports doctor` shows the fix"
+        return _elsewhere("Homebrew", default, brews) + ", or install Homebrew at the usual place (https://brew.sh)"
 
     def make_graphs(self) -> None:
         """Build the dependency graph of each source, and record every source unit in the draft
@@ -359,7 +461,7 @@ class _Composer:
             self.draft.units.update((u.key, u) for u in units)
 
     def named(self, name: str) -> list[Unit]:
-        """Return the units of that name in every source, as `--keep`, `--only` and `--drop` match names
+        """Return the units of that name in every source, as `--leave`, `--only` and `--uninstall` match names
 
         @param name  a package name; a port's matches in any case
         @returns     the units, source by source
@@ -367,7 +469,7 @@ class _Composer:
         return [u for g in self.graphs.values() for u in g.named(name)]
 
     def instance_at(self, path: str) -> Instance | None:
-        """Return the instance whose prefix a `--remove-old` value names
+        """Return the installation at the path a `--delete` value names
 
         @param path  a prefix, in any spelling
         @returns     the instance, or None when none is there
@@ -383,43 +485,79 @@ class _Composer:
         """
         opts = self.options
         errors = []
-        for flag, names in (("--keep", opts.keep), ("--only", opts.only), ("--drop", opts.drop),
-                            ("--map", sorted(self.maps))):
+        where = " or ".join(at(inst) for inst in self.sources) or "any old installation"
+        for flag, names in (("--leave", opts.keep), ("--only", opts.only), ("--uninstall", opts.drop),
+                            ("--replace", sorted(self.maps))):
             for name in names:
                 if not self.named(name):
-                    errors.append(f"{flag} {name}: no source instance has {name} installed")
+                    errors.append(f"{flag} {name}: no package named {name} is installed in {where}")
         for name in sorted(set(opts.keep) & set(opts.drop)):
-            errors.append(f"{name} is named in both --keep and --drop")
-        if opts.remove_manager is not None:
-            if opts.only:
-                errors.append("--remove-old cannot be combined with --only")
-            if not opts.remove_manager:
-                self.removed = list(self.sources)
-            for value in opts.remove_manager:
-                inst = self.instance_at(value)
-                if inst is None:
-                    errors.append(f"--remove-old {value}: no Homebrew or MacPorts instance there")
-                elif inst.prefix == self.target.prefix:
-                    errors.append(f"--remove-old {value}: that is the target")
-                elif inst not in self.removed:
-                    self.removed.append(inst)
-            for inst in self.removed:
-                if (inst.manager is Manager.BREW and self.manager is Manager.PORTS
-                        and opts.casks not in ("drop", "map")):
-                    errors.append(f"--remove-old {inst.prefix}: a Homebrew source of a MacPorts target needs "
-                                  "--casks drop or --casks map, because the default keep leaves Homebrew installed "
-                                  "for its casks")
+            errors.append(f"{name} is named in both --leave and --uninstall")
+        if opts.delete and opts.only:
+            errors.append(ONLY_DELETES_NOTHING)
+        if opts.casks is not None and self.manager is Manager.BREW:
+            errors.append("--casks is for a move into MacPorts (--target ports). Into Homebrew, apps stay where they "
+                          "are and the Homebrew they move into takes over their record")
+        for value in opts.delete:
+            inst = self.instance_at(value)
+            marker = plan_phases.marker_missing(inst) if inst is not None else None
+            if inst is None:
+                errors.append(f"--delete {value}: there is no Homebrew or MacPorts there")
+            elif inst.prefix == self.target.prefix:
+                errors.append(f"--delete {value}: that is where the packages move to")
+            elif marker:
+                errors.append(f"--delete {value}: {marker}, and brew-ports deletes no folder that it cannot tell is a "
+                              "manager's")
+            elif inst not in self.forced:
+                self.forced.append(inst)
         if errors:
             raise _Stop(EXIT_USAGE, errors)
-        self.draft.removed = self.removed
+        # A name matches a port in any case; the matcher looks a package up by its own spelling.
+        self.maps = {unit.name: new for old, new in self.maps.items() for unit in self.named(old)}
         self.keep = {u.key for n in opts.keep for u in self.named(n)}
         self.only = {u.key for n in opts.only for u in self.named(n)} if opts.only else None
+        self.draft.candidates = self.candidates()
+
+    def candidates(self) -> list[Instance]:
+        """Return the old installations the plan uninstalls if the move leaves them empty
+
+        A full move takes every old installation that looks like its manager's, whose command runs and whose
+        packages are known; `--delete` adds the ones it names, whatever their state. `--only` and
+        `--keep-managers` take none by themselves.
+
+        @returns  the installations, in scan order; the overview's `stays` gets the reason of each one left out
+        """
+        out = []
+        self.draft.unreadable = {inst.prefix for inst in self.sources if envclean.unlistable(inst)}
+        for inst in self.sources:
+            marker = plan_phases.marker_missing(inst)
+            if inst in self.forced:
+                out.append(inst)
+            elif self.options.only:
+                continue
+            elif self.options.keep_managers:
+                self.draft.stays[inst.prefix] = "stays installed, as you asked (--keep-managers)"
+            elif marker:
+                self.draft.stays[inst.prefix] = f"stays installed: {marker}, and brew-ports deletes no such folder"
+            elif not inst.inventory_known:
+                self.draft.stays[inst.prefix] = ("stays installed: brew-ports cannot read its record of installed "
+                                                 "packages (`brew-ports doctor` says why)")
+            elif inst.prefix in self.draft.unreadable:
+                self.draft.stays[inst.prefix] = ("stays installed: its Cellar or Caskroom folder cannot be read, so "
+                                                 "brew-ports cannot tell that it will be empty")
+            elif not inst.drivable:
+                self.draft.stays[inst.prefix] = (
+                    "stays installed, since nothing can be uninstalled from it (`brew-ports doctor` says why its "
+                    f"command cannot run); `--delete {inst.prefix}` deletes it whole after the move")
+            else:
+                out.append(inst)
+        return out
 
     def make_context(self) -> resolver.Context:
         """Return the resolver's view of the target: its catalogue or PortIndex, its packages and the options
 
         @returns       the resolver context
-        @throws _Stop  exit 2 when a `--map` entry names no usable target
+        @throws _Stop  exit 2 when a `--replace` entry names no usable target; exit 3 without a package list
         """
         brew = self.manager is Manager.BREW
         prefix = self.target.prefix
@@ -436,9 +574,9 @@ class _Composer:
             downloads=downloads,
             source_catalogues={inst.prefix: cat for inst, cat, _ in self.bundle.brew
                                if cat is not None and inst.prefix != prefix})
-        if (ctx.catalogue if brew else ctx.portindex) is None:
-            self.draft.notes.append(f"the target {prefix} has no {'offline catalogue' if brew else 'PortIndex'}: "
-                                    "no root can be mapped (`plan --refresh` fetches one)")
+        if not listed(self.bundle, self.target) and self.refresh != BEFORE:
+            raise _Stop(EXIT_PREFLIGHT, [f"this Mac has no package list for {at(self.target)}, so no replacement "
+                                         f"can be looked up{NO_LIST[self.refresh]}"])
         errors = []
         for name in sorted(self.maps):
             for unit in self.named(name):
@@ -472,7 +610,7 @@ class _Composer:
                                      only=self.only, ties=self.ties)
 
     def resolve(self) -> None:
-        """Map each root to the target after choosing the plan's Python; a `--keep` root stays unmapped"""
+        """Map each root to the target after choosing the plan's Python; a `--leave` root stays unmapped"""
         roots = [r.unit.pkg for r in self.draft.roots.values() if r.key not in self.keep]
         self.ctx.python_version = resolver.plan_python(roots, self.ctx)
         progress.step("matching packages")
@@ -485,50 +623,87 @@ class _Composer:
                 progress.count()
 
     def check_drop(self) -> None:
-        """Refuse a `--drop` name that is neither an unmigratable root nor a port with only inactive versions
+        """Refuse a `--uninstall` name that is neither an unmigratable root nor a port with only inactive versions
 
-        @throws _Stop  exit 2, a line per refused name
+        @throws _Stop  exit 2, a line per refused name that says why the option does not apply to it
         """
         errors = []
         for name in self.options.drop:
-            hits = []
+            hits, reasons = [], []
             for unit in self.named(name):
                 root = self.draft.roots.get(unit.key)
-                if unit.inactive_only or (root is not None and root.mapping is not None
-                                          and not resolver.accepted(root.mapping, self.ctx)):
+                why = self.fixed(unit) or self.undroppable(unit, root)
+                if why:
+                    reasons.append(why)
+                else:
                     hits.append(unit.key)
             if not hits:
-                errors.append(f"--drop {name}: {name} is neither an unmigratable root nor a port whose every version "
-                              "is inactive")
+                errors.append(f"--uninstall {name}: {reasons[0]}")
             self.dropped.update(hits)
         if errors:
             raise _Stop(EXIT_USAGE, errors)
 
+    def undroppable(self, unit: Unit, root: Root | None) -> str | None:
+        """Return why `--uninstall` does not apply to a package, or None when it does
+
+        The option is for a package the user installed that gets no replacement, and for a port with only
+        inactive versions.
+
+        @param unit  a unit the option names
+        @param root  the unit's root, or None when it is none
+        @returns     the reason, as the usage error ends
+        """
+        name = unit.name
+        if unit.inactive_only:
+            return None
+        if root is None:
+            if self.only is not None and unit.key not in self.only:
+                return f"{name} is not among the packages --only names"
+            if unit.kind == "cask":
+                return f"{name} is an app, and {plan_sets.KEPT_APP}"
+            return f"{name} is a dependency: the move uninstalls it once nothing that stays needs it"
+        if root.mapping is None:
+            return f"{name} stays where it is, as --leave says"
+        if resolver.accepted(root.mapping, self.ctx):
+            return f"{name} has a replacement and moves. To leave it where it is, plan with `--leave {name}`"
+        return None
+
     # Blocking findings -----------------------------------------------------------------------
 
     def early_blocking(self) -> None:
-        """Stop on an undrivable target and on the findings that block whatever the answers
+        """Stop on a target whose command cannot run and on the findings that block whatever the answers
 
-        Those are the CRITICAL ones, `ANY`, the target's `TARGET` and the named instances' `REMOVE`.
+        Those are the CRITICAL ones, `ANY`, the target's `TARGET` and the `REMOVE` of the installations `--delete`
+        names. A finding that only stops the uninstall of an installation the move would empty keeps that
+        installation, and the overview says why.
 
         @throws _Stop  exit 3, with the blocking findings
         """
         self.issues = list(doctor.detect_all(self.bundle, self.runner))
-        context = doctor.PlanContext(target_prefix=self.target.prefix,
-                                     remove_prefixes=tuple(i.prefix for i in self.removed))
+        target = self.target.prefix
+        plain = doctor.blocking(self.issues, doctor.PlanContext(target_prefix=target))
+        for inst in [i for i in self.draft.candidates if i not in self.forced]:
+            context = doctor.PlanContext(target_prefix=target, remove_prefixes=(inst.prefix,))
+            held = [issue for issue in doctor.blocking(self.issues, context) if issue not in plain]
+            if held:
+                self.draft.candidates.remove(inst)
+                self.draft.stays[inst.prefix] = ("stays installed, because a problem stops its uninstall: "
+                                                 f"{held[0].title}. `brew-ports doctor` shows what was found")
+        context = doctor.PlanContext(target_prefix=target, remove_prefixes=tuple(i.prefix for i in self.forced))
         self.block(doctor.blocking(self.issues, context))
 
     def block(self, found: list[Issue]) -> None:
-        """Stop when the target cannot be driven or a finding blocks the plan
+        """Stop when the target's command cannot run or a finding blocks the plan
 
         @param found   the findings that block the plan
         @throws _Stop  exit 3, a line per reason, with the findings
         """
         lines = []
         if not self.target.drivable:
-            detail = f": {self.target.usability_detail}" if self.target.usability_detail else ""
-            lines.append(f"the target {self.target.prefix} cannot be driven ({self.target.usability.value}{detail}): "
-                         "`brew-ports doctor` names the repair")
+            first = (self.target.usability_detail or "").strip().splitlines()[:1]
+            detail = f" ({first[0].rstrip(':')})" if first else ""
+            lines.append(f"nothing can move into {at(self.target)}: its `{COMMAND_OF[self.manager]}` command cannot "
+                         f"run{detail}. `brew-ports doctor` shows the fix")
         lines += doctor.blocked_by_lines(found)
         if lines:
             raise _Stop(EXIT_PREFLIGHT, lines, found)
@@ -563,7 +738,7 @@ class _Composer:
         """
         if not self.told:
             self.told = True
-            question = "\n".join(plan_report.overview(self.target, self.sources, self.removed) + ["", question])
+            question = "\n".join(plan_report.overview(self.draft) + ["", question])
         return self.ask.choose(question, options, default)
 
     def questions(self) -> None:
@@ -586,28 +761,55 @@ class _Composer:
         @param mapping  its mapping
         """
         ok = resolver.accepted(mapping, self.ctx)
-        if (not ok and mapping.confidence is Confidence.MEDIUM and mapping.target_name
-                and not resolver.is_language(mapping) and root.key not in self.dropped):
+        closest = (f"{mapping.target_kind} {mapping.target_name}" if mapping.confidence is Confidence.MEDIUM
+                   and mapping.target_name and not resolver.is_language(mapping) else None)
+        asked = False
+        if not ok and closest and root.key not in self.dropped:
+            asked = getattr(self.ask, "tty", False) and not getattr(self.ask, "yes", False)
             answer = self.choose(plan_report.medium_question(root.unit, mapping, self.target), ("yes", "no"), "no")
             ok = resolver.accepted(mapping, self.ctx, answer == "yes")
         if ok:
             root.status = MIGRATED
             return
-        first = mapping.evidence[0] if mapping.evidence else "no equivalent"
-        if mapping.confidence is Confidence.MEDIUM and mapping.target_name and not resolver.is_language(mapping):
-            first = f"its closest match, {mapping.target_kind} {mapping.target_name}, was not accepted"
-        root.note = root.note or first
+        first = mapping.evidence[0] if mapping.evidence else (
+            f"nothing of that name, or like it, is in {possessive(manager_name(self.target))} package list")
+        if closest and asked:
+            first = f"you declined its closest match, {closest}"
+        elif closest:
+            first = (f"its closest match, {closest}, needs your yes: plan on a terminal without --yes, or with "
+                     f"--accept-closest or `--replace {root.unit.name}={mapping.target_name}`")
         unit = root.unit
         if root.key in self.dropped:
             root.status = DROPPED
-        elif resolver.keeps_data(unit.pkg):
+            data = resolver.keeps_data(unit.pkg)
+            detail = (f"its data in {data} will be deleted with it" if data
+                      else f"its closest match would be {closest}" if closest else root.note or first)
+            root.note = f"as you asked (--uninstall); {detail}"
+            return
+        root.note = root.note or first
+        if resolver.keeps_data(unit.pkg) or self.fixed(unit):
             root.status = UNMIGRATABLE
-        elif unit.kind == "cask" and self.manager is Manager.PORTS:
+        elif unit.kind == "cask" and self.manager is Manager.PORTS and not closest:
             root.status = DROPPED
-            root.note = f"--casks map found no accepted mapping ({root.note})"
+            again = f"; to have it again, install it from {unit.pkg.homepage}" if unit.pkg.homepage else ""
+            root.note = f"--casks replace uninstalls it: {root.note}{again}"
         else:
-            question = plan_report.unmigratable_question(unit, root.note, self.target, unit.inst in self.removed)
+            question = plan_report.unmigratable_question(
+                unit, root.note, self.target, emptied=unit.inst in self.draft.candidates,
+                forced=unit.inst in self.forced, manual=unit.kind == "cask" and unit.pkg.privileged_uninstall)
             root.status = DROPPED if self.choose(question, ("keep", "drop"), "keep") == "drop" else UNMIGRATABLE
+
+    def fixed(self, unit: Unit) -> str | None:
+        """Return why the plan cannot uninstall a package whatever the user answers, or None when it can
+
+        @param unit  a source unit
+        @returns     the reason: its installation's command cannot run and `--delete` does not name it
+        """
+        inst = unit.inst
+        if not inst.drivable and inst not in self.forced:
+            return (f"nothing can be uninstalled from {at(inst)}, because its `{COMMAND_OF[inst.manager]}` command "
+                    f"cannot run. `--delete {inst.prefix}` deletes it whole after the move")
+        return None
 
     def write_language_files(self) -> None:
         """Write a requirements file per language, with the names tried as hints and the manual steps
@@ -629,7 +831,9 @@ class _Composer:
             self.draft.language_files[kind] = path
             for root, mapping in roots:
                 if not resolver.accepted(mapping, self.ctx):
-                    reason = f"language package: see {path}"
+                    language = plan_report.LANGUAGE_NAMES.get(kind, kind)
+                    reason = (f"it is a {language} package, which the plan does not move: "
+                              f"{report.tilde(path)} lists what to reinstall")
                     root.note = reason
                     mapping.evidence.insert(0, reason)
 
@@ -648,8 +852,8 @@ class _Composer:
                      if f.active]
             hits = plan_sets.colliding_files(unit.inst, self.target, files)
             if hits:
-                self.withdraw(root, "its files outside the prefix collide with the target's port "
-                              f"({', '.join(hits[:3])})")
+                self.withdraw(root, f"its replacement in {at(self.target)} would overwrite its files outside "
+                              f"{unit.prefix} ({', '.join(hits[:3])})")
 
     def withdraw(self, root: Root, reason: str) -> None:
         """Keep a root for its own sake: no install, and its mapping listed as unmigratable
@@ -679,9 +883,10 @@ class _Composer:
             if inst.prefix in self.graphs:
                 root_owned |= {(inst.prefix, "formula", name) for name in inv.root_owned}
         return plan_sets.Inputs(graphs=self.graphs, target=self.manager, roots=roots, keep=set(self.keep),
-                                dropped=dropped, root_owned=root_owned, ties=self.ties,
+                                dropped=dropped, named=set(self.dropped), root_owned=root_owned, ties=self.ties,
                                 policy=self.options.cask_policy, only=self.only,
-                                remove={i.prefix for i in self.removed}, extra_kept=dict(self.extra_kept))
+                                remove={i.prefix for i in self.removed}, forced={i.prefix for i in self.forced},
+                                extra_kept=dict(self.extra_kept))
 
     def unit(self, key: Key) -> Unit | None:
         """Return the source unit of a key
@@ -692,8 +897,26 @@ class _Composer:
         graph = self.graphs.get(key[0])
         return graph.units.get(key) if graph else None
 
+    def loose_shell(self) -> tuple[str, str] | None:
+        """Return the login shell and its installation's prefix when no package of that old installation owns it
+
+        @returns  `(shell, prefix)`, or None when the shell lies elsewhere or belongs to a package
+        """
+        environment = self.result.environment
+        shell, prefix = environment.get("login_shell"), environment.get("login_shell_prefix")
+        graph = self.graphs.get(prefix or "")
+        if not shell or not prefix or graph is None:
+            return None
+        owner = plan_sets.package_at(graph, shell, environment.get("login_shell_realpath"), self.bundle.owner_of)
+        return None if owner is not None else (shell, prefix)
+
     def compute_sets(self) -> None:
-        """Compute the package sets, again after withdrawing a root that provides the login shell"""
+        """Compute the package sets, then settle which old installations the plan uninstalls
+
+        The sets are computed again after withdrawing a root that provides the login shell, and once more when
+        an installation that the move was to empty keeps something.
+        """
+        self.removed = list(self.draft.candidates)
         self.sets = plan_sets.compute(self.inputs())
         found = plan_sets.login_shell_key(self.result.environment, self.graphs, self.sets,
                                           owner_of=self.bundle.owner_of)
@@ -703,13 +926,42 @@ class _Composer:
             mapping = root.mapping if root is not None and root.status == MIGRATED else None
             executables = self.ctx.catalogue.executables if self.ctx.catalogue is not None else (lambda name: [])
             if not plan_sets.installs_basename(mapping, base, self.manager, executables):
-                reason = f"provides the login shell {self.result.environment.get('login_shell')}"
+                shell = self.result.environment.get("login_shell")
+                lacks = (f"its replacement, {mapping.target_name}, is not known to provide `{base}`"
+                         if mapping is not None else f"the plan installs no replacement that provides `{base}`")
+                reason = (f"it is your login shell ({shell}), and {lacks}; change your shell first "
+                          "(`chsh -s /bin/zsh`) to move it")
                 if root is not None:
                     self.withdraw(root, reason)
                 else:
                     self.extra_kept[key] = reason
                 self.sets = plan_sets.compute(self.inputs())
+        self.settle()
         self.draft.sets = self.sets
+
+    def settle(self) -> None:
+        """Keep each old installation that the move does not leave empty, and say why in the overview
+
+        An installation `--delete` names is never kept here: the plan is refused when it holds something. A login
+        shell that lies in an installation and belongs to no package of it holds it too.
+        """
+        shell = self.loose_shell()
+        for inst in list(self.removed):
+            why = self.sets.holds(inst.prefix, self.draft.units, command=False)
+            if not why and shell is not None and shell[1] == inst.prefix:
+                why = (f"your login shell ({shell[0]}) is inside it and belongs to no package: change your shell "
+                       "first (`chsh -s /bin/zsh`), then plan again")
+                if inst in self.forced:
+                    self.refusals.append(f"--delete {inst.prefix}: {at(inst)} cannot be deleted while {why}")
+            if why and inst in self.forced:
+                self.draft.stays[inst.prefix] = f"stays installed although --delete names it: {why}"
+            elif why:
+                self.removed.remove(inst)
+                self.draft.stays[inst.prefix] = f"stays installed, because {why}"
+        if len(self.removed) != len(self.draft.candidates):
+            self.sets = plan_sets.compute(self.inputs())
+        self.draft.removed = self.removed
+        self.draft.settled = True
 
     # Phases, upgrades and refusals ------------------------------------------------------------------
 
@@ -752,7 +1004,7 @@ class _Composer:
                                                                removed=removed, racks=racks,
                                                                gone={i.prefix for i in self.removed},
                                                                owner_of=self.bundle.owner_of)
-        self.draft.notes += [f"remaining cross-prefix link: {line}" for line in remaining]
+        self.draft.notes += remaining
         return rebuild
 
     def outdated(self) -> dict[str, str]:
@@ -775,11 +1027,14 @@ class _Composer:
         rebuild = [n for n in self.rebuilds() if view.key(n) not in {view.key(r) for r in repaired}]
         ups = plan_phases.upgrades(view, targets, repaired + rebuild, self.outdated())
         self.draft.upgrades = ups
-        refusals = list(self.sets.refusals)
+        refusals = list(self.sets.refusals) + self.refusals
         for name, roots in sorted(ups.pinned.items()):
-            refusals.append(f"the pinned {name} would be upgraded ({ups.reasons.get(name)}), which the mappings of "
-                            f"{', '.join(roots) or 'the plan'} need: run `brew unpin {name}`, or plan again with those "
-                            "roots in --keep")
+            needed = (f"the replacement{'' if len(roots) == 1 else 's'} of {some(roots)}" if roots
+                      else "the replacements")
+            leave = f", or plan with `--leave {','.join(roots)}`" if roots else ""
+            unpin = typed([self.target.binary or "brew", "unpin", name])
+            refusals.append(f"installing {needed} would upgrade {name} ({ups.reasons.get(name)}), which you pinned. "
+                            f"Run `{unpin}`{leave}")
         items, projects = plan_phases.installs(mappings)
         if self.manager is Manager.BREW:
             phase3 = plan_phases.phase3_brew(view, self.host_arch, items, projects=projects, explicit=ups.explicit,
@@ -792,7 +1047,7 @@ class _Composer:
         phase6 = plan_phases.phase6(self.removed, self.target, self.result.services, self.environ, survivors)
         phases = plan_phases.assemble(plan_phases.phase2(repairs), phase3, phase6, bool(self.removed))
         self.draft.stops = self.stops()
-        self.draft.notes += self.user_jobs()
+        self.draft.todo += self.user_jobs()
         self.draft.notes += self.sets.notes
         self.draft.plan = self.plan(phases)
         if refusals:
@@ -825,8 +1080,11 @@ class _Composer:
                 continue
             unit = plan_sets.package_at(graph, svc.program, None, self.bundle.owner_of) if svc.program else None
             if svc.instance_prefix in gone or (unit is not None and unit.key in removed):
-                program = svc.program or f"a program under {svc.instance_prefix}"
-                out.append(f"will stop working: {svc.plist} runs {program}; edit or remove it by hand")
+                program = svc.program or f"a program in {svc.instance_prefix}"
+                wait = " `apply` stops before it deletes the installation while the service runs." if (
+                    svc.instance_prefix in gone) else ""
+                out.append(f"Your own service {report.tilde(svc.plist)} runs {program}, which this plan uninstalls. "
+                           f"Point it at the replacement, or delete it.{wait}")
         return out
 
     def packages(self, keys: Iterable[Key]) -> list[model.Package]:
@@ -871,89 +1129,122 @@ class _Composer:
 
 # Files and the outcome --------------------------------------------------------------------------
 
-def _finish(draft: Draft, options: PlanOptions, run_dir: state.RunDir | None, head: Sequence[str]) -> PlanOutcome:
-    """Write `plan.json`, or `plan-refused.json` with the reasons, copy it to `--out` and build the outcome
+def _finish(draft: Draft, options: PlanOptions, run_dir: state.RunDir | None, head: Sequence[str],
+            verbose: bool = False, *, updated: str | None = None, after: Sequence[str] = ()) -> PlanOutcome:
+    """Write `plan.json`, or `plan-refused.json` with the reasons, and build the outcome
+
+    A plan is also copied to `--out`; the reasons of a plan that was not made never replace that file.
 
     @param draft    the pass's draft
     @param options  the plan's options
     @param run_dir  the run directory the file goes into; None writes nothing
     @param head     the report lines that come before the draft's
+    @param verbose  whether the report holds every replacement's reasons and the whole lists
+    @param updated  the installation whose package list `--refresh` updated, as the report names it; its head
+                    line is printed even when no plan follows
+    @param after    the lines that follow the reasons of a plan that was not made
     @returns        the outcome
     """
-    report = list(head) + plan_report.render(draft)
-    ok = draft.exit_code == EXIT_OK and draft.plan is not None
+    if draft.nothing:
+        return PlanOutcome(plan=None, exit_code=EXIT_OK, report=list(draft.nothing), result_file=None)
+    lines = plan_report.render(draft, verbose)
+    if lines and head:
+        lines = list(head) + [""] + lines
+    elif updated:
+        lines = list(head)
+    problems = plan_report.problems(draft)
+    if problems:
+        problems += list(after)
+    exit_code = draft.exit_code
+    ok = exit_code == EXIT_OK and draft.plan is not None
     name = PLAN_FILE if ok else REFUSED_FILE
     if ok:
         text = model.to_json(draft.plan)
     else:
-        text = json.dumps({"refused": {"exit": draft.exit_code, "reasons": draft.errors + draft.refusals,
+        text = json.dumps({"refused": {"exit": exit_code, "reasons": draft.errors + draft.refusals,
                                        "blocking": model.to_plain(draft.blocking)},
                            "plan": model.to_plain(draft.plan) if draft.plan is not None else None,
-                           "report": report}, indent=2, sort_keys=True)
+                           "report": lines + problems}, indent=2, sort_keys=True)
     path = run_dir.write_json(name, text) if run_dir is not None else None
-    if path is not None:
-        report.append(f"{'plan written' if ok else 'refused plan written'}: {path}")
-        if options.out:
-            out = os.path.abspath(os.path.expanduser(options.out))
-            shutil.copyfile(path, out)
-            report.append(f"copied to {out}")
-    return PlanOutcome(plan=draft.plan if ok else None, exit_code=draft.exit_code, report=report,
+    if path is not None and run_dir is not None and ok:
+        out = options.out
+        try:
+            if out:
+                shutil.copyfile(path, os.path.abspath(os.path.expanduser(out)))
+        except OSError as exc:
+            problems.append(f"brew-ports: the plan could not be copied to {out}: {exc.strerror or exc}. It is saved in "
+                            "the run folder")
+            exit_code, out = EXIT_ACTION, None
+        lines += plan_report.closing(path, out, run_dir.path, updated)
+    elif path is not None and exit_code not in (EXIT_USAGE, EXIT_ACTION):
+        problems += plan_report.refused_closing(path)
+    return PlanOutcome(plan=draft.plan if ok else None, exit_code=exit_code, report=lines,
                        result_file=name if path is not None else None, path=path,
-                       draft=None if ok else draft.plan)
+                       draft=None if ok else draft.plan, problems=problems)
 
 
 def _refreshed(bundle: scan.ScanBundle, options: PlanOptions, runner: Any, *, ask: Any,
-               state_dir: state.StateDir | None, run_dir: state.RunDir | None) -> PlanOutcome:
-    """Refresh the target's catalogue, then plan over a fresh inventory
+               state_dir: state.StateDir | None, run_dir: state.RunDir | None, verbose: bool = False) -> PlanOutcome:
+    """Update the target's package list, then plan over a fresh scan
 
-    A first pass with the default answers must find nothing blocking before anything runs.
+    A first pass with the default answers must find nothing that stops the plan before anything runs.
 
     @param bundle     the scan
     @param options    the plan's options
-    @param runner     runs the refresh and the fresh scan; it holds the host's architecture and environment
-    @param ask        answers the terminal questions, the refresh's among them
+    @param runner     runs the update and the fresh scan; it holds the host's architecture and environment
+    @param ask        answers the terminal questions, the update's among them
     @param state_dir  the state directory, or None
     @param run_dir    the run directory, or None
+    @param verbose    whether the report holds every replacement's reasons and the whole lists
     @returns          the outcome
     """
-    first = _Composer(bundle, options, runner, ask=_Defaults(), state_dir=state_dir, run_dir=run_dir).run()
-    if first.exit_code in (EXIT_USAGE, EXIT_PREFLIGHT) or first.target is None:
-        return _finish(first, options, run_dir, ["plan --refresh: refused before the refresh; nothing was run"])
+    first = _Composer(bundle, options, runner, ask=_Defaults(), state_dir=state_dir, run_dir=run_dir,
+                      refresh=BEFORE).run()
+    if first.exit_code in (EXIT_USAGE, EXIT_PREFLIGHT) or first.target is None or first.nothing:
+        return _finish(first, options, run_dir, [], verbose,
+                       after=["The package list was not updated (--refresh): the above comes first"])
     actions = plan_phases.refresh_actions(first.target, runner.host_arch)
-    commands = [doctor.describe(a) for a in actions]
-    head = [f"refresh: {c}" for c in commands]
-    if not ask.confirm(f"Update the package list of {plan_report.place(first.target)} before planning "
-                       f"({'; '.join(commands)})?", default=False):
-        draft = _Composer(bundle, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir).run()
-        return _finish(draft, options, run_dir, head + ["refresh declined: planned against the catalogue as it is"])
+    commands = "; ".join(doctor.describe(a) for a in actions)
+    where = at(first.target)
+    declined = ("the plan uses the list as it is" if listed(bundle, first.target)
+                else "no plan is made, as this Mac has no package list of it yet")
+    if not ask.confirm(f"`{commands}` updates the package list of {where}. If you answer no, {declined}.\n"
+                       "Run it before planning?", default=False):
+        asked = bool(getattr(ask, "tty", False))
+        draft = _Composer(bundle, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir,
+                          refresh=DECLINED if asked else UNASKED).run()
+        why = (", as you answered" if asked else
+               ": --refresh asks first, and there is no terminal to ask on (add --yes to run it)")
+        return _finish(draft, options, run_dir, [f"The package list of {where} was not updated{why}; planned with it "
+                                                 "as it is."], verbose)
     try:
         if any(a.sudo for a in actions):
             runner.sudo_preflight()
     except PreflightError as exc:
-        return _finish(Draft(exit_code=EXIT_PREFLIGHT, target=first.target, errors=[str(exc)]), options, run_dir, head)
+        return _finish(Draft(exit_code=EXIT_PREFLIGHT, target=first.target, errors=[str(exc)]), options, run_dir, [],
+                       verbose)
     if state_dir is not None and run_dir is not None:
         state_dir.touch_dirty(run_dir.run_id, "plan --refresh")
     try:
         for action in actions:
             runner.run(action)
     except (ActionFailed, EscalationFailed) as exc:
-        return _finish(Draft(exit_code=EXIT_ACTION, target=first.target, errors=[f"the refresh failed: {exc}"]),
-                       options, run_dir, head)
+        error = f"{exc}. Nothing was planned. Fix that, or plan without --refresh"
+        return _finish(Draft(exit_code=EXIT_ACTION, target=first.target, errors=[error]), options, run_dir, [], verbose)
     fresh = scan.build(runner, runner.environ)
     try:
         if run_dir is not None:
             scan.write(fresh, run_dir)
-        draft = _Composer(fresh, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir).run()
+        draft = _Composer(fresh, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir, refresh=DONE).run()
     finally:
         fresh.close()
-    return _finish(draft, options, run_dir, head + ["refreshed: planned against a fresh inventory"])
+    return _finish(draft, options, run_dir, [f"Updated the package list of {where} (`{commands}`)."], verbose,
+                   updated=where)
 
 
 def build(bundle: scan.ScanBundle, options: PlanOptions, runner: Any, *, ask: Any,
-          state_dir: state.StateDir | None, run_dir: state.RunDir | None) -> PlanOutcome:
+          state_dir: state.StateDir | None, run_dir: state.RunDir | None, verbose: bool = False) -> PlanOutcome:
     """Plan `bundle` under `options`, with the report lines and the file written into `run_dir`
-
-    `--refresh --dry-run` only lists the refresh commands.
 
     @param bundle     the scan
     @param options    the plan's options
@@ -961,17 +1252,13 @@ def build(bundle: scan.ScanBundle, options: PlanOptions, runner: Any, *, ask: An
     @param ask        answers the terminal questions
     @param state_dir  the state directory, or None
     @param run_dir    the run directory, or None
+    @param verbose    whether the report holds every replacement's reasons and the whole lists
     @returns          the outcome
     """
-    if options.refresh and not options.dry_run:
-        return _refreshed(bundle, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir)
+    if options.refresh:
+        return _refreshed(bundle, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir, verbose=verbose)
     draft = _Composer(bundle, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir).run()
-    head: list[str] = []
-    if options.refresh and draft.target is not None:
-        head = [f"would run: {doctor.describe(a)}"
-                for a in plan_phases.refresh_actions(draft.target, runner.host_arch)]
-        head.append("--dry-run: planned against the catalogue as it is")
-    return _finish(draft, options, run_dir, head)
+    return _finish(draft, options, run_dir, [], verbose)
 
 
 def cmd_plan(ctx: Context, make_runner: Callable[[Context, state.RunDir], BaseRunner] | None = None) -> int:
@@ -990,10 +1277,13 @@ def cmd_plan(ctx: Context, make_runner: Callable[[Context, state.RunDir], BaseRu
         try:
             if reused:
                 env_interpreters.write_requirements(run_dir.path, bundle.result.interpreter_extras)
-                ctx.console.info("plan: reusing the scan of the last ten minutes (--rescan takes a fresh one)")
-            outcome = build(bundle, options, runner, ask=ctx, state_dir=ctx.state, run_dir=run_dir)
+                ctx.console.info("Using the scan taken in the last ten minutes (--rescan takes a new one).")
+            outcome = build(bundle, options, runner, ask=ctx, state_dir=ctx.state, run_dir=run_dir,
+                            verbose=ctx.console.verbose)
         finally:
             bundle.close()
     for line in outcome.report:
         ctx.console.out(line)
+    for line in outcome.problems:
+        ctx.console.warn(line)
     return outcome.exit_code

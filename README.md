@@ -22,7 +22,8 @@ You also usually end up with two copies of the same packages, half of them never
 database. It recommends a manager to keep and migrates your packages to it,
 asking before each phase.
 
-`--remove-old` also removes the old installations entirely.
+A full move also uninstalls each old Homebrew or MacPorts that it leaves empty.
+`--keep-managers` leaves them installed.
 
 > **Status:** every command exists, and unit tests run each one against
 > simulated hosts, but the tool has not yet migrated a real Mac. Until it has,
@@ -103,13 +104,13 @@ brew-ports has nine commands:
 | `doctor [--fix]` | Health checks for both managers. `--fix` offers each remedy for confirmation. |
 | `recommend` | Score both directions by package coverage, casks, bottles, services, and work, and recommend one. |
 | `bootstrap-ports` | Install MacPorts from its signed installer package on a Mac without it. |
-| `plan --target brew\|ports` | Map each package you installed on purpose to a replacement, with its confidence and evidence, and write `plan.json`. |
+| `plan --target brew\|ports` | Find a replacement for each package you installed yourself, ask about the uncertain ones, and write `plan.json`. |
 | `apply PLAN` | Run a plan. |
 | `verify [PLAN]` | Check a run's result against the current state of the Mac. |
 | `env-cleanup [--apply]` | Show the PATH lines, exports, and sourced files of a removed prefix in your shell files. `--apply` removes them. |
 | `rollback RUN-ID` | Reinstall what a run removed, from its snapshot. |
 
-Every command takes `--state-dir DIR`, `--verbose`, `--quiet`, `--no-color`, and `--redact`.
+Every command takes `--state-dir DIR`, `--verbose`, `--quiet`, and `--redact`.
 Commands that change the system take `--yes` and `--dry-run`.
 
 On a terminal, a status line shows the step a command is in and how long it has run. It also names the
@@ -119,14 +120,15 @@ The main `plan` options:
 
 | Option | Meaning |
 | --- | --- |
-| `--only NAME,…` | Migrate only these packages. The source manager stays. |
-| `--keep NAME,…` | Leave these packages installed in the source. |
-| `--drop NAME,…` | Remove these packages without a replacement. |
-| `--map SOURCE=TARGET` | Choose the target package yourself. |
-| `--accept-medium` | Accept medium-confidence mappings without asking. |
-| `--casks keep\|drop\|map` | What to do with Homebrew casks when the target is MacPorts. |
-| `--lang-packages report\|pipx` | Report Python, Node, Ruby, and Perl packages, or reinstall Python tools with `pipx`. |
-| `--remove-old[=PATH,…]` | After the move, uninstall the old installations: all of them, or those at the paths. |
+| `--only NAME,…` | Move only these packages. No manager is uninstalled. |
+| `--leave NAME,…` | Leave these packages, and what they need, in the old installation. |
+| `--uninstall NAME,…` | Uninstall these packages without a replacement. For packages that have none. |
+| `--replace OLD=NEW` | Choose the replacement of a package yourself. |
+| `--accept-closest` | Where a package has no exact replacement, take the closest match without asking. |
+| `--casks keep\|uninstall\|replace` | What becomes of Homebrew's apps (casks) when the packages move into MacPorts. |
+| `--pipx` | Reinstall Python tools without a replacement with `pipx`. By default they are only listed. |
+| `--keep-managers` | Do not uninstall the old Homebrew or MacPorts that the move leaves empty. |
+| `--delete PATH,…` | After the move, delete an old installation whole, although its command cannot run. |
 | `--start-services` | Start the replacements of the services that were running. |
 | `--repology` | Ask repology.org about packages the offline catalogs cannot match. |
 | `--refresh` | Update the target's catalog (`brew update`, `port sync`) first. |
@@ -138,15 +140,15 @@ The main `plan` options:
 
 | Phase | Step |
 | --- | --- |
-| 0 | Preflight: the blocking health findings, the tool checks, the disk check, and `sudo`. |
-| 1 | Snapshot both managers: package lists, `Brewfile`, registry backup, services, shell files. |
-| 2 | Repair the target manager where the packages it installs need repair. |
-| 3 | Install every replacement, then rebuild target packages that link into the old prefix. |
-| 4 | Gate: each replacement must exist, provide its commands, and link cleanly. |
-| 5 | Remove the source packages, after stopping their services. |
-| 6 | Uninstall the old installations, only with `--remove-old`, after archiving their data directories. |
-| 7 | Clean the shell environment and `/etc/paths`. |
-| 8 | Run the `verify` checks, and write `report.md`. |
+| 0 | Checks before starting: the blocking health findings, the tool checks, the disk check, and `sudo`. |
+| 1 | Save a record for undo: package lists, `Brewfile`, registry backup, services, shell files. |
+| 2 | Repair the installation that stays, where the packages it installs need repair. |
+| 3 | Install the replacements, then rebuild packages that link into the old installation. |
+| 4 | Check the replacements: each must exist, provide its commands, and link cleanly. |
+| 5 | Uninstall the old packages, after stopping their services. |
+| 6 | Uninstall each old manager that is now empty, after archiving its data directories. Answering no leaves it installed, and the run goes on. A move with `--only` or `--keep-managers` has no phase 6. |
+| 7 | Clean up the shell files and `/etc/paths`. |
+| 8 | Final check: run the `verify` checks, and write `report.md`. |
 
 `--stop-after N` ends a run after phase N. `apply --resume RUN-ID` continues a
 run: phases 1 to 3 skip the work that succeeded, and the later phases recompute
@@ -170,7 +172,7 @@ Five rules protect the Mac:
 - Every run records a journal, a snapshot of both managers, and a backup of
   every file it edits, which `rollback` restores from.
 - Only installs, `--refresh`, `bootstrap-ports`, `--repology`, and the PyPI
-  lookups of `--lang-packages pipx` use the network. brew-ports checks the
+  lookups of `--pipx` use the network. brew-ports checks the
   MacPorts installer package against a pinned Apple Developer ID signature
   before running it.
 

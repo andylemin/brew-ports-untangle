@@ -382,7 +382,7 @@ def plan(target: model.Instance, sources: Sequence[model.Instance], *, mappings:
     @param phase3        the actions of phase 3
     @param phase6        the actions of phase 6
     @param upgrades      the plan's `target_upgrades`
-    @param remove        the prefixes of `--remove-old`
+    @param remove        the prefixes of the old installations the plan uninstalls
     @param unmigratable  the mappings of packages that are not migrated
     @param options       `PlanOptions` fields, such as `start_services=True`
     @returns             the plan

@@ -301,7 +301,7 @@ class _Direction:
     def coverage(self) -> Term:
         """Score 40 times the share of roots mapped EXACT or HIGH, 40 without roots
 
-        It counts the mappings the default options accept (no `--accept-medium`, `--lang-packages report`): those,
+        It counts the mappings the default options accept (no `--accept-closest`, no `--pipx`): those,
         but no language mapping.
 
         @returns  the row, 0 to 40 points

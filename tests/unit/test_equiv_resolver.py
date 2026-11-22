@@ -1,4 +1,4 @@
-"""The resolver's stages in their order, the version gate, interpreters, `--map` and what maps to nothing"""
+"""The resolver's stages in their order, the version gate, interpreters, `--replace` and what maps to nothing"""
 
 import unittest
 
@@ -175,6 +175,14 @@ class ExecutableStageTest(ResolverCase):
         m = self.into_brew(port("ag-tools", "2.2", executables=["ag", "ag-index", "ag-report"]))
         self.assert_mapped(m, "formula", "the-silver-searcher", MEDIUM)
 
+    def test_a_sole_match_of_another_major_is_named_with_its_option(self):
+        m = self.into_brew(port("ag-tools", "9.0", executables=["ag", "ag-index", "ag-report"]))
+        self.assert_mapped(m, "none", None, NONE)
+        reason = m.evidence[0]
+        self.assertTrue(reason.startswith("the closest find, formula the-silver-searcher "), reason)
+        self.assertTrue(reason.endswith(" has another major version than 9.0; if it is the same software, plan with "
+                                        "`--replace ag-tools=the-silver-searcher`"), reason)
+
     def test_several_weak_matches_give_nothing(self):
         m = self.into_brew(port("cc-mp", "15.0", executables=["gcc-mp-15"]))
         self.assertIsNone(m.target_name)
@@ -290,23 +298,23 @@ class InterpreterTest(ResolverCase):
 
 
 class MapOverrideTest(ResolverCase):
-    """`--map SOURCE=TARGET`: the target it names, its errors and the parser"""
+    """`--replace OLD=NEW`: the target it names, its errors and the parser"""
 
     def test_map_names_the_target(self):
         m = self.into_brew(port("dd_rescue", "1.99"), maps={"dd_rescue": "ddrescue"})
         self.assert_mapped(m, "formula", "ddrescue", EXACT, "1.29")
-        self.assertEqual(m.evidence[0], "--map dd_rescue=ddrescue")
+        self.assertEqual(m.evidence[0], "your choice: --replace dd_rescue=ddrescue")
 
     def test_a_map_target_must_be_in_the_catalogue(self):
         ctx = brew_context(self.tmp, maps={"dd_rescue": "no-such"})
         m = resolve(port("dd_rescue", "1.99"), ctx)
         self.assert_mapped(m, "none", None, NONE)
-        self.assertEqual(m.evidence[0], "--map target no-such is not in the Homebrew catalogue")
+        self.assertEqual(m.evidence[0], "no-such, which you chose with --replace, is not in Homebrew's package list")
         self.assertIsNone(resolver.target_known(ctx, "no-such"))
         self.assertEqual(resolver.target_known(ctx, "gsed"), ("formula", "gnu-sed"))
         self.assertEqual(resolver.target_known(ctx, "docker"), ("cask", "docker-desktop"))
         self.assertEqual(resolver.map_error(port("dd_rescue", "1.99"), ctx),
-                         "--map dd_rescue=no-such: the Homebrew catalogue has no no-such")
+                         "--replace dd_rescue=no-such: Homebrew's package list has no no-such")
 
     def test_map_errors_spare_projects_and_known_targets(self):
         ctx = brew_context(self.tmp, maps={"py313-serial": "pyserial", "dd_rescue": "ddrescue"})
@@ -320,7 +328,7 @@ class MapOverrideTest(ResolverCase):
     def test_map_keeps_a_target_of_another_major(self):
         m = self.into_brew(port("ruby", "1.8.7-p374"), maps={"ruby": "ruby@3.4"})
         self.assert_mapped(m, "formula", "ruby@3.4", EXACT)
-        self.assert_evidence(m, "--map keeps the target")
+        self.assert_evidence(m, "the major version differs; --replace keeps your choice")
 
     def test_parse_maps(self):
         self.assertEqual(resolver.parse_maps(["a=b", " c = d "]), {"a": "b", "c": "d"})
@@ -338,7 +346,7 @@ class NegativeTest(ResolverCase):
         ctx = brew_context(self.tmp)
         m = resolve(port("xyzzy", "1.0"), ctx)
         self.assert_mapped(m, "none", None, NONE)
-        self.assertEqual(m.evidence, ["no equivalent in Homebrew catalogue"])
+        self.assertEqual(m.evidence, ["nothing of that name, or like it, is in Homebrew's package list"])
         self.assertFalse(resolver.accepted(m, ctx))
         self.assertEqual(len(resolver.NO_EQUIVALENT_SUGGESTIONS), 3)
 
@@ -346,9 +354,8 @@ class NegativeTest(ResolverCase):
         ctx = brew_context(self.tmp)
         m = resolve(port("apophenia", "1.0"), ctx)
         self.assert_mapped(m, "formula", "apophenia", NONE)
-        self.assertEqual(m.evidence[:2], [
-            "Homebrew refuses to install apophenia: disabled since 2026-05-16 (unmaintained)",
-            "suggestion: --map apophenia=gsl"])
+        self.assertEqual(m.evidence[0], "Homebrew has disabled apophenia (since 2026-05-16: unmaintained); it names "
+                                        "gsl in its place: plan with `--replace apophenia=gsl`")
         self.assertFalse(resolver.accepted(m, ctx))
         refused = resolve(port("apophenia", "1.0"), brew_context(self.tmp, maps={"apophenia": "apophenia"}))
         self.assertEqual(refused.confidence, NONE)
@@ -360,13 +367,14 @@ class NegativeTest(ResolverCase):
         ctx = brew_context(self.tmp)
         m = resolve(port("libpng16", "1.6.50"), ctx)
         self.assert_mapped(m, "formula", "libpng", LOW)
-        self.assertEqual(m.evidence[0], "fuzzy: libpng16 ~ libpng (libpng); not accepted without --map")
+        self.assertEqual(m.evidence[0], "Homebrew's package list has similar names only (libpng); if one is the same "
+                                        "software, plan with `--replace libpng16=` and that name")
         self.assertFalse(resolver.accepted(m, ctx))
         self.assert_mapped(self.into_brew(port("lz9", "1.0")), "none", None, NONE)
 
     def test_without_a_target_catalogue(self):
         m = resolve(port("wget", "1.25.0"), Context(target=Manager.BREW))
-        self.assertEqual((m.confidence, m.evidence), (NONE, ["no Homebrew catalogue to map against"]))
+        self.assertEqual((m.confidence, m.evidence), (NONE, ["this Mac has no package list for Homebrew yet"]))
 
     def test_requested_variants_are_noted(self):
         m = self.into_brew(port("wget", "1.25.0", requested_variants=["+ssl", "-idn"]))

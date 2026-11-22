@@ -118,7 +118,8 @@ class CasksTest(RecommendCase):
         self.assertEqual((t.points, t.detail), (-10.0, "2 casks: firefox, vlc; --casks keep (the default) leaves "
                                                        "Homebrew installed for them"))
         self.assertEqual([(r.name, r.why, r.accepted, r.evidence[0]) for r in s.roots],
-                         [("miniconda", "keeps data in its Caskroom", False, "keeps data in base")])
+                         [("miniconda", "keeps data in its Caskroom", False,
+                           "it keeps data in base, which uninstalling it would delete")])
         for token in ("zoom", "virtualbox", "docker-desktop", "font-fira-code"):
             self.host.cask(token)
         self.assertEqual(term(self.score("ports"), "casks").points, -25.0)
@@ -329,9 +330,9 @@ class RootsTest(RecommendCase):
         site = prefix + "/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages"
         self.assertEqual(sorted(self.roots()), sorted([
             ("dbus", "1.16.2_0", "owns the service org.freedesktop.dbus-system"),
-            ("python313", "3.13.18_0", f"owns interpreter extras (python 3.13 packages in {site})"),
-            ("nodejs22", "22.23.4_0", "owns interpreter extras (1 npm entry)"),
-            ("mariadb", "11.4.9_0", f"owns the data directory {prefix}/var/db/mariadb")]))
+            ("python313", "3.13.18_0", f"owns Python 3.13 packages in {site}"),
+            ("nodejs22", "22.23.4_0", "owns 1 global npm package"),
+            ("mariadb", "11.4.9_0", f"owns data in {prefix}/var/db/mariadb")]))
 
     def test_the_python_of_pipx_venvs_is_a_root(self):
         self.both()
@@ -341,7 +342,7 @@ class RootsTest(RecommendCase):
                                       "version": "25.9.0", "home": self.host.brew_prefix + "/opt/python@3.13/bin",
                                       "instance_prefix": self.host.brew_prefix}]}
         self.assertEqual(self.roots("ports", self.host.ports_prefix),
-                         [("python@3.13", "3.13.18", "owns interpreter extras (the pipx venv black)")])
+                         [("python@3.13", "3.13.18", "owns the pipx tool black")])
 
     def test_every_other_instance_is_a_source(self):
         self.host.add_brew()
@@ -385,7 +386,7 @@ class TargetTest(RecommendCase):
         s = self.score("ports")
         self.assertIsNone(s.target_prefix)
         self.assertEqual((term(s, "coverage").points, term(s, "unmigratable").points), (0.0, -10.0))
-        self.assertEqual(s.roots[0].evidence, ["no MacPorts catalogue to map against"])
+        self.assertEqual(s.roots[0].evidence, ["this Mac has no package list for MacPorts yet"])
         self.assertIn("no MacPorts: `brew-ports bootstrap-ports` installs it, and every root counts as unmigratable",
                       s.notes)
 
@@ -551,8 +552,8 @@ class CommandTest(RecommendCase):
         self.assertNotIn("Both managers present", out)
         self.assertIn("Term".ljust(len("Source manager undrivable  ")) + "target brew  target ports\n", out)
         self.assertIn(f"target brew: Homebrew at {self.host.brew_prefix}; sources none\n  Coverage: no roots\n", out)
-        self.assertIn(f"  root wget ({self.host.brew_prefix}, installed on request): unmigratable (NONE): no MacPorts "
-                      "catalogue to map against", out)
+        self.assertIn(f"  root wget ({self.host.brew_prefix}, installed on request): unmigratable (NONE): this Mac has "
+                      "no package list for MacPorts yet", out)
         self.assertTrue(out.endswith("Recommendation: target brew (Homebrew), 40.0 points against -10.1 for target "
                                      "ports; nothing to migrate in that direction.\n"), out)
 

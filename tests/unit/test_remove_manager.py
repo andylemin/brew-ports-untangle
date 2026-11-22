@@ -503,11 +503,11 @@ class SafetyTest(MacPortsTest):
         inst = self.source(apps=home)
         under_target = b.write(os.path.join(self.target.prefix, "Library", "LaunchDaemons", "org.macports.t.plist"))
         holds_target = os.path.dirname(self.target.prefix)
-        refused = {home: "it is the home directory or a parent of it",
-                   os.path.dirname(home): "it is the home directory or a parent of it",
-                   under_target: "it is or lies under the target prefix",
+        refused = {home: "it is your home folder, or holds it",
+                   os.path.dirname(home): "it is your home folder, or holds it",
+                   under_target: f"it belongs to Homebrew at {self.target.prefix}, which stays",
                    holds_target: f"it holds {self.target.prefix}, which stays",
-                   "/var": "it is a system directory"}
+                   "/var": "it is a system folder"}
         services = [b.service(f"org.macports.s{n}", path, inst.prefix, f"s{n}", kind="port", scope="system")
                     for n, path in enumerate(sorted(refused)) if path != home]
         lines = self.run_phase(inst, services)

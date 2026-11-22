@@ -6,6 +6,7 @@ import argparse
 import os
 import sys
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from . import (__version__, doctor, envclean, executor, planner, progress, recommend, report, rollback,
                runner as runner_mod, scan as scan_mod, state as state_mod, system, verify)
@@ -18,6 +19,8 @@ EXIT_PREFLIGHT = 3
 EXIT_ACTION = 4
 
 ALIAS_MESSAGE = "run brew-ports directly; brew replaces the environment"
+MANAGERS = {"brew": "brew", "homebrew": "brew", "ports": "ports", "macports": "ports"}
+CASK_POLICIES = {"keep": "keep", "uninstall": "drop", "replace": "map"}     # --casks, as the planner knows it
 
 
 class UsageError(Exception):
@@ -40,9 +43,90 @@ def _global_options(parser: argparse.ArgumentParser, suppress: bool) -> None:
                         help="state directory (default ~/Library/Application Support/brew-ports)")
     parser.add_argument("--verbose", action="store_true", default=default(False), help="print more detail")
     parser.add_argument("--quiet", action="store_true", default=default(False), help="print only results and errors")
-    parser.add_argument("--no-color", action="store_true", default=default(False), help="never colour the output")
     parser.add_argument("--redact", action="store_true", default=default(False),
                         help="redact the home directory and login name in the output")
+
+
+def _manager(value: str) -> str:
+    """Return the manager an option names, by either of its names
+
+    @param value                        `brew` or `homebrew`, `ports` or `macports`, in any case
+    @returns                            `brew` or `ports`
+    @throws argparse.ArgumentTypeError  for any other word
+    """
+    try:
+        return MANAGERS[value.lower()]
+    except KeyError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a manager: give brew (Homebrew) or ports "
+                                         "(MacPorts)") from None
+
+
+def _casks(value: str) -> str:
+    """Return the cask policy `--casks` names, as the planner knows it
+
+    @param value                        `keep`, `uninstall` or `replace`
+    @returns                            `keep`, `drop` or `map`
+    @throws argparse.ArgumentTypeError  for any other word
+    """
+    try:
+        return CASK_POLICIES[value.lower()]
+    except KeyError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not one of keep, uninstall, replace") from None
+
+
+def _add_plan(sub: Any, common: argparse.ArgumentParser) -> None:
+    """Add `plan` and its options to the subcommands
+
+    @param sub     the subcommands of the main parser
+    @param common  the parser of the global options, which every subcommand inherits
+    """
+    p = sub.add_parser(
+        "plan", parents=[common], allow_abbrev=False, help="work out a move of your packages; changes nothing",
+        description="Work out what moving your packages into one manager would install, leave and uninstall. "
+                    "A full move also uninstalls each old Homebrew or MacPorts that it leaves empty. "
+                    "Changes nothing on this Mac; writes plan.json for `brew-ports apply`.",
+        epilog="Example: brew-ports plan --target brew --out plan.json")
+    p.add_argument("--target", required=True, type=_manager, metavar="brew|ports",
+                   help="the manager the packages move into: brew (Homebrew) or ports (MacPorts); "
+                        "`brew-ports recommend` says which")
+    p.add_argument("--target-prefix", metavar="PATH",
+                   help="its folder, when this Mac has several installations of it (default: /opt/homebrew, or "
+                        "/usr/local on Intel; /opt/local for MacPorts)")
+    p.add_argument("--only", action="append", metavar="NAME[,NAME...]",
+                   help="move only these packages, with the dependencies nothing else needs; no manager is "
+                        "uninstalled")
+    p.add_argument("--leave", dest="keep", action="append", metavar="NAME[,NAME...]",
+                   help="leave these packages, and what they need, in the old installation")
+    p.add_argument("--uninstall", dest="drop", action="append", metavar="NAME[,NAME...]",
+                   help="uninstall these packages without a replacement; for packages that have none")
+    p.add_argument("--replace", dest="map", action="append", metavar="OLD=NEW",
+                   help="use the package NEW as the replacement of OLD; repeat the option for more")
+    p.add_argument("--accept-closest", dest="accept_medium", action="store_true",
+                   help="where a package has no exact replacement, take the closest match without asking")
+    p.add_argument("--casks", type=_casks, metavar="keep|uninstall|replace",
+                   help="with --target ports, what becomes of Homebrew's apps (casks): keep them, and Homebrew with "
+                        "them (default); uninstall them; or replace each with its port, ask about one that has only "
+                        "a closest match, and uninstall those that have none")
+    p.add_argument("--pipx", dest="lang_packages", action="store_const", const="pipx", default="report",
+                   help="reinstall Python tools that have no replacement with pipx, which looks them up on "
+                        "pypi.org; by default they are only listed")
+    p.add_argument("--start-services", action="store_true",
+                   help="start the replacement of each service that was running")
+    p.add_argument("--keep-managers", action="store_true",
+                   help="do not uninstall the old Homebrew or MacPorts that the move leaves empty")
+    p.add_argument("--delete", action="append", metavar="PATH[,PATH...]",
+                   help="after the move, delete the old installation at PATH whole, although its command cannot run")
+    p.add_argument("--repology", action="store_true",
+                   help="look up packages without a known replacement on repology.org (uses the network)")
+    p.add_argument("--refresh", action="store_true",
+                   help="first update the package list of the manager the packages move into (brew update, or sudo "
+                        "port sync); asks before it runs, unless --yes is given")
+    p.add_argument("--rescan", action="store_true",
+                   help="scan the Mac again instead of using a scan taken in the last ten minutes")
+    p.add_argument("--yes", action="store_true",
+                   help="do not ask: each question about a package takes its default, so no closest match is taken; "
+                        "the update of --refresh runs")
+    p.add_argument("--out", metavar="FILE", help="also save the plan as FILE, for `brew-ports apply FILE`")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -54,18 +138,19 @@ def build_parser() -> argparse.ArgumentParser:
     _global_options(common, suppress=True)
 
     parser = argparse.ArgumentParser(
-        prog="brew-ports",
+        prog="brew-ports", allow_abbrev=False,
         description="Inventory Homebrew and MacPorts on this Mac, check their health, and migrate to one of them.")
     _global_options(parser, suppress=False)
     parser.add_argument("--version", action="version", version="brew-ports " + __version__)
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
     sub.required = True
 
-    p = sub.add_parser("scan", parents=[common], help="inventory both managers and the environment")
+    p = sub.add_parser("scan", parents=[common], allow_abbrev=False,
+                       help="inventory both managers and the environment")
     p.add_argument("--json", action="store_true", help="print scan.json")
     p.add_argument("--deep", action="store_true", help="scan the binaries of every keg, not only local builds")
 
-    p = sub.add_parser("doctor", parents=[common], help="health checks, with --fix to repair")
+    p = sub.add_parser("doctor", parents=[common], allow_abbrev=False, help="health checks, with --fix to repair")
     p.add_argument("--json", action="store_true")
     p.add_argument("--deep", action="store_true")
     p.add_argument("--rescan", action="store_true", help="take a fresh inventory")
@@ -73,51 +158,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="answer the confirmations (never the per-item removals)")
     p.add_argument("--dry-run", action="store_true", help="print the remedies, run nothing")
 
-    p = sub.add_parser("recommend", parents=[common], help="which manager to keep")
+    p = sub.add_parser("recommend", parents=[common], allow_abbrev=False, help="which manager to keep")
     p.add_argument("--json", action="store_true")
     p.add_argument("--rescan", action="store_true")
 
-    p = sub.add_parser("bootstrap-ports", parents=[common], help="install MacPorts base from the signed package")
+    p = sub.add_parser("bootstrap-ports", parents=[common], allow_abbrev=False,
+                       help="install MacPorts base from the signed package")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--dry-run", action="store_true")
 
-    p = sub.add_parser("plan", parents=[common], help="plan a migration")
-    p.add_argument("--target", required=True, choices=["brew", "ports"])
-    p.add_argument("--target-prefix", metavar="PATH")
-    p.add_argument("--rescan", action="store_true")
-    p.add_argument("--only", action="append", metavar="NAME[,NAME...]")
-    p.add_argument("--keep", action="append", metavar="NAME[,NAME...]")
-    p.add_argument("--drop", action="append", metavar="NAME[,NAME...]")
-    p.add_argument("--map", action="append", metavar="SOURCE=TARGET")
-    p.add_argument("--accept-medium", action="store_true")
-    p.add_argument("--yes", action="store_true")
-    p.add_argument("--casks", choices=["keep", "drop", "map"])
-    p.add_argument("--lang-packages", choices=["report", "pipx"], default="report")
-    p.add_argument("--start-services", action="store_true")
-    p.add_argument("--remove-old", dest="remove_manager", nargs="?", const="", metavar="PATH,...",
-                   help="after the move, uninstall the old installations: all, or those at the paths")
-    p.add_argument("--repology", action="store_true")
-    p.add_argument("--refresh", action="store_true")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--out", metavar="FILE")
+    _add_plan(sub, common)
 
-    p = sub.add_parser("apply", parents=[common], help="run a plan")
+    p = sub.add_parser("apply", parents=[common], allow_abbrev=False, help="run a plan")
     p.add_argument("plan", nargs="?", metavar="PLAN")
     p.add_argument("--resume", metavar="RUN-ID")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--stop-after", type=int, metavar="N", choices=range(0, 9))
 
-    p = sub.add_parser("verify", parents=[common], help="check a migration")
+    p = sub.add_parser("verify", parents=[common], allow_abbrev=False, help="check a migration")
     p.add_argument("plan", nargs="?", metavar="PLAN")
 
-    p = sub.add_parser("env-cleanup", parents=[common], help="clean the shell environment")
-    p.add_argument("--target", choices=["brew", "ports"])
+    p = sub.add_parser("env-cleanup", parents=[common], allow_abbrev=False, help="clean the shell environment")
+    p.add_argument("--target", type=_manager, metavar="brew|ports")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--dry-run", action="store_true")
 
-    p = sub.add_parser("rollback", parents=[common], help="reinstall what a run removed")
+    p = sub.add_parser("rollback", parents=[common], allow_abbrev=False, help="reinstall what a run removed")
     p.add_argument("run_id", metavar="RUN-ID")
     p.add_argument("--yes", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -253,14 +321,23 @@ COMMANDS: dict[str, Callable[[Context], int]] = {
 def check_usage(args: argparse.Namespace) -> None:
     """Refuse the option combinations argparse cannot express (exit 2)
 
+    An option of `plan` that names nothing is refused, so that an empty `--only` never plans a full move.
+
     @param args         the parsed command line
-    @throws UsageError  for `apply` without exactly one of PLAN and `--resume`, or `--remove-old` with `--only`
+    @throws UsageError  for `apply` without exactly one of PLAN and `--resume`, a `plan` list option without a
+                        name, or `--delete` with `--only`
     """
     if args.command == "apply":
         if bool(args.plan) == bool(args.resume):
             raise UsageError("apply needs exactly one of PLAN or --resume RUN-ID")
-    if args.command == "plan" and args.remove_manager is not None and args.only:
-        raise UsageError("--remove-old cannot be combined with --only")
+    if args.command != "plan":
+        return
+    for flag, values, noun in (("--only", args.only, "package"), ("--leave", args.keep, "package"),
+                               ("--uninstall", args.drop, "package"), ("--delete", args.delete, "folder")):
+        if values is not None and not planner.split_names(values):
+            raise UsageError(f"{flag} names nothing: give it at least one {noun}")
+    if args.delete and args.only:
+        raise UsageError(planner.ONLY_DELETES_NOTHING)
 
 
 def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = None) -> int:
@@ -282,7 +359,7 @@ def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = Non
     try:
         check_usage(args)
     except UsageError as exc:
-        console.warn(f"brew-ports: {exc}")
+        console.error(str(exc))
         return EXIT_USAGE
     if system.running_as_root():
         console.warn(system.ROOT_MESSAGE)
@@ -294,16 +371,16 @@ def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = Non
         with state.lock(), progress.shown(console, args.command, env):
             return handler(ctx)
     except state_mod.LockHeld as exc:
-        console.warn(f"brew-ports: {exc}")
+        console.error(str(exc))
         return EXIT_PREFLIGHT
     except UsageError as exc:
-        console.warn(f"brew-ports: {exc}")
+        console.error(str(exc))
         return EXIT_USAGE
     except runner_mod.PreflightError as exc:
-        console.warn(f"brew-ports: {exc}")
+        console.error(str(exc))
         return EXIT_PREFLIGHT
     except (runner_mod.ActionFailed, runner_mod.EscalationFailed, runner_mod.Interrupted) as exc:
-        console.warn(f"brew-ports: {exc}")
+        console.error(str(exc))
         return EXIT_ACTION
 
 

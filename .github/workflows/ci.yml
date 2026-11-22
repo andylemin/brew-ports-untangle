@@ -140,7 +140,7 @@ jobs:
           sudo /opt/local/bin/port -N -b install jq gsed wget
           brew install wget tree jq
       - name: plan
-        run: brew-ports plan --target ports --only wget,tree --casks drop --yes --out plan.json
+        run: brew-ports plan --target ports --only wget,tree --casks uninstall --yes --out plan.json
       - name: apply
         run: brew-ports apply plan.json --yes
       - name: The formulae are replaced, the rest stays

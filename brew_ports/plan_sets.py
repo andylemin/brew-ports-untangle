@@ -13,9 +13,12 @@ from . import env, system
 from .env import services as env_services
 from .equiv import resolver, rules
 from .model import Instance, Manager, Mapping, Package, PackageKey as Key, Service, name_key
+from .report import at, counted, manager_name, some, typed
 
 Pair = tuple[str, str]              # (kind, name), as the removal set lists it
 
+KEPT_ON_REQUEST = "you asked to leave it there (--leave)"
+KEPT_APP = "apps stay with Homebrew unless you plan with --casks uninstall or --casks replace"
 FULL = "full"                       # a kept package keeps its whole dependency closure
 FORMULAE = "formulae"               # a cask keeps only the formulae it declares, with their closure
 KIND_ORDER = {"cask-adopted": 0, "cask": 1, "formula": 2, "port": 3}
@@ -26,6 +29,7 @@ _EXTRA_OWNERS = {
     ("gems", "formula"): re.compile(r"^ruby(@[\d.]+)?$"), ("gems", "port"): re.compile(r"^ruby\d+$"),
     ("cpan", "formula"): re.compile(r"^perl$"), ("cpan", "port"): re.compile(r"^perl5"),
 }
+_EXTRA_NOUNS = {"npm": "global npm package", "gems": "Ruby gem", "cpan": "Perl module"}
 
 
 @dataclass
@@ -73,9 +77,9 @@ class Unit:
     def label(self) -> str:
         """Return the unit as the report names it
 
-        @returns  `<kind> <name> (<prefix>)`
+        @returns  such as `jq (MacPorts at /opt/local)`; a cask says that it is one
         """
-        return f"{self.kind} {self.name} ({self.inst.prefix})"
+        return f"{'the cask ' if self.kind == 'cask' else ''}{self.name} ({at(self.inst)})"
 
 
 def units_of(inst: Instance, packages: Iterable[Package]) -> list[Unit]:
@@ -97,6 +101,17 @@ def units_of(inst: Instance, packages: Iterable[Package]) -> list[Unit]:
         rep = active[0] if active else rows[-1]
         out.append(Unit(inst, rep.kind, rep.name, rep, rows))
     return sorted(out, key=lambda u: (KIND_ORDER.get(u.kind, 9), u.name.lower()))
+
+
+def uninstall_casks(units: Sequence[Unit]) -> str:
+    """Return the command that uninstalls casks of one Homebrew, for the user to run
+
+    @param units  the casks' units, all of one installation
+    @returns      the command as the user would type it
+    """
+    inst = units[0].inst
+    brew = inst.binary or os.path.join(inst.prefix, "bin", "brew")
+    return typed([brew, "uninstall", "--cask"] + [u.name for u in units])
 
 
 class SourceGraph:
@@ -151,7 +166,7 @@ class SourceGraph:
         return self.units.get((self.inst.prefix, kind, name_key(kind, name))) if name else None
 
     def named(self, name: str) -> list[Unit]:
-        """Return every unit of that name, of any kind, as `--keep`, `--only` and `--drop` match names
+        """Return every unit of that name, of any kind, as `--leave`, `--only` and `--uninstall` match names
 
         @param name  a package name; a port's matches in any case
         @returns     the units
@@ -250,8 +265,8 @@ class Ties:
         @returns     a line per service, data directory and extras text; empty when it has none
         """
         out = [f"the service {s.label}" for s in self.services.get(unit.key, [])]
-        out += [f"the data directory {d}" for d in self.data(unit)]
-        out += [f"interpreter extras ({text})" for text in self.extras.get(unit.key, [])]
+        out += [f"data in {d}" for d in self.data(unit)]
+        out += list(self.extras.get(unit.key, []))
         return out
 
 
@@ -312,21 +327,20 @@ def extras_ties(extras: dict[str, Any], units: dict[str, list[Unit]]) -> dict[Ke
             continue
         version = item.get("version")
         prefixes = [item["instance_prefix"]] if item.get("instance_prefix") else list(item.get("instances") or [])
-        text = f"python {version} packages in {item.get('site_packages') or item.get('location')}"
+        text = f"Python {version} packages in {item.get('site_packages') or item.get('location')}"
         for prefix in prefixes:
             add(prefix, functools.partial(_is_python, version=version), text)
     for item in extras.get("pipx") or []:
         found = _PY_HOME.search(item.get("home") or "")
         add(item.get("instance_prefix"), functools.partial(_is_python, version=found.group(1) if found else None),
-            f"the pipx venv {item.get('name')}")
+            f"the pipx tool {item.get('name')}")
     for kind in ("npm", "gems", "cpan"):
         counts: dict[str, int] = {}
         for item in extras.get(kind) or []:
             if item.get("instance_prefix"):
                 counts[item["instance_prefix"]] = counts.get(item["instance_prefix"], 0) + 1
         for prefix, count in sorted(counts.items()):
-            add(prefix, functools.partial(_owns_extras, kind=kind),
-                f"{count} {kind} {'entry' if count == 1 else 'entries'}")
+            add(prefix, functools.partial(_owns_extras, kind=kind), counted(count, _EXTRA_NOUNS[kind]))
     return out
 
 
@@ -397,7 +411,7 @@ def plain_roots(result: Any, target_prefix: str | None, target: Manager,
 MIGRATED = "migrated"               # an accepted mapping: installed in phase 3, removed in phase 5
 UNMIGRATABLE = "unmigratable"       # no accepted mapping, kept (the default answer)
 DROPPED = "dropped"                 # no accepted mapping, removed without a replacement
-KEPT = "kept"                       # named in --keep: never resolved, never installed
+KEPT = "kept"                       # named in --leave: never resolved, never installed
 WITHDRAWN = "withdrawn"             # an accepted mapping that is not installed because the root stays
 
 
@@ -429,13 +443,15 @@ class Inputs:
     graphs: dict[str, SourceGraph]                  # every source instance
     target: Manager
     roots: dict[Key, Root]
-    keep: set[Key]                                  # --keep
+    keep: set[Key]                                  # --leave
     dropped: set[Key]                               # dropped roots and dropped inactive-only ports
+    named: set[Key]                                 # those of them that --uninstall names
     root_owned: set[Key]                            # formulae with root-owned keg paths
     ties: Ties
     policy: str                                     # the cask policy of a ports target
     only: set[Key] | None = None                 # --only: the named units
-    remove: set[str] = field(default_factory=set)   # instances --remove-old names
+    remove: set[str] = field(default_factory=set)   # the installations the plan uninstalls after the move
+    forced: set[str] = field(default_factory=set)   # those of them that --delete names
     extra_kept: dict[Key, str] = field(default_factory=dict)   # kept for the login shell or colliding files
 
 
@@ -444,12 +460,30 @@ class Sets:
     """The kept and removal sets of a plan, what stays in place, and the refusals and notes they cause"""
 
     kept: dict[Key, str] = field(default_factory=dict)          # key -> reason
+    followers: set[Key] = field(default_factory=set)            # kept only because a kept package needs them
     removal: dict[str, list[Pair]] = field(default_factory=dict)
     path_removed: dict[str, list[Pair]] = field(default_factory=dict)
     left_in_place: list[Unit] = field(default_factory=list)
     manual_casks: list[Unit] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     refusals: list[str] = field(default_factory=list)
+
+    def holds(self, prefix: str, units: dict[Key, Unit], command: bool = True) -> str | None:
+        """Return what keeps an old installation from being uninstalled once the move is done
+
+        @param prefix   the installation's prefix
+        @param units    every source unit, by key
+        @param command  give the command that uninstalls the apps only the user can uninstall; False points at the
+                        report's section, which gives it
+        @returns        `it keeps <names>`, those apps, or both; None when the move leaves the installation empty
+        """
+        own = sorted(units[k].name for k in self.kept if k[0] == prefix and k not in self.followers)
+        why = [f"it keeps {some(own, 3)}"] if own else []
+        manual = [u for u in self.manual_casks if u.prefix == prefix]
+        if manual:
+            how = f"`{uninstall_casks(manual)}`, then plan again" if command else "the command is below"
+            why.append(f"it holds {some(u.name for u in manual)}, which only you can uninstall ({how})")
+        return " and ".join(why) or None
 
     def removed_keys(self) -> set[Key]:
         """Return the keys of the removal set and of `path_removed`
@@ -521,22 +555,23 @@ class _Builder:
 
         @returns  `(key, reason, FULL or FORMULAE)` triples
         """
-        out: list[tuple[Key, str, str]] = [(k, "--keep", FULL) for k in sorted(self.inp.keep)]
+        out: list[tuple[Key, str, str]] = [(k, KEPT_ON_REQUEST, FULL) for k in sorted(self.inp.keep)]
         for key, reason in sorted(self.inp.extra_kept.items()):
             out.append((key, reason, FULL))
         for key, root in sorted(self.inp.roots.items()):
             if root.status in (UNMIGRATABLE, WITHDRAWN) and key not in self.inp.extra_kept:
-                out.append((key, f"unmigratable: {root.note}" if root.status == UNMIGRATABLE else root.note, FULL))
+                out.append((key, root.note, FULL))
         for unit in sorted(self.units.values(), key=lambda u: u.key):
             if not self.in_scope(unit):
                 continue
             if unit.inactive_only and unit.key not in self.inp.dropped:
-                out.append((unit.key, "inactive in the source", FULL))
+                out.append((unit.key, f"installed but switched off; `--uninstall {unit.name}` uninstalls it", FULL))
             if unit.key in self.inp.root_owned:
-                out.append((unit.key, "root-owned keg paths (brew-root-owned-keg)", FULL))
+                out.append((unit.key, "some of its files belong to root, so `brew` cannot uninstall it; "
+                            "`brew-ports doctor --fix` repairs that", FULL))
             if (self.cask_of_homebrew_for_ports(unit) and self.inp.policy == "keep"
                     and unit.key not in self.inp.roots):
-                out.append((unit.key, "--casks keep", FORMULAE))
+                out.append((unit.key, KEPT_APP, FORMULAE))
         return out
 
     def keep(self, seeds: Sequence[tuple[Key, str, str]]) -> dict[Key, str]:
@@ -546,20 +581,23 @@ class _Builder:
         @returns      each kept key with the first reason that keeps it
         """
         kept: dict[Key, str] = {}
+        seeded = set()
         for key, reason, closure in seeds:
             graph = self.inp.graphs.get(key[0])
             if graph is None or key not in graph.units:
                 continue
             kept.setdefault(key, reason)
+            seeded.add(key)
             unit = graph.units[key]
             if closure == FULL:
                 start = sorted(graph.deps.get(key, ()))
-                why = f"needed by {unit.name}"
+                why = f"{unit.name} needs it"
             else:
                 start = sorted(k for k in graph.deps.get(key, ()) if k[1] == "formula")
-                why = f"retained for the cask {unit.name}"
+                why = f"the app {unit.name} needs it"
             for member in graph.closure(start):
                 kept.setdefault(member, why)
+        self.out.followers = set(kept) - seeded
         return kept
 
     # Removal --------------------------------------------------------------------------
@@ -633,7 +671,8 @@ class _Builder:
                         changed = True
             for key, why in sorted(left.items()):
                 if why:
-                    self.out.notes.append(f"left installed: {graph.units[key].label()}: {why}")
+                    unit = graph.units[key]
+                    self.out.notes.append(f"{unit.name} stays in {at(unit.inst)}: {why}")
 
     def unsweepable(self, unit: Unit, kept: dict[Key, str]) -> tuple[bool, str | None]:
         """Return whether the sweep must leave a dependency, and the reason the report gives
@@ -647,13 +686,14 @@ class _Builder:
         if unit.key in kept or unit.inactive_only or unit.key in self.inp.root_owned:
             return True, None
         if unit.pkg.requested is not False:
-            return True, "installed on request" if unit.pkg.requested else "no installed-on-request record"
+            return True, ("you installed it yourself" if unit.pkg.requested
+                          else f"{manager_name(unit.inst)} has no record of whether you installed it yourself")
         if unit.kind == "cask" and (self.inp.target is Manager.BREW or self.inp.policy == "keep"
                                     or unit.pkg.privileged_uninstall):
             return True, None
         ties = self.inp.ties.of(unit)
         if ties:
-            return True, f"owns {', '.join(ties)}"
+            return True, f"it has {', '.join(ties)}"
         return False, None
 
     @staticmethod
@@ -695,35 +735,21 @@ class _Builder:
         return self.out
 
     def undrivable(self, kept: dict[Key, str]) -> None:
-        """Uninstall nothing through an undrivable source
+        """Uninstall nothing through a source whose command cannot run
 
-        Its packages are `path_removed` when `--remove-old` names it, else left in place (exit 1 in a full
-        migration).
+        Its packages are `path_removed` when `--delete` names it, else left in place: the plan's overview says so.
 
         @param kept  the kept set, whose packages are never `path_removed`
         """
         for prefix, graph in sorted(self.inp.graphs.items()):
-            inst = graph.inst
-            if inst.drivable:
+            if graph.inst.drivable:
                 continue
             units = sorted(graph.units.values(), key=lambda u: (KIND_ORDER.get(u.kind, 9), u.name.lower()))
             if prefix in self.inp.remove:
                 self.out.path_removed[prefix] = _sorted_pairs(u.pair(self.adopted(u)) for u in units
                                                               if u.key not in kept)
-                continue
-            self.out.left_in_place.extend(units)
-            if self.inp.only is not None:
-                continue
-            if not inst.inventory_known:
-                self.out.refusals.append(
-                    f"{prefix} cannot be driven ({inst.usability.value}) and its packages are unknown "
-                    "(ports-damaged-registry): a full migration must name it in --remove-old, which that finding "
-                    "blocks; plan with --only instead")
-            elif units:
-                self.out.refusals.append(
-                    f"{prefix} cannot be driven ({inst.usability.value}), so it uninstalls nothing: name it in "
-                    "--remove-old (phase 6 deletes it by path) or plan with --only; these would stay in place: "
-                    f"{', '.join(u.name for u in units)}")
+            else:
+                self.out.left_in_place.extend(units)
 
     def yielded(self, kept: dict[Key, str]) -> None:
         """Note every dropped root that stays because a kept package needs it
@@ -733,7 +759,7 @@ class _Builder:
         for key in sorted(self.inp.dropped):
             if key in kept:
                 unit = self.units[key]
-                self.out.notes.append(f"{unit.label()} stays although dropped: {kept[key]}")
+                self.out.notes.append(f"{unit.label()} stays, although you asked to uninstall it: {kept[key]}")
 
     def dependents_check(self) -> None:
         """Refuse the plan when a removed package has a dependent outside the removal set
@@ -750,30 +776,28 @@ class _Builder:
                 key = self._key(prefix, (kind, name))
                 outside = sorted(d for d in graph.dependents.get(key, ()) if d not in members)
                 for dep in outside:
-                    unit = graph.units[dep]
+                    user = graph.units[dep].name
+                    leave = (f"take {name} out of --uninstall" if key in self.inp.named
+                             else f"leave {name} where it is too (`--leave {name}`)")
                     if dep in manual:
-                        why = "a manual cask"
+                        why = (f"and only you can uninstall {user}. Run `{uninstall_casks([graph.units[dep]])}` "
+                               f"first, or {leave}")
                     elif dep in self.out.kept:
-                        why = f"kept: {self.out.kept[dep]}"
+                        why = f"and {user} stays ({self.out.kept[dep]}). To plan this move, {leave}"
+                    elif self.inp.only is not None:
+                        why = f"and is not in --only. Add {user} to --only, or take {name} out"
                     else:
-                        why = "outside --only" if self.inp.only is not None else "not removed"
-                    hint = (f": name it in --only too, or leave {name} out" if self.inp.only is not None
-                            and dep not in manual and dep not in self.out.kept else "")
-                    self.out.refusals.append(f"{kind} {name} ({prefix}) is needed by {unit.kind} {unit.name} "
-                                             f"({why}){hint}")
+                        why = f"and stays. To plan this move, {leave}"
+                    self.out.refusals.append(f"{name} cannot be uninstalled from {at(graph.inst)}: {user} needs it, "
+                                             f"{why}")
 
     def remove_manager_check(self) -> None:
-        """Refuse every instance `--remove-old` names that keeps packages or has manual casks"""
-        for prefix in sorted(self.inp.remove):
-            kept = sorted(self.units[k].name for k in self.out.kept if k[0] == prefix)
-            if kept:
-                self.out.refusals.append(f"--remove-old {prefix}: it keeps packages: {', '.join(kept)}")
-            manual = [u for u in self.out.manual_casks if u.prefix == prefix]
-            if manual:
-                lines = "; ".join(f"{u.inst.binary or prefix + '/bin/brew'} uninstall --cask {u.name}"
-                                  for u in manual)
-                self.out.refusals.append(f"--remove-old {prefix}: it has manual casks; run these on a terminal "
-                                         f"first, then plan again: {lines}")
+        """Refuse every installation `--delete` names that keeps packages or holds apps only the user uninstalls"""
+        for prefix in sorted(self.inp.forced):
+            why = self.out.holds(prefix, self.units)
+            if why:
+                self.out.refusals.append(f"--delete {prefix}: {at(self.inp.graphs[prefix].inst)} cannot be deleted "
+                                         f"while {why}. Settle what stays in it, or plan without --delete")
 
 
 def compute(inp: Inputs) -> Sets:

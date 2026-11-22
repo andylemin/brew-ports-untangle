@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import importlib
 import os
-import shlex
 import sqlite3
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -20,7 +19,7 @@ from .homebrew import actions as brew_actions, inventory as brew_inventory, loca
 from .homebrew.catalogue import version_key
 from .macports import actions as mp_actions, bootstrap as mp_bootstrap, locate as mp_locate, registry
 from .model import Action, Blocks, Instance, Issue, Manager, PackageKey, Service, Severity, name_key
-from .report import limited
+from .report import limited, typed
 from .runner import ActionFailed, BaseRunner, EscalationFailed, Interrupted, PreflightError, start_run
 
 # The exit codes of cli.py.
@@ -31,6 +30,7 @@ EXIT_ACTION = 4
 
 GIB = 1024 ** 3
 LOW_SPACE_BYTES = 5 * GIB          # system-low-disk-space
+EVIDENCE_SHOWN = 3                 # evidence lines under a finding that stops a move; `doctor` shows them all
 FAMILY_ORDER = {"system": 0, "brew": 1, "ports": 2, "env": 3}
 HEALTH_MODULES = {"brew": "brew_ports.homebrew.health", "ports": "brew_ports.macports.health"}
 SPLIT_PAIRS = (("python3", "pip3"), ("perl", "cpan"), ("ruby", "gem"), ("node", "npm"))
@@ -600,8 +600,8 @@ def _language_packages(host: _Host) -> list[Issue]:
         for where in sorted(groups):
             out.append(_issue(code, Severity.MEDIUM, title, kind, where or None,
                               evidence=[f"{kind} ({where or 'user'}): {', '.join(groups[where])}"],
-                              remedies=[note(code, kind, f"listed in {filename} in the run directory; a plan adds "
-                                                         "actions per --lang-packages")]))
+                              remedies=[note(code, kind, f"listed in {filename} in the run directory; a move does "
+                                                         "not reinstall them")]))
     return out
 
 
@@ -1005,17 +1005,18 @@ def blocking(issues: Iterable[Issue], plan_context: PlanContext) -> list[Issue]:
 
 
 def blocked_by_lines(found: Iterable[Issue]) -> list[str]:
-    """Return a `blocked by` line for each finding, each followed by its remedies
+    """Return a line for each finding that stops the move, with what was found and how to fix it
 
     @param found  the blocking findings
-    @returns      the lines, each remedy indented under its finding
+    @returns      the lines; the evidence and the remedies are indented under their finding
     """
     lines = []
     for issue in found:
         subject = f": {issue.subject}" if issue.subject else ""
-        where = f" ({issue.instance_prefix})" if issue.instance_prefix else ""
-        lines.append(f"blocked by {issue.code} {issue.title}{subject}{where}")
-        lines.extend(f"    {describe(a)}" for a in issue.remedies)
+        where = f" ({issue.instance_prefix})" if issue.instance_prefix not in (None, issue.subject) else ""
+        lines.append(f"this stops the move: {issue.title}{subject}{where}")
+        lines.extend(f"    {line}" for line in issue.evidence[:EVIDENCE_SHOWN])
+        lines.extend(f"    Fix: {describe(a)}" for a in issue.remedies)
     return lines
 
 
@@ -1083,11 +1084,11 @@ def describe(action: Action) -> str:
     """Return an action as the user would type it, `sudo` included
 
     @param action  a remedy
-    @returns       the shell-quoted command; the text of a note
+    @returns       the shell-quoted command, without the `arch` wrapper; the text of a note
     """
     if action.kind != "command":
         return action.description
-    return shlex.join((["sudo"] if action.sudo else []) + list(action.argv))
+    return typed(action.argv, action.sudo)
 
 
 def _tag(issue: Issue, action: Action) -> str:

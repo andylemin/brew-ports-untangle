@@ -11,9 +11,10 @@ from collections.abc import Callable
 
 from . import doctor, exec_env, exec_install, exec_remove, model, scan, snapshot, state, system
 from .context import Context
-from .exec_run import (EXIT_ACTION, EXIT_OK, EXIT_PREFLIGHT, EXIT_USAGE, EXIT_VERIFY, PLAN_FILE, SOURCE_BIN, START,
-                       Run, Stop, module, phase6_prefixes)
+from .exec_run import (DECLINED, EXIT_ACTION, EXIT_OK, EXIT_PREFLIGHT, EXIT_USAGE, EXIT_VERIFY, PLAN_FILE, SOURCE_BIN,
+                       START, Run, Stop, module, phase6_prefixes)
 from .model import Instance, Manager, Plan, is_recorded_as
+from .report import at
 from .runner import ActionFailed, BaseRunner, EscalationFailed, Interrupted, PreflightError, command_runner
 
 # Phase 0 -------------------------------------------------------------------------------------
@@ -30,11 +31,12 @@ def plan_context(run: Run) -> doctor.PlanContext:
     pairs = list(plan.removal_set.items()) + list(plan.path_removed.items())
     casks = sorted({p for p, ps in pairs if any(kind in ("cask", "cask-adopted") for kind, _ in ps)})
     exempt = [p for p in list(plan.source_prefixes) + phase6_prefixes(plan) if run.phase6_begun(p)]
+    removed = [] if run.managers_stay else phase6_prefixes(plan)
     return doctor.PlanContext(
         target_prefix=run.fresh_prefix(plan.target_prefix),
         uninstall_prefixes=tuple(run.fresh_prefix(p) for p, ps in sorted(plan.removal_set.items()) if ps),
         cask_prefixes=tuple(run.fresh_prefix(p) for p in casks),
-        remove_prefixes=tuple(run.fresh_prefix(p) for p in phase6_prefixes(plan)),
+        remove_prefixes=tuple(run.fresh_prefix(p) for p in removed),
         exempt_prefixes=tuple(run.fresh_prefix(p) for p in exempt))
 
 
@@ -119,7 +121,7 @@ def refused_lines(run: Run) -> list[str]:
             why = catalogue.refused(name, kind)
             if why:
                 swap = why.get("replacement_formula") or why.get("replacement_cask")
-                hint = f", suggestion: --map {m.source.name}={swap}" if swap else ""
+                hint = f"; plan with `--replace {m.source.name}={swap}`" if swap else ""
                 lines.append(f"Homebrew refuses to install {kind} {name}: disabled since {why.get('date')} "
                              f"({why.get('because')}){hint}; re-plan")
     return lines
@@ -274,8 +276,8 @@ def recovery_lines(run: Run, result) -> list[str]:
     run_id = run.run_dir.run_id
     keep = ",".join(roots) or "<root>"
     return [f"fix the cause, then `brew-ports apply --resume {run_id}`",
-            f"or plan again with the failed roots kept: `brew-ports plan --target {run.plan.target.value} --keep "
-            f"{keep}` (or an --only without them)",
+            f"or plan again and leave the failed ones where they are: `brew-ports plan --target "
+            f"{run.plan.target.value} --leave {keep}` (or an --only without them)",
             f"or `brew-ports rollback {run_id}` reinstalls a target package a repair dropped"]
 
 
@@ -304,16 +306,25 @@ def gate(run: Run) -> None:
 # Phase 6 -------------------------------------------------------------------------------------
 
 def remove_managers(run: Run) -> None:
-    """Run phase 6 for every instance `--remove-old` names
+    """Run phase 6 for every old installation the plan uninstalls
 
-    `remove_manager` recomputes its lists and checks, and asks its own confirmations through `ctx`.
+    `remove_manager` recomputes its lists and checks, and asks its own confirmations through `ctx`. A no to the
+    phase's own question leaves the managers installed and lets the run go on; the journal keeps the answer, so a
+    resume does not ask again.
 
     @param run                      the run
     @throws remove_manager.Stopped  a check, an archive or a deletion stopped phase 6; its lines join the report
+    @throws Stop                    exit 4 when no terminal can answer the question and `--yes` is not given
     """
     named = [p for p in run.plan.options.get("remove_manager", "").split(",") if p]
     if not named:
         run.say("  no source manager is removed")
+        return
+    several = len(named) > 1
+    names = " and ".join(at(inst) if (inst := run.instance(p)) is not None else p for p in named)
+    stays = f"  {names} {'stay' if several else 'stays'} installed, as you answered"
+    if run.managers_stay:
+        run.say(stays)
         return
     phase = run.phase(6)
     for action in phase.actions if phase else []:
@@ -321,7 +332,15 @@ def remove_managers(run: Run) -> None:
     if run.dry_run:
         run.say("  (previews from the plan: phase 6 recomputes them from the live inventory)")
         return
-    run.confirm(6, f" for {', '.join(named)}")
+    if run.ctx.tty and not run.ctx.yes:
+        run.say(f"  a no leaves {names} installed, without {'their' if several else 'its'} packages, and the run "
+                "goes on")
+    if not run.agreed(6, f" for {', '.join(named)}"):
+        if not run.ctx.tty:
+            raise run.unconfirmed(6)
+        run.journal({"action_id": DECLINED, "kind": "note", "prefixes": named})
+        run.say(f"{stays}; a new plan can uninstall {'them' if several else 'it'} later")
+        return
     bundle = run.fresh_scan()                     # the host as phase 5 left it
     # remove_manager prints its lines as it makes them; they are kept here for report.md only.
     remove_manager = module("remove_manager")

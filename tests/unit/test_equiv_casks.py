@@ -10,6 +10,8 @@ from tests.unit.helpers import TempDirTest, make_package
 
 EXACT, HIGH, NONE = Confidence.EXACT, Confidence.HIGH, Confidence.NONE
 CONDA_BASE = "/usr/local/Caskroom/miniconda/base"
+DATA_KEPT = f"it keeps data in {CONDA_BASE}, which uninstalling it would delete"
+NEEDS_PASSWORD = "Homebrew has it, but its installer asks for your password, which brew-ports never passes on"
 
 
 class CaskCase(TempDirTest):
@@ -43,7 +45,8 @@ class CaskTargetTest(CaskCase):
         ctx = brew_context(self.tmp)
         m = resolve(port("zoom-client", "6.6", homepage="https://zoom.us/"), ctx)
         self.assert_mapped(m, "cask", "zoom", NONE)
-        self.assertEqual(m.evidence[0], "cask needs sudo to install: run `brew install --cask zoom` on a terminal")
+        self.assertEqual(m.evidence[0], f"{NEEDS_PASSWORD}: run `{BREW_TARGET}/bin/brew install --cask zoom` yourself, "
+                                        "then plan again")
         self.assertFalse(resolver.accepted(m, ctx))
 
 
@@ -73,7 +76,7 @@ class AdoptionTest(CaskCase):
         ctx = brew_context(self.tmp, installed=[make_package("1kc-razer", "cask", BREW_TARGET, version="0.4.10")])
         m = resolve(cask("1kc-razer", "0.4.9"), ctx)
         self.assert_mapped(m, "cask", "1kc-razer", NONE)
-        self.assertTrue(m.evidence[0].startswith("Homebrew refuses to install 1kc-razer"))
+        self.assertTrue(m.evidence[0].startswith("Homebrew has disabled 1kc-razer"))
 
     def test_an_installed_cask_only_target_needs_no_sudo(self):
         ctx = brew_context(self.tmp, installed=[make_package("zoom", "cask", BREW_TARGET, version="6.6.0")])
@@ -83,20 +86,19 @@ class AdoptionTest(CaskCase):
     def test_a_cask_that_needs_sudo_is_not_adopted(self):
         m = resolve(cask("virtualbox", "7.2.2"), brew_context(self.tmp))
         self.assert_mapped(m, "cask", "virtualbox", NONE)
-        self.assertEqual(m.evidence[0], "cask needs sudo to install: run `brew install --cask --adopt virtualbox` "
-                                        "on a terminal, then plan again")
+        self.assertEqual(m.evidence[0], f"{NEEDS_PASSWORD}: run `{BREW_TARGET}/bin/brew install --cask --adopt "
+                                        "virtualbox` yourself, then plan again")
 
     def test_a_refused_cask_is_not_adopted(self):
         m = resolve(cask("1kc-razer", "0.4.9"), brew_context(self.tmp))
         self.assert_mapped(m, "cask", "1kc-razer", NONE)
-        self.assertEqual(m.evidence, ["Homebrew refuses to install 1kc-razer: disabled since 2026-09-01 "
-                                      "(fails_gatekeeper_check)"])
+        self.assertEqual(m.evidence, ["Homebrew has disabled 1kc-razer (since 2026-09-01: fails gatekeeper check)"])
 
     def test_a_cask_that_keeps_data_is_never_adopted(self):
         pkg = cask("miniconda", "py313_25.9.1-0", caskroom_data=[CONDA_BASE])
         m = resolve(pkg, brew_context(self.tmp))
         self.assert_mapped(m, "none", None, NONE)
-        self.assertEqual(m.evidence, [f"keeps data in {CONDA_BASE}"])
+        self.assertEqual(m.evidence, [DATA_KEPT])
         self.assertEqual(resolver.keeps_data(pkg), CONDA_BASE)
         self.assertIsNone(resolver.keeps_data(cask("firefox")))
 
@@ -107,16 +109,16 @@ class AdoptionTest(CaskCase):
             with self.subTest(target=context.target):
                 m = resolve(pkg, context)
                 self.assert_mapped(m, "none", None, NONE)
-                self.assertEqual(m.evidence, [f"keeps data in {CONDA_BASE}: --map miniconda=miniconda is refused"])
+                self.assertEqual(m.evidence, [f"{DATA_KEPT}, so `--replace miniconda=miniconda` is not followed"])
 
     def test_a_token_the_target_catalogue_lacks(self):
         m = resolve(cask("homemade", "1.0"), brew_context(self.tmp))
         self.assert_mapped(m, "none", None, NONE)
-        self.assertEqual(m.evidence[0], "no equivalent in Homebrew catalogue: it has no cask homemade")
+        self.assertEqual(m.evidence[0], "Homebrew's package list has no cask named homemade")
 
 
 class CasksIntoMacPortsTest(CaskCase):
-    """Casks into a MacPorts target: `-app` ports by homepage, fonts, data and `--map`"""
+    """Casks into a MacPorts target: `-app` ports by homepage, fonts, data and `--replace`"""
 
     def test_a_cask_maps_to_an_app_port_by_its_homepage(self):
         m = resolve(cask("firefox", "145.0", homepage="https://www.mozilla.org/firefox/"), ports_context(self.tmp))
@@ -126,22 +128,23 @@ class CasksIntoMacPortsTest(CaskCase):
         m = resolve(cask("firefox", "145.0", homepage="https://www.mozilla.org/firefox/"),
                     ports_context(self.tmp, drop=["firefox-app"]))
         self.assert_mapped(m, "none", None, NONE)
-        self.assertEqual(m.evidence, ["no equivalent in MacPorts catalogue"])
+        self.assertEqual(m.evidence, ["nothing of that name, or like it, is in MacPorts' package list"])
 
     def test_font_casks_map_to_nothing(self):
         pkg = cask("font-fira-code", "6.2", homepage="https://github.com/tonsky/FiraCode")
         self.assertTrue(resolver.font_cask(pkg))
         m = resolve(pkg, ports_context(self.tmp))
-        self.assertEqual((m.confidence, m.evidence), (NONE, ["font casks map to nothing: reinstall the font by hand"]))
+        self.assertEqual((m.confidence, m.evidence),
+                         (NONE, ["fonts are not matched to ports: install the font yourself"]))
 
     def test_a_cask_that_keeps_data_maps_to_nothing(self):
         m = resolve(cask("miniconda", caskroom_data=[CONDA_BASE]), ports_context(self.tmp))
-        self.assertEqual(m.evidence, [f"keeps data in {CONDA_BASE}"])
+        self.assertEqual(m.evidence, [DATA_KEPT])
 
     def test_map_names_the_port(self):
         m = resolve(cask("firefox", "145.0"), ports_context(self.tmp, maps={"firefox": "firefox-esr"}))
         self.assert_mapped(m, "port", "firefox-esr", EXACT)
-        self.assertEqual(m.evidence[0], "--map firefox=firefox-esr")
+        self.assertEqual(m.evidence[0], "your choice: --replace firefox=firefox-esr")
 
 
 if __name__ == "__main__":

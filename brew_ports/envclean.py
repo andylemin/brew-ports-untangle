@@ -191,7 +191,7 @@ def _package_count(bundle, inst: Instance) -> int:
     return sum(1 for pkg in bundle.result.packages if pkg.instance_prefix == inst.prefix)
 
 
-def _unlistable(inst: Instance) -> bool:
+def unlistable(inst: Instance) -> bool:
     """Return whether a Homebrew Cellar or Caskroom exists but cannot be listed, so its empty walk proves nothing
 
     @param inst  an instance; a MacPorts one returns False
@@ -230,7 +230,7 @@ def _judge(bundle, inst: Instance, fresh: bool, target: str | None, keeps: Seque
         return False, "gone: no instance is found there now"
     if not inst.inventory_known:
         return True, "its packages are unknown (ports-damaged-registry), so it is never known to be empty"
-    if _unlistable(inst):
+    if unlistable(inst):
         return True, "its Cellar or Caskroom cannot be listed, so it is never known to be empty"
     count = _package_count(bundle, inst)
     if count:

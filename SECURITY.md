@@ -21,14 +21,14 @@ brew-ports keeps these limits on every run of a plan, the `plan.json` that
   that needs root runs through `sudo -n`, after one `sudo -v`. `brew` never
   runs under `sudo`.
 - It installs only the plan's replacements. It removes only the packages in the
-  plan's removal set, their services, and, under `--remove-old`, the old
-  Homebrew and MacPorts installations.
+  plan's removal set, their services, and each old Homebrew or MacPorts that
+  the move leaves empty. `--keep-managers` leaves those installed.
 - It edits your shell files, `/etc/paths`, `/etc/paths.d`, and `/etc/shells`.
   When the plan removes your login shell's package, brew-ports switches the
   shell with `chsh`. It snapshots each manager first, and backs up each file it
   edits.
 - It uses the network only for installs, `--refresh`, `bootstrap-ports`,
-  `--repology`, and PyPI lookups of `--lang-packages pipx`. It first checks the
+  `--repology`, and PyPI lookups of `--pipx`. It first checks the
   MacPorts installer against a pinned Apple Developer ID signature.
 
 The release bundles a python-build-standalone CPython, pinned by SHA-256 in

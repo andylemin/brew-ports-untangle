@@ -1,7 +1,7 @@
 """Equivalence resolution: map one source package to its target, stage by stage
 
 `resolve` takes the outcome of the first stage that decides, NONE included; the version gate checks every catalogue
-pick but a `--map` target, a fuzzy match, an interpreter's nearest sibling and a `pip` or `npm` port.
+pick but a `--replace` target, a fuzzy match, an interpreter's nearest sibling and a `pip` or `npm` port.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from .. import model
 from ..homebrew.catalogue import Catalogue, normalise_url
 from ..macports.registry import vercmp
 from ..model import Confidence, Manager, Package
+from ..report import MANAGER_NAMES, possessive, typed
 from ..state import slug
 from . import repology as repology_mod, rules
 from .static_map import shipped
@@ -29,7 +30,7 @@ NO_EQUIVALENT_SUGGESTIONS = (
     "build them from source outside a manager",
     "use pipx, cargo or npm where the project ships that way",
 )
-LABELS = {Manager.BREW: "Homebrew", Manager.PORTS: "MacPorts"}
+DATA_KEPT = "it keeps data in %s, which uninstalling it would delete"      # a cask with entries in its Caskroom
 PYPI_URL = "https://pypi.org/pypi/%s/json"
 PYPI_URL_KEYS = ("home_page", "project_url", "package_url", "download_url", "docs_url")
 
@@ -57,13 +58,13 @@ class Context:
     catalogue: Catalogue | None = None                  # a Homebrew target's offline catalogue
     portindex: Any | None = None                        # a MacPorts target's PortIndex
     installed: Sequence[Package] = ()                      # the target instance's packages
-    lang_packages: str = "report"                          # --lang-packages report|pipx
+    lang_packages: str = "report"                          # pipx with --pipx
     repology: Any | None = None                         # --repology: a repology.Repology; None skips Repology
-    accept_medium: bool = False                            # --accept-medium
-    maps: dict[str, str] = field(default_factory=dict)     # --map SOURCE=TARGET
+    accept_medium: bool = False                            # --accept-closest
+    maps: dict[str, str] = field(default_factory=dict)     # --replace OLD=NEW
     python_version: str | None = None                   # the plan's Python ("3.13"); None: the target's default
     source_catalogues: dict[str, Catalogue] = field(default_factory=dict)  # Homebrew source prefix -> catalogue
-    runner: Any | None = None                           # PyPI lookups under --lang-packages pipx; None: offline
+    runner: Any | None = None                           # PyPI lookups under --pipx; None: offline
     downloads: str | None = None                        # where curl writes the PyPI answers
     memo: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -211,7 +212,7 @@ class _Target:
     def cand(self, name: str, kind: str = "") -> Cand | None:
         """Return the candidate of a catalogue name, through the catalogue's renames
 
-        @param name  a name as a stage or `--map` gives it
+        @param name  a name as a stage or `--replace` gives it
         @param kind  the kind wanted; empty for the catalogue's own kind
         @returns     the candidate; None when the catalogue has no such entry
         """
@@ -292,9 +293,9 @@ class _Target:
         return [n for n in self.stem_matches(cand.name) if n.lower() != cand.name.lower()]
 
     def lookup(self, name: str) -> Cand | None:
-        """Return the candidate for a name as `--map` gives it
+        """Return the candidate for a name as `--replace` gives it
 
-        @param name  the target side of a `--map` entry
+        @param name  the target side of a `--replace` entry
         @returns     the candidate; None when the catalogue lacks it
         """
         return self.cand(name)
@@ -348,7 +349,7 @@ class _Brew(_Target):
     def lookup(self, name: str) -> Cand | None:
         """Return the formula of that name, else the cask
 
-        @param name  the target side of a `--map` entry
+        @param name  the target side of a `--replace` entry
         @returns     the candidate; None when the catalogue has neither
         """
         return self.cand(name) or self.cand(name, "cask")
@@ -612,9 +613,9 @@ def is_language(mapping: model.Mapping) -> bool:
 
 
 def accepted(mapping: model.Mapping, ctx: Context, answer: bool | None = None) -> bool:
-    """Return whether a plan accepts a mapping: EXACT and HIGH, or MEDIUM with `--accept-medium` or `answer`
+    """Return whether a plan accepts a mapping: EXACT and HIGH, or MEDIUM with `--accept-closest` or `answer`
 
-    `answer` is a yes on a terminal. A language mapping counts only as a HIGH `pip` one under `--lang-packages pipx`.
+    `answer` is a yes on a terminal. A language mapping counts only as a HIGH `pip` one under `--pipx`.
 
     @param mapping  a resolved mapping
     @param ctx      the resolution context, with the plan options
@@ -633,7 +634,7 @@ def accepted(mapping: model.Mapping, ctx: Context, answer: bool | None = None) -
 def keeps_data(pkg: Package) -> str | None:
     """Return a cask's Caskroom entries besides `.metadata` and its versions, joined
 
-    A cask that keeps data there is never adopted or mapped, and only `--drop` drops it.
+    A cask that keeps data there is never adopted or mapped, and only `--uninstall` drops it.
 
     @param pkg  a source package
     @returns    the entries, comma-separated; None for a cask without any, a formula or a port
@@ -666,10 +667,10 @@ def installed_in_target(ctx: Context, kind: str, name: str) -> Package | None:
 
 
 def target_known(ctx: Context, name: str) -> tuple[str, str] | None:
-    """Return the target catalogue's `(kind, name)` for a `--map` target, or None when it lacks it
+    """Return the target catalogue's `(kind, name)` for a `--replace` target, or None when it lacks it
 
     @param ctx   the resolution context
-    @param name  the target side of a `--map` entry
+    @param name  the target side of a `--replace` entry
     @returns     the kind and the catalogue's own name; None also without a target catalogue
     """
     target = _target(ctx)
@@ -678,12 +679,12 @@ def target_known(ctx: Context, name: str) -> tuple[str, str] | None:
 
 
 def map_error(pkg: Package, ctx: Context) -> str | None:
-    """Return the usage error (exit 2) of the `--map` entry for `pkg`, or None when it has none or it is usable
+    """Return the usage error (exit 2) of the `--replace` entry for `pkg`, or None when it has none or it is usable
 
-    A language package's entry names its project (`--map py313-serial=pyserial`), not a catalogue entry.
+    A language package's entry names its project (`--replace py313-serial=pyserial`), not a catalogue entry.
 
     @param pkg  a source package
-    @param ctx  the resolution context, with the `--map` entries
+    @param ctx  the resolution context, with the `--replace` entries
     @returns    the error text; None also without a target catalogue
     """
     wanted = ctx.maps.get(pkg.name, ctx.maps.get(pkg.name.lower()))
@@ -692,13 +693,13 @@ def map_error(pkg: Package, ctx: Context) -> str | None:
         return None
     if _Run(pkg, ctx, target).language_kind() is not None:
         return None
-    return f"--map {pkg.name}={wanted}: the {target.label} catalogue has no {wanted}"
+    return f"--replace {pkg.name}={wanted}: {possessive(target.label)} package list has no {wanted}"
 
 
 def parse_maps(values: Iterable[str] | None) -> dict[str, str]:
-    """Parse the `--map SOURCE=TARGET` values
+    """Parse the `--replace OLD=NEW` values
 
-    @param values       the `--map` values, or None
+    @param values       the `--replace` values, or None
     @returns            the target by source name, both sides stripped
     @throws ValueError  a value without both sides, a usage error (exit 2)
     """
@@ -706,7 +707,7 @@ def parse_maps(values: Iterable[str] | None) -> dict[str, str]:
     for value in values or ():
         source, sep, target = value.partition("=")
         if not sep or not source.strip() or not target.strip():
-            raise ValueError(f"--map wants SOURCE=TARGET, not {value!r}")
+            raise ValueError(f"--replace wants OLD=NEW, not {value!r}")
         out[source.strip()] = target.strip()
     return out
 
@@ -740,7 +741,7 @@ def language_hints(mapping: model.Mapping) -> list[str]:
 # PyPI ---------------------------------------------------------------------------------
 
 class PyPI:
-    """PyPI JSON lookups through curl for `--lang-packages pipx`, kept for the run"""
+    """PyPI JSON lookups through curl for `--pipx`, kept for the run"""
 
     def __init__(self, runner: Any, downloads: str | None = None) -> None:
         """Start a client that has looked up nothing yet
@@ -886,6 +887,7 @@ class _Run:
         self.source = Manager.PORTS if pkg.kind == "port" else Manager.BREW
         self.cross = self.source is not ctx.target
         self.notes: list[str] = []
+        self.aside: list[Cand] = []         # a stage's sole match that the version gate set aside
         self._pythons: tuple[list[str], str | None] | None = None
 
     # Results ----------------------------------------------------------------------------
@@ -898,7 +900,7 @@ class _Run:
         @param kind     the kind of the target that cannot be used; `none` without one
         @param name     that target's name, or None
         @param version  that target's version, or None
-        @param extra    the lines after the reason, such as a `--map` suggestion
+        @param extra    the lines after the reason, such as a `--replace` suggestion
         @returns        the outcome
         """
         return Outcome(kind, name, version, Confidence.NONE, [reason] + list(extra))
@@ -923,25 +925,31 @@ class _Run:
             install = cand.kind == "cask" and installed_in_target(self.ctx, "cask", cand.name) is None
             info = self.target.cat.cask(cand.name) if install else None
             if info is not None and info.privileged_install:
-                command = f"brew install --cask {'--adopt ' if adopt else ''}{cand.name}"
-                reason = f"cask needs sudo to install: run `{command}` on a terminal"
-                return self.none(reason + (", then plan again" if adopt else ""), "cask", cand.name, cand.version)
+                brew = os.path.join(self.target.cat.prefix, "bin", "brew")
+                command = typed([brew, "install", "--cask"] + (["--adopt"] if adopt else []) + [cand.name])
+                reason = (f"Homebrew has it, but its installer asks for your password, which brew-ports never "
+                          f"passes on: run `{command}` yourself, then plan again")
+                return self.none(reason, "cask", cand.name, cand.version)
         companions, selections = self.companions(cand)
         return Outcome(cand.kind, cand.name, cand.version, confidence, lines, adopt, companions, selections)
 
     def refusal(self, cand: Cand, refused: dict[str, Any]) -> Outcome:
-        """Return the NONE outcome of a target Homebrew refuses, its replacement offered as a `--map`
+        """Return the NONE outcome of a target Homebrew refuses, with the replacement Homebrew names for it
 
         @param cand     the refused candidate
         @param refused  the catalogue's refusal of it
         @returns        the outcome
         """
-        date = refused.get("date") or "an earlier date"
-        because = refused.get("because") or "no reason given"
-        reason = f"Homebrew refuses to install {cand.name}: disabled since {date} ({because})"
+        since = f"since {refused['date']}" if refused.get("date") else ""
+        because = refused.get("because") or ""
+        if " " not in because:
+            because = because.replace("_", " ")         # Homebrew's own word for the reason: `fails_gatekeeper_check`
+        detail = ": ".join(part for part in (since, because) if part)
+        reason = f"Homebrew has disabled {cand.name}" + (f" ({detail})" if detail else "")
         replacement = refused.get("replacement_formula") or refused.get("replacement_cask")
-        extra = [f"suggestion: --map {self.pkg.name}={replacement}"] if replacement else []
-        return self.none(reason, cand.kind, cand.name, cand.version, extra)
+        if replacement:
+            reason += f"; it names {replacement} in its place: plan with `--replace {self.pkg.name}={replacement}`"
+        return self.none(reason, cand.kind, cand.name, cand.version)
 
     def mapping(self, outcome: Outcome) -> model.Mapping:
         """Return the mapping of an outcome, the notes of the stages that did not decide after its own lines
@@ -971,7 +979,12 @@ class _Run:
             found = step()
             if found is not None:
                 return found
-        return self.none(f"no equivalent in {self.target.label} catalogue")
+        if self.aside:
+            cand = self.aside[0]
+            return self.none(f"the closest find, {cand.kind} {cand.name} {_plain(cand.version)}, has another major "
+                             f"version than {_plain(self.pkg.version)}; if it is the same software, plan with "
+                             f"`--replace {self.pkg.name}={cand.name}`")
+        return self.none(f"nothing of that name, or like it, is in {possessive(self.target.label)} package list")
 
     def steps(self) -> list[Callable[[], Outcome | None]]:
         """Return the matching steps for this package, in the order they are tried
@@ -1081,6 +1094,7 @@ class _Run:
             return self.finish(best, Confidence.MEDIUM, lines + [text])
         self.notes.append(f"version: {cands[0].name} {_plain(cands[0].version)} has another major than the source "
                           f"{_plain(self.pkg.version)}")
+        self.aside.append(cands[0])
         return None
 
     def siblings(self, cand: Cand, lines: list[str]) -> Outcome:
@@ -1117,33 +1131,34 @@ class _Run:
                 return f"corroborated by the executables (Jaccard {score:.2f})"
         return None
 
-    # --map and casks ------------------------------------------------------------------------
+    # --replace and casks ------------------------------------------------------------------------
 
     def mapped(self) -> Outcome | None:
-        """Map by `--map SOURCE=TARGET`, EXACT; a major difference is noted, not refused
+        """Map by `--replace OLD=NEW`, EXACT; a major difference is noted, not refused
 
         A cask that keeps data in its Caskroom is refused, as the cask stage refuses it.
 
-        @returns  the outcome; None without a `--map` entry for the package
+        @returns  the outcome; None without a `--replace` entry for the package
         """
         maps = self.ctx.maps
         wanted = maps.get(self.pkg.name, maps.get(self.pkg.name.lower()))
         if wanted is None:
             return None
-        line = f"--map {self.pkg.name}={wanted}"
+        line = f"your choice: --replace {self.pkg.name}={wanted}"
         data = keeps_data(self.pkg)
         if data:
-            return self.none(f"keeps data in {data}: {line} is refused")
+            return self.none(f"{DATA_KEPT % data}, so `--replace {self.pkg.name}={wanted}` is not followed")
         cand = self.target.lookup(wanted)
         if cand is None:
             lang = self.language_kind()
             if lang is not None:
                 return self.language(lang, project=wanted, line=line)
-            return self.none(f"--map target {wanted} is not in the {self.target.label} catalogue")
+            return self.none(f"{wanted}, which you chose with --replace, is not in "
+                             f"{possessive(self.target.label)} package list")
         adopt = self.pkg.kind == "cask" and cand.kind == "cask" and self.ctx.target is Manager.BREW
         notes = self.version_line(cand)
         if not same_major(self.pkg.version, cand):
-            notes.append("version: the major differs; --map keeps the target")
+            notes.append("version: the major version differs; --replace keeps your choice")
         return self.finish(cand, Confidence.EXACT, [line] + notes, adopt=adopt)
 
     def cask(self) -> Outcome | None:
@@ -1153,11 +1168,11 @@ class _Run:
         """
         data = keeps_data(self.pkg)
         if data:
-            return self.none(f"keeps data in {data}")
+            return self.none(DATA_KEPT % data)
         if self.ctx.target is Manager.BREW:
             return self.adopt()
         if font_cask(self.pkg):
-            return self.none("font casks map to nothing: reinstall the font by hand")
+            return self.none("fonts are not matched to ports: install the font yourself")
         return self.homepage() or self.repology()
 
     def adopt(self) -> Outcome:
@@ -1167,7 +1182,7 @@ class _Run:
         """
         cand = self.target.cand(self.pkg.name, "cask")
         if cand is None:
-            return self.none(f"no equivalent in Homebrew catalogue: it has no cask {self.pkg.name}")
+            return self.none(f"Homebrew's package list has no cask named {self.pkg.name}")
         held = installed_in_target(self.ctx, "cask", cand.name) is not None
         where = "installed in the target" if held else "the same token in the target catalogue"
         return self.finish(cand, Confidence.EXACT, [f"adopt {cand.name}: {where}"], adopt=True)
@@ -1381,13 +1396,13 @@ class _Run:
                  line: str | None = None) -> Outcome:
         """Return a language mapping: LOW, never accepted, with the names tried
 
-        Under `--lang-packages pipx`, a `pip` project of a source with executables is HIGH, with `pipx`, when
-        its PyPI JSON lists the source homepage or `--map` names it.
+        Under `--pipx`, a `pip` project of a source with executables is HIGH, with `pipx`, when
+        its PyPI JSON lists the source homepage or `--replace` names it.
 
         @param kind     the language kind: `pip`, `cpan` or `gem`
         @param bare     the bare project name to try
-        @param project  the project `--map` names, or None
-        @param line     the `--map` evidence line, or None
+        @param project  the project `--replace` names, or None
+        @param line     the `--replace` evidence line, or None
         @returns        the outcome
         """
         head = [line] if line else []
@@ -1398,7 +1413,7 @@ class _Run:
             return Outcome(kind, project, None, Confidence.LOW, [tried_line] + head)
         found: str | None
         if project:
-            found, version, lines = project, None, [f"pipx: {project} is named by --map"]
+            found, version, lines = project, None, [f"pipx: {project} is your choice (--replace)"]
         else:
             found, version, lines = self.pypi(tried)
         if found is None:
@@ -1578,7 +1593,7 @@ class _Run:
         return self.gated(cands, Confidence.HIGH, [line], strong=True)
 
     def fuzzy(self) -> Outcome | None:
-        """Map by `rules.fuzzy_key`, LOW: every match is listed, and none is accepted without `--map`
+        """Map by `rules.fuzzy_key`, LOW: every match is listed, and none is accepted without `--replace`
 
         @returns  the outcome; None without a match
         """
@@ -1588,7 +1603,8 @@ class _Run:
             return None
         best = _closest(self.pkg.version, cands)
         listed = ", ".join(c.name for c in cands)
-        line = f"fuzzy: {self.pkg.name} ~ {listed} ({rules.fuzzy_key(self.pkg.name)}); not accepted without --map"
+        line = (f"{possessive(self.target.label)} package list has similar names only ({listed}); if one is the same "
+                f"software, plan with `--replace {self.pkg.name}=` and that name")
         return self.finish(best, Confidence.LOW, [line] + self.version_line(best))
 
 
@@ -1603,7 +1619,7 @@ def resolve(pkg: Package, ctx: Context) -> model.Mapping:
     """
     target = _target(ctx)
     if target is None:
-        reason = f"no {LABELS[ctx.target]} catalogue to map against"
+        reason = f"this Mac has no package list for {MANAGER_NAMES[ctx.target]} yet"
         return model.Mapping(source=pkg, target_kind="none", target_name=None, target_version=None,
                              confidence=Confidence.NONE, evidence=[reason], companions=[], selections=[],
                              variants_note=None)

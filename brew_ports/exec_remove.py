@@ -458,7 +458,7 @@ def links_into(prefix: str, room: str) -> list[str]:
 def adopted_token(run, inst: Instance, token: str) -> str:
     """Return the token the target holds an adopted source cask under: its mapping's target
 
-    A cask rename or `--map` gives the target token another name than the source's.
+    A cask rename or `--replace` gives the target token another name than the source's.
 
     @param run    the run
     @param inst   the source instance

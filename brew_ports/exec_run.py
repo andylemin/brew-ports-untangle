@@ -28,6 +28,7 @@ REPORT_FILE = "report.md"
 SOURCE_BIN = "source-bin.json"
 COMPLETE = "%d.complete"
 START = "0.apply"
+DECLINED = "6.declined"          # the journal's record of a no at phase 6: the old managers stay installed
 
 
 class Stop(Exception):
@@ -239,6 +240,31 @@ class Run:
         failed = f" ({', '.join(names)})" if names else ""
         self.say(f"  {action.action_id}: failed{failed}")
 
+    def agreed(self, number: int, what: str = "") -> bool:
+        """Ask once before a phase marked `confirm` (`--yes` answers), and return the answer
+
+        @param number  the phase number
+        @param what    the text that follows the phase's name in the question
+        @returns       True for a yes, for a dry run and for a phase that asks nothing
+        """
+        phase = self.phase(number)
+        if self.dry_run or phase is None or not phase.confirm:
+            return True
+        question = f"Run phase {number} ({phase.name or PHASE_NAMES.get(number, '')}){what}?"
+        if not self.ctx.confirm(question, default=False):
+            return False
+        self.runner.check_interrupt()
+        return True
+
+    def unconfirmed(self, number: int) -> Stop:
+        """Return the stop of a phase that was not confirmed
+
+        @param number  the phase number
+        @returns       the stop, exit 4
+        """
+        why = "" if self.ctx.tty else " (no terminal: --yes answers every phase)"
+        return Stop(EXIT_ACTION, [f"phase {number} was not confirmed{why}; the run stops here"])
+
     def confirm(self, number: int, what: str = "") -> None:
         """Ask once before a phase marked `confirm` (`--yes` answers); a "no" stops the run
 
@@ -246,15 +272,16 @@ class Run:
         @param what    the text that follows the phase's name in the question
         @throws Stop   exit 4 when the answer is no
         """
-        phase = self.phase(number)
-        if self.dry_run or phase is None or not phase.confirm:
-            return
-        question = f"Run phase {number} ({phase.name or PHASE_NAMES.get(number, '')}){what}?"
-        if self.ctx.confirm(question, default=False):
-            self.runner.check_interrupt()
-            return
-        why = "" if self.ctx.tty else " (no terminal: --yes answers every phase)"
-        raise Stop(EXIT_ACTION, [f"phase {number} was not confirmed{why}; the run stops here"])
+        if not self.agreed(number, what):
+            raise self.unconfirmed(number)
+
+    @property
+    def managers_stay(self) -> bool:
+        """Return whether an earlier start was told to leave the old managers installed (a no at phase 6)
+
+        @returns  True once the journal holds the answer
+        """
+        return any(e.get("action_id") == DECLINED for e in self.entries)
 
     # The plan and the host ----------------------------------------------------------------------
 

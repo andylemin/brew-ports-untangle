@@ -7,7 +7,7 @@ import os
 import unittest
 from unittest import mock
 
-from brew_ports import cli, model, state
+from brew_ports import cli, model, planner, state
 from tests.unit.helpers import TempDirTest, make_instance
 
 SUBCOMMANDS = ["scan", "doctor", "recommend", "bootstrap-ports", "plan", "apply", "verify", "env-cleanup", "rollback"]
@@ -70,8 +70,19 @@ class RefusalTest(TempDirTest):
         self.assertEqual(run_cli(["apply"])[0], 2)
         self.assertEqual(run_cli(["apply", "p.json", "--resume", "R"])[0], 2)
 
-    def test_remove_manager_with_only_is_a_usage_error(self):
-        self.assertEqual(run_cli(["plan", "--target", "brew", "--only", "jq", "--remove-old"])[0], 2)
+    def test_delete_with_only_is_a_usage_error(self):
+        code, _, err = run_cli(["plan", "--target", "brew", "--only", "jq", "--delete", "/opt/local"])
+        self.assertEqual(code, 2)
+        self.assertEqual(err, f"brew-ports: {planner.ONLY_DELETES_NOTHING}\n")
+
+    def test_an_option_that_names_nothing_is_a_usage_error(self):
+        for flag, noun in (("--only", "package"), ("--leave", "package"), ("--uninstall", "package"),
+                           ("--delete", "folder")):
+            for value in ("", " , "):
+                with self.subTest(flag=flag, value=value):
+                    code, _, err = run_cli(["plan", "--target", "brew", flag, value])
+                    self.assertEqual((code, err), (2, f"brew-ports: {flag} names nothing: give it at least one "
+                                                      f"{noun}\n"))
 
     def test_lock_held(self):
         sd = state.StateDir(self.path("state"))
