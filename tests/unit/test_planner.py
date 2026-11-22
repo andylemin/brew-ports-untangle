@@ -945,7 +945,9 @@ class ReportTest(PlannerCase):
         self.brew_target()
 
     def test_the_replacements_the_uninstalls_and_the_closing_lines(self):
-        outcome = self.plan(accept_medium=True)
+        # The commands hold the temporary folder, whose length differs from machine to machine: none is cut here.
+        with mock.patch.object(plan_report, "COMMAND_WIDTH", 10_000):
+            outcome = self.plan(accept_medium=True)
         self.assert_exit(outcome, 0)
         title = f"Replacements in Homebrew at {self.target.prefix}: 3 packages"
         self.assertEqual(self.section(outcome, title), [
@@ -1076,6 +1078,19 @@ class PlanWordsTest(unittest.TestCase):
         line = "version: foo and foo2 share the source's major; foo is the newest"
         self.assertIn(f"formula foo 1.3: {line}.",
                       plan_report.medium_question(unit, self.mapping(unit, "foo", "1.3", (line,)), self.target))
+
+    def test_a_long_command_is_cut_at_a_word(self):
+        names = [f"formula{n:02d}" for n in range(20)]
+        action = model.Action(action_id="3.install.bottled", kind="command", argv=["/x/brew", "install"] + names,
+                              sudo=False, description="install the replacements")
+        whole = "/x/brew install " + " ".join(names)
+        self.assertEqual(plan_report._command(action, True), whole)
+        cut = plan_report._command(action, False)
+        shown = cut.split(" ... ")[0]
+        self.assertTrue(whole.startswith(shown + " ") and len(shown) <= plan_report.COMMAND_WIDTH, cut)
+        left = len(whole.split()) - len(shown.split())
+        self.assertEqual(cut, f"{shown} ... ({left} more words; --verbose shows all)")
+        self.assertEqual(shown.split()[-1], "formula08")
 
     def test_the_language_lists_say_what_pipx_moves(self):
         files = {"pip": "/run/language-pip.txt"}
