@@ -2,9 +2,11 @@
 
 import io
 import json
+import os
 import unittest
 
-from brew_ports import report
+from brew_ports import model, report
+from tests.unit.helpers import TempDirTest, make_instance, write_file
 
 
 class RedactionTest(unittest.TestCase):
@@ -75,6 +77,57 @@ class ConsoleTest(unittest.TestCase):
         lines = report.table([("a", 1), ("bbb", 22)], ["name", "n"])
         self.assertEqual(lines[0], "name  n")
         self.assertEqual(lines[2], "a     1")
+
+    def test_an_error_carries_the_tool_name_even_when_quiet(self):
+        err = io.StringIO()
+        report.Console(stream=io.StringIO(), err=err, quiet=True).error("no plan was found")
+        self.assertEqual(err.getvalue(), "brew-ports: no plan was found\n")
+
+
+class WordsTest(TempDirTest):
+    """Tests of the names, counts, lists and commands as the reader meets them"""
+
+    def test_an_installation_is_named_in_full(self):
+        ports = make_instance(model.Manager.PORTS, "/opt/local", version="2.10.5")
+        intel = make_instance(model.Manager.BREW, "/usr/local", version="4.6.0", arch="x86_64")
+        self.assertEqual(report.place(ports), "MacPorts 2.10.5 at /opt/local (Apple Silicon)")
+        self.assertEqual(report.place(intel), "Homebrew 4.6.0 at /usr/local (Intel)")
+        self.assertEqual(report.at(intel), "Homebrew at /usr/local")
+
+    def test_an_installation_whose_command_cannot_run_says_so(self):
+        broken = make_instance(model.Manager.PORTS, "/opt/local", version=None, arch=None, drivable=False,
+                               usability=model.Usability.NO_REGISTRY)
+        self.assertEqual(report.place(broken), "MacPorts at /opt/local (its `port` command cannot run)")
+
+    def test_counts_and_capped_lists(self):
+        self.assertEqual(report.counted(1, "port"), "1 port")
+        self.assertEqual(report.counted(1240, "file"), "1,240 files")
+        self.assertEqual(report.counted(2, "entry", "entries"), "2 entries")
+        self.assertEqual(report.some(["a", "b"]), "a, b")
+        self.assertEqual(report.some([str(n) for n in range(11)]), "0, 1, 2, 3, 4, 5, 6, 7 and 3 more")
+
+    def test_the_home_folder_is_written_as_a_tilde(self):
+        self.assertEqual(report.tilde("/Users/alice/Library/x", "/Users/alice"), "~/Library/x")
+        self.assertEqual(report.tilde("/Users/alice", "/Users/alice/"), "~")
+        self.assertEqual(report.tilde("/Users/alice2/x", "/Users/alice"), "/Users/alice2/x")
+
+    def test_a_command_is_shown_without_its_wrappers(self):
+        argv = ["/usr/bin/sudo", "-n", "--preserve-env=http_proxy", "--", "/usr/bin/arch", "-arm64",
+                "/opt/local/bin/port", "-N", "uninstall", "jq", "@1.7.1_0"]
+        self.assertEqual(report.typed(argv, path=""), "sudo /opt/local/bin/port -N uninstall jq @1.7.1_0")
+        self.assertEqual(report.typed(["/usr/bin/arch", "-arm64", "/opt/homebrew/bin/brew", "install", "a b"],
+                                      sudo=True, path=""), "sudo /opt/homebrew/bin/brew install 'a b'")
+        self.assertEqual(report.typed(["/bin/kill", "-s", "INT", "--", "-12"], sudo=True, path=""),
+                         "sudo /bin/kill -s INT -- -12")
+
+    def test_a_bare_program_name_only_when_path_finds_that_file(self):
+        first, second = self.path("first", "brew"), self.path("second", "brew")
+        for program in (first, second):
+            write_file(program, "#!/bin/sh\n", mode=0o755)
+        path = os.pathsep.join([os.path.dirname(first), os.path.dirname(second)])
+        self.assertEqual(report.typed([first, "install", "jq"], path=path), "brew install jq")
+        self.assertEqual(report.typed([second, "install", "jq"], path=path), f"{second} install jq")
+        self.assertEqual(report.typed([first, "install", "jq"], path="/nowhere"), f"{first} install jq")
 
 
 if __name__ == "__main__":

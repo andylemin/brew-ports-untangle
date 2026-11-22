@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, TypedDict
 
 from . import progress, system
 from .model import Action, OnFailure
-from .report import Console
+from .report import Console, typed
 from .state import RunDir, now_iso, slug
 
 if TYPE_CHECKING:
@@ -83,7 +83,9 @@ class ActionFailed(RunnerError):
 
         @param result  the action's result
         """
-        super().__init__(f"{result.action_id} failed with exit {result.exit}")
+        line = result.error_line()
+        what = f"`{result.typed or result.action_id}` failed (exit {result.exit})"
+        super().__init__(f"{what}: {line}" if line else what)
         self.result = result
 
 
@@ -121,6 +123,20 @@ class Result:
     failed: list[str] = field(default_factory=list)   # SPLIT: the names that failed; RETRY_WITH: the action id
     ok: bool = True
     retry: "Result" | None = None
+    typed: str = ""                                   # the command as the user would type it
+
+    def error_line(self) -> str:
+        """Return the one line of the command's output that says why it failed
+
+        @returns  the first line that starts with `Error`, `fatal` or `sudo:`, else the last line of standard
+                  error, else of standard output; at most 200 characters, empty when the command printed nothing
+        """
+        text = self.stderr().strip() or self.stdout().strip()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        named = [line for line in lines if line.lower().startswith(("error", "fatal", "sudo:"))]
+        return (named[0] if named else lines[-1])[:200]
 
     def stdout(self) -> str:
         """Return the command's standard output
@@ -561,7 +577,8 @@ class BaseRunner:
                 os.close(err_fd)
         finally:
             os.close(out_fd)
-        result = Result(journal_id, exit_code, stdout_path, stderr_path, round(duration, 3), timed_out)
+        result = Result(journal_id, exit_code, stdout_path, stderr_path, round(duration, 3), timed_out,
+                        typed=typed(full, path=self.environ.get("PATH", "")))
         self._journal({"ts": now_iso(), "phase": self.phase, "action_id": journal_id, "argv": full,
                        "sudo": action.sudo, "exit": exit_code, "duration_s": result.duration_s,
                        "stdout_path": stdout_path, "stderr_path": stderr_path,

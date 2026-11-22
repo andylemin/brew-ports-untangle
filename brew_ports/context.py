@@ -41,7 +41,7 @@ class Context:
     def confirm(self, question: str, default: bool = False) -> bool:
         """Ask a yes/no question: `--yes` answers yes, and without a terminal the default stands
 
-        @param question  the question, without the `[y/N]` hint
+        @param question  the question, without the `(y/n)` hint
         @param default   the answer without a terminal, or for an empty reply
         @returns         the answer
         """
@@ -54,7 +54,7 @@ class Context:
     def confirm_terminal(self, question: str) -> bool:
         """Ask for a per-item answer, as for a `doctor --fix` removal, that `--yes` never gives
 
-        @param question  the question, without the `[y/N]` hint
+        @param question  the question, without the `(y/n)` hint
         @returns         the answer; no without a terminal or for an empty reply
         """
         if not self.tty:
@@ -68,7 +68,7 @@ class Context:
         @param default   the answer for an empty reply or the end of input
         @returns         True for `y` or `yes` in any case, False for any other answer, else the default
         """
-        hint = " [Y/n] " if default else " [y/N] "
+        hint = " (y/n) [y] " if default else " (y/n) [n] "
         try:
             with progress.held():
                 answer = input(question + hint).strip().lower()
@@ -82,13 +82,17 @@ class Context:
         """Pick one of the options; `--yes` or no terminal takes the default
 
         @param question  the question
-        @param options   the lowercase answers it accepts; any other repeats the question
+        @param options   the lowercase answers it accepts, also by their first letter when no two share one;
+                         any other answer repeats the question
         @param default   the answer for `--yes`, without a terminal, for an empty reply or at the end of input
         @returns         the chosen option
         """
         if self.yes or not self.tty:
             return default
-        prompt = f"{question} ({'/'.join(options)}) [{default}] "
+        letters = {o[0]: o for o in options} if len({o[0] for o in options}) == len(options) else {}
+        short = set(options) == {"yes", "no"}          # asked as (y/n), like `confirm`
+        shown = [o[0] if short else o for o in options]
+        prompt = f"{question} ({'/'.join(shown)}) [{default[0] if short else default}] "
         while True:
             try:
                 with progress.held():
@@ -99,3 +103,5 @@ class Context:
                 return default
             if answer in options:
                 return answer
+            if answer in letters:
+                return letters[answer]

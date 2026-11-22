@@ -14,6 +14,132 @@ from typing import Any, TextIO
 from . import model
 
 EVIDENCE_LIMIT = 20                     # lines of one list a finding keeps as evidence
+NAMES_SHOWN = 8                         # names of one list a sentence gives before "and N more"
+ARCH_NAMES = {"arm64": "Apple Silicon", "x86_64": "Intel"}
+COMMAND_OF = {model.Manager.BREW: "brew", model.Manager.PORTS: "port"}
+MANAGER_NAMES = {model.Manager.BREW: "Homebrew", model.Manager.PORTS: "MacPorts"}
+
+
+# The reader's words ---------------------------------------------------------------------
+
+def manager_name(inst: model.Instance) -> str:
+    """Return the name of an installation's manager as people write it
+
+    @param inst  an installation
+    @returns     `Homebrew` or `MacPorts`
+    """
+    return MANAGER_NAMES[inst.manager]
+
+
+def possessive(name: str) -> str:
+    """Return a name as an owner
+
+    @param name  a name
+    @returns     `Homebrew's` or `MacPorts'`
+    """
+    return name + ("'" if name.endswith("s") else "'s")
+
+
+def at(inst: model.Instance) -> str:
+    """Return an installation by its manager and its location
+
+    @param inst  an installation
+    @returns     such as `MacPorts at /opt/local`
+    """
+    return f"{manager_name(inst)} at {inst.prefix}"
+
+
+def place(inst: model.Instance) -> str:
+    """Return an installation as its first mention names it: manager, version, location and machine code
+
+    @param inst  an installation
+    @returns     such as `MacPorts 2.10.5 at /opt/local (Apple Silicon)`; one whose command cannot run says so
+    """
+    name = f"{manager_name(inst)} {inst.version}" if inst.version else manager_name(inst)
+    notes = [ARCH_NAMES[inst.arch]] if inst.arch in ARCH_NAMES else []
+    if not inst.drivable:
+        notes.append(f"its `{COMMAND_OF[inst.manager]}` command cannot run")
+    return f"{name} at {inst.prefix}" + (f" ({', '.join(notes)})" if notes else "")
+
+
+def counted(number: int, noun: str, plural: str | None = None) -> str:
+    """Return a count with its noun
+
+    @param number  how many
+    @param noun    the noun for one
+    @param plural  the noun for several; None adds an `s`
+    @returns       such as `1 port` or `1,240 files`
+    """
+    return f"{number:,} {noun if number == 1 else plural or noun + 's'}"
+
+
+def some(names: Iterable[str], limit: int = NAMES_SHOWN) -> str:
+    """Return names as a sentence lists them: every name of a short list, else the first ones and how many more
+
+    @param names  the names, in the order to show
+    @param limit  how many a long list shows
+    @returns      such as `bat, brotli, bzip2 and 88 more`
+    """
+    names = list(names)
+    if len(names) <= limit:
+        return ", ".join(names)
+    return f"{', '.join(names[:limit])} and {len(names) - limit:,} more"
+
+
+def tilde(path: str, home: str | None = None) -> str:
+    """Return a path with the home folder written as `~`, for prose; a command to copy keeps the full path
+
+    @param path  a path
+    @param home  the home folder; None for the user's own
+    @returns     the path, shortened when it lies in the home folder
+    """
+    home = (home if home is not None else os.path.expanduser("~")).rstrip("/")
+    if home and (path == home or path.startswith(home + "/")):
+        return "~" + path[len(home):]
+    return path
+
+
+def _on_path(program: str, path: str) -> bool:
+    """Return whether a program's bare name, typed in a shell with this PATH, runs that program
+
+    @param program  the program's absolute path
+    @param path     a PATH value
+    @returns        True when the first PATH folder that holds an executable of that name holds this file
+    """
+    name = os.path.basename(program)
+    for folder in path.split(os.pathsep):
+        candidate = os.path.join(folder or ".", name)
+        try:
+            if os.path.isfile(candidate) and os.stat(candidate).st_mode & 0o111:
+                return os.path.samefile(candidate, program)
+        except OSError:
+            return False
+    return False
+
+
+def typed(argv: Sequence[str], sudo: bool = False, path: str | None = None) -> str:
+    """Return a command as the user would type it
+
+    The `arch` wrapper and sudo's own options are left out. A program is given by its bare name when typing
+    that name runs the same file, else by its full path: with two Homebrews, only one of them is `brew`.
+
+    @param argv  the command, with or without `sudo` and the `arch` wrapper in front
+    @param sudo  whether the command runs under sudo although `argv` does not start with it
+    @param path  the PATH that decides the bare names; None for the tool's own
+    @returns     the shell-quoted command
+    """
+    words = list(argv)
+    if words and os.path.basename(words[0]) == "sudo":
+        sudo = True
+        words = words[1:]
+        while words and words[0].startswith("-"):
+            if words.pop(0) == "--":
+                break
+    if len(words) > 2 and os.path.basename(words[0]) == "arch" and words[1].startswith("-"):
+        words = words[2:]
+    if words and os.path.isabs(words[0]) and _on_path(words[0], os.environ.get("PATH", "") if path is None else path):
+        words[0] = os.path.basename(words[0])
+    return shlex.join((["sudo"] if sudo else []) + words)
 
 
 class Redactor:
@@ -144,6 +270,13 @@ class Console:
         @param text  the warning
         """
         self._write(self.err, text)
+
+    def error(self, text: str) -> None:
+        """Print an error on the error stream, even when quiet, under the tool's name
+
+        @param text  what went wrong and what to run or change
+        """
+        self._write(self.err, f"brew-ports: {text}")
 
     def command(self, argv: Sequence[str]) -> None:
         """Print an escalated command before it runs

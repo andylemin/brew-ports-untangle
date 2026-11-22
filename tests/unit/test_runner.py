@@ -132,6 +132,25 @@ class PolicyTest(TempDirTest):
             fake.run(act(argv=["/bin/x"]))
         self.assertEqual(run.journal.result(3, "3.x.step"), "failed")
 
+    def test_a_failure_names_the_command_and_its_error_line(self):
+        argv = ("/usr/bin/arch", "-arm64", "/opt/homebrew/bin/brew", "install", "--formula", "nosuch")
+        stderr = "Warning: something else\nError: No available formula with the name \"nosuch\".\nmore detail\n"
+        fake, _ = self.runner({argv: r.FakeResponse(exit=1, stderr=stderr)})
+        with self.assertRaises(r.ActionFailed) as caught:
+            fake.run(act(argv=list(argv)))
+        self.assertEqual(str(caught.exception), "`/opt/homebrew/bin/brew install --formula nosuch` failed (exit 1): "
+                                                "Error: No available formula with the name \"nosuch\".")
+
+    def test_a_failure_without_an_error_line_gives_the_last_line(self):
+        fake, _ = self.runner({("/bin/x",): r.FakeResponse(exit=2, stdout="first\nlast\n"),
+                               ("/bin/y",): r.FakeResponse(exit=3)})
+        with self.assertRaises(r.ActionFailed) as caught:
+            fake.run(act(argv=["/bin/x"]))
+        self.assertEqual(str(caught.exception), "`/bin/x` failed (exit 2): last")
+        with self.assertRaises(r.ActionFailed) as caught:
+            fake.run(act(argv=["/bin/y"]))
+        self.assertEqual(str(caught.exception), "`/bin/y` failed (exit 3)")
+
     def test_probe_returns_status_and_no_result_line(self):
         fake, run = self.runner({("/bin/x",): r.FakeResponse(exit=1, stdout="data")})
         res = fake.run(act(argv=["/bin/x"], on_failure=model.OnFailure.PROBE, read_only=True))
