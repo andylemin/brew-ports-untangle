@@ -13,7 +13,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from . import env, model, scan, servicectl, snapshot, state, system
+from . import env, model, progress, scan, servicectl, snapshot, state, system
 from .context import Context
 from .env import interpreters as env_interpreters, linkage as env_linkage, shell as env_shell
 from .homebrew import actions as brew_actions, inventory as brew_inventory, locate as brew_locate
@@ -828,8 +828,10 @@ def detect_all(bundle, runner) -> list[Issue]:
     @param runner  the runner the detectors probe through
     @returns       the findings, in `sort_issues` order
     """
+    progress.step("system and environment checks")
     issues = system_issues(bundle, runner) + env_issues(bundle, runner)
-    for family in ("brew", "ports"):
+    for family, name in (("brew", "Homebrew"), ("ports", "MacPorts")):
+        progress.step(f"{name} checks")
         issues.extend(health_module(family).detect(bundle, runner))
     _defer_cross_linkage(issues)
     return sort_issues(issues)

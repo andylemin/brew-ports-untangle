@@ -9,7 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import env, model, report, state, system
+from . import env, model, progress, report, state, system
 from .env import (interpreters as env_interpreters, linkage as env_linkage, services as env_services,
                   shell as env_shell)
 from .homebrew import inventory as brew_inventory
@@ -128,6 +128,25 @@ def _close(ports: Sequence[PortsEntry]) -> None:
 
 
 
+def _ports_entry(runner, instance: model.Instance, environ: Mapping[str, str], notes: list[str]) -> PortsEntry:
+    """Take the inventory of one MacPorts instance, with its PortIndex when one loads
+
+    @param runner    the runner the probes go through
+    @param instance  the MacPorts instance
+    @param environ   the environment the tool runs with
+    @param notes     receives a note when the PortIndex fails to load
+    @returns         the `(instance, index, inventory)` triple
+    """
+    progress.step(f"MacPorts {instance.prefix}: PortIndex")
+    try:
+        index = mp_portindex.load_for(instance, environ)
+    except mp_portindex.PortIndexError as exc:
+        index = None
+        notes.append(f"{instance.prefix}: no PortIndex ({exc})")
+    progress.step(f"MacPorts {instance.prefix}: installed ports")
+    return instance, index, mp_inventory.inventory(runner, instance, index, host_arch=runner.host_arch)
+
+
 def _macports(runner, environ: Mapping[str, str], notes: list[str]) -> list[PortsEntry]:
     """Locate every MacPorts instance and take its inventory, with its PortIndex when one loads
 
@@ -136,15 +155,9 @@ def _macports(runner, environ: Mapping[str, str], notes: list[str]) -> list[Port
     @param notes    receives a note for each instance whose PortIndex fails to load
     @returns        one `(instance, index, inventory)` triple per instance
     """
-    out: list[PortsEntry] = []
-    for instance in mp_locate.find_instances(runner, environ, runner.host_arch):
-        try:
-            index = mp_portindex.load_for(instance, environ)
-        except mp_portindex.PortIndexError as exc:
-            index = None
-            notes.append(f"{instance.prefix}: no PortIndex ({exc})")
-        out.append((instance, index, mp_inventory.inventory(runner, instance, index, host_arch=runner.host_arch)))
-    return out
+    progress.step("finding MacPorts")
+    return [_ports_entry(runner, instance, environ, notes)
+            for instance in mp_locate.find_instances(runner, environ, runner.host_arch)]
 
 
 def build(runner, environ: Mapping[str, str], deep: bool = False) -> ScanBundle:
@@ -170,8 +183,10 @@ def build(runner, environ: Mapping[str, str], deep: bool = False) -> ScanBundle:
             if catalogue is not None:
                 labels.update(catalogue.service_labels())
 
+        progress.step("shell setup")
         login = env_shell.login_shell(runner, facts["user"])
         analysis = env_shell.analyse(runner, home, dict(environ), instances, login)
+        progress.step("services")
         listings: dict[str, list[Any]] = {}
         for inst, _, _ in brew:
             listing = brew_inventory.services_listing(runner, inst) if inst.drivable else None
@@ -184,12 +199,14 @@ def build(runner, environ: Mapping[str, str], deep: bool = False) -> ScanBundle:
         notes += service_scan.notes
         env_services.attach(services, packages)
 
+        progress.step("linked libraries")
         scanned = env_linkage.scan_set(packages, deep)
         for pkg in scanned:
             inv = _macports_inventory(ports, pkg.instance_prefix) if pkg.kind == "port" else None
             if inv is not None and not pkg.binaries:
                 pkg.binaries = inv.binaries(pkg)
         linkage = env_linkage.scan(runner, env_linkage.binaries_by_package(scanned), instances)
+        progress.step("language packages")
         extras = env_interpreters.extras(instances, packages, home, owner_of=owner_of)
 
         result = model.ScanResult(
@@ -243,18 +260,14 @@ def load(path: str, runner, environ: Mapping[str, str]) -> ScanBundle:
     ports: list[PortsEntry] = []
     for inst in result.instances:
         if inst.manager is model.Manager.BREW:
+            progress.step(f"Homebrew {inst.prefix}: package catalogue")
             data = dict(result.homebrew.get(inst.prefix, {}))
             data["packages"] = [model.to_plain(p) for p in result.packages if p.instance_prefix == inst.prefix]
             brew.append((inst, Catalogue.load(inst, environ, runner.host_arch),
                          brew_inventory.HomebrewInventory.from_plain(data)))
     for inst in result.instances:
         if inst.manager is model.Manager.PORTS:
-            try:
-                index = mp_portindex.load_for(inst, environ)
-            except mp_portindex.PortIndexError as exc:
-                index = None
-                notes.append(f"{inst.prefix}: no PortIndex ({exc})")
-            ports.append((inst, index, mp_inventory.inventory(runner, inst, index, host_arch=runner.host_arch)))
+            ports.append(_ports_entry(runner, inst, environ, notes))
     fresh = {inst.prefix for inst, _, _ in ports}
     result.packages = ([p for p in result.packages if p.instance_prefix not in fresh]
                        + [p for _, _, inv in ports for p in inv.packages])

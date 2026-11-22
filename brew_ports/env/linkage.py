@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .. import system
+from .. import progress, system
 from ..model import Instance, Package
 from . import PrefixIndex
 
@@ -469,7 +469,9 @@ def scan(runner, package_binaries: dict[str, list[str]], instances: Sequence[Ins
                 order.append(path)
     binaries: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
+    progress.counting("files", len(order))
     for batch in _batches(order, max(1, batch_size)):
+        progress.count(len(batch))
         action = system.probe(_batch_id(batch), [OTOOL, "-l"] + batch, f"Mach-O load commands of {len(batch)} files")
         try:
             result = runner.run(action)

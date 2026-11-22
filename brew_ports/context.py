@@ -7,7 +7,7 @@ import os
 import sys
 from collections.abc import Sequence
 
-from . import report, runner as runner_mod, state as state_mod
+from . import progress, report, runner as runner_mod, state as state_mod
 
 
 class Context:
@@ -70,7 +70,8 @@ class Context:
         """
         hint = " [Y/n] " if default else " [y/N] "
         try:
-            answer = input(question + hint).strip().lower()
+            with progress.held():
+                answer = input(question + hint).strip().lower()
         except EOFError:
             return default
         if not answer:
@@ -90,7 +91,8 @@ class Context:
         prompt = f"{question} ({'/'.join(options)}) [{default}] "
         while True:
             try:
-                answer = input(prompt).strip().lower()
+                with progress.held():
+                    answer = input(prompt).strip().lower()
             except EOFError:
                 return default
             if not answer:

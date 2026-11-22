@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypedDict
 
-from . import system
+from . import progress, system
 from .model import Action, OnFailure
 from .report import Console
 from .state import RunDir, now_iso, slug
@@ -553,8 +553,9 @@ class BaseRunner:
             err_fd = os.open(stderr_path, flags, 0o600)
             try:
                 start = time.monotonic()
-                exit_code, timed_out = self._execute(full, env, action, out_fd, err_fd, timeout=timeout,
-                                                     journal_id=journal_id)
+                with progress.running(action.description or shlex.join(full)):
+                    exit_code, timed_out = self._execute(full, env, action, out_fd, err_fd, timeout=timeout,
+                                                         journal_id=journal_id)
                 duration = time.monotonic() - start
             finally:
                 os.close(err_fd)
@@ -730,7 +731,8 @@ class CommandRunner(BaseRunner):
         askpass = bool(self.environ.get("SUDO_ASKPASS"))
         if has_tty:
             # The foreground process group, so sudo can prompt on the terminal.
-            subprocess.call([SUDO, "-v"], env=env)
+            with progress.held():
+                subprocess.call([SUDO, "-v"], env=env)
         elif askpass:
             subprocess.call([SUDO, "-A", "-v"], stdin=subprocess.DEVNULL, env=env, **_group_kwargs())
         self.check_interrupt()

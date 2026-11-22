@@ -7,8 +7,8 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 
-from . import (__version__, doctor, envclean, executor, planner, recommend, report, rollback, runner as runner_mod,
-               scan as scan_mod, state as state_mod, system, verify)
+from . import (__version__, doctor, envclean, executor, planner, progress, recommend, report, rollback,
+               runner as runner_mod, scan as scan_mod, state as state_mod, system, verify)
 from .context import Context
 from .macports import bootstrap as mp_bootstrap, locate as mp_locate
 
@@ -290,7 +290,7 @@ def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = Non
     ctx = Context(args, console, state, environ=env)
     handler = COMMANDS[args.command]
     try:
-        with state.lock():
+        with state.lock(), progress.shown(console, args.command, env):
             return handler(ctx)
     except state_mod.LockHeld as exc:
         console.warn(f"brew-ports: {exc}")

@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import doctor, model, plan_phases, plan_report, plan_sets, scan, state
+from . import doctor, model, plan_phases, plan_report, plan_sets, progress, scan, state
 from .context import Context
 from .env import interpreters as env_interpreters
 from .equiv import repology as repology_mod, resolver
@@ -474,11 +474,14 @@ class _Composer:
         """Map each root to the target after choosing the plan's Python; a `--keep` root stays unmapped"""
         roots = [r.unit.pkg for r in self.draft.roots.values() if r.key not in self.keep]
         self.ctx.python_version = resolver.plan_python(roots, self.ctx)
+        progress.step("matching packages")
+        progress.counting("packages", len(roots))
         for key, root in sorted(self.draft.roots.items()):
             if key in self.keep:
                 root.status = KEPT
             else:
                 root.mapping = resolver.resolve(root.unit.pkg, self.ctx)
+                progress.count()
 
     def check_drop(self) -> None:
         """Refuse a `--drop` name that is neither an unmigratable root nor a port with only inactive versions

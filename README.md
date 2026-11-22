@@ -112,6 +112,9 @@ brew-ports has nine commands:
 Every command takes `--state-dir DIR`, `--verbose`, `--quiet`, `--no-color`, and `--redact`.
 Commands that change the system take `--yes` and `--dry-run`.
 
+On a terminal, a status line shows the step a command is in and how long it has run. It also names the
+program the step waits for, or counts the files it reads. `--quiet` turns it off.
+
 The main `plan` options:
 
 | Option | Meaning |

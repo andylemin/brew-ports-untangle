@@ -42,6 +42,12 @@ command, with `-n`.
 
 `state.py` owns the state directory and each run's journal.
 
+`progress.py` draws the status line on a terminal. A thread redraws it ten times
+a second, so it keeps moving through a long command and through the tool's own
+work between commands. The runner names each command on it, and the scan and the
+checks name their steps and count the files they read. Each console write and
+each prompt clears it first.
+
 ### The managers
 
 `homebrew/` and `macports/` share five parts:

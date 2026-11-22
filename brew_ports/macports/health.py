@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .. import snapshot, system
+from .. import progress, snapshot, system
 from ..env import linkage as env_linkage, services as env_services
 from ..homebrew import locate as brew_locate
 from ..model import Action, Blocks, Instance, Issue, OnFailure, Package, Service, Severity, Usability
@@ -589,6 +589,7 @@ def _stat_active_files(files: Sequence[registry.FileRow]) -> tuple[list[str], in
     """
     missing: list[str] = []
     unchecked = 0
+    progress.count(len(files))
     for row in files:
         if not row.active:
             continue
@@ -613,6 +614,8 @@ def _missing_file(site: _Site, loaded: set[str]) -> list[Issue]:
     """
     code = "ports-missing-file"
     out = []
+    progress.step(f"MacPorts {site.prefix}: checking registered files")
+    progress.counting("files")
     for pkg in site.inv.packages:
         if not pkg.active:
             continue
@@ -972,6 +975,7 @@ def _walk(top: str) -> Iterator[tuple[str, os.stat_result]]:
             entries = sorted(it, key=lambda e: e.name)
     except OSError:
         return
+    progress.count(len(entries))
     for entry in entries:
         try:
             st = entry.stat(follow_symlinks=False)
@@ -1097,6 +1101,8 @@ def _unregistered_file(site: _Site, extras: Mapping[str, Any]) -> list[Issue]:
     inv = site.inv
     if not inv.known:
         return []
+    progress.step(f"MacPorts {site.prefix}: looking for unregistered files")
+    progress.counting("files")
     root = inv.registry_prefix
     info_dir = os.path.join(root, "share", "info", "dir")
     links = _select_targets(site)
@@ -1485,6 +1491,7 @@ def detect(bundle, runner, *, platform: locate.Platform | None = None, default_p
     issues: list[Issue] = []
     for detector in per_site:
         for site in sites:
+            progress.step(f"MacPorts {site.prefix}: checks")
             issues += detector(site)
     issues += _usr_local_cellar(bundle, usr_local_cellar)
     for detector in (_registry_schema_update, _replaced_port, _cannot_run, _no_registry):

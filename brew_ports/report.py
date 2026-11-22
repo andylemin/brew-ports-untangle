@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import pwd
 import re
@@ -88,7 +89,16 @@ class Console:
         self.verbose = verbose
         self.silenced = False
         self.json_mode = False   # with --json, stdout carries the JSON alone and progress goes to stderr
+        self.activity: Any = None   # the `progress.Activity` drawn on the terminal, which each write clears first
         self._redact = (redactor or Redactor()) if redact else _identity
+
+    def redacted(self, text: str) -> str:
+        """Return a line as the console would print it
+
+        @param text  the line
+        @returns     the line, redacted under `--redact`
+        """
+        return self._redact(text)
 
     def _write(self, stream: TextIO, text: str) -> None:
         """Write one line, redacted when asked; a failed write silences the console
@@ -99,8 +109,9 @@ class Console:
         if self.silenced:
             return
         try:
-            stream.write(self._redact(text) + "\n")
-            stream.flush()
+            with self.activity.hidden() if self.activity is not None else contextlib.nullcontext():
+                stream.write(self._redact(text) + "\n")
+                stream.flush()
         except (BrokenPipeError, OSError):
             self.silenced = True
 

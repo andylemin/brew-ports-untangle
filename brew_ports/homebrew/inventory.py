@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .. import model, system
+from .. import model, progress, system
 from ..report import table
 from ..state import slug
 from . import actions, locate
@@ -205,6 +205,7 @@ def root_owned_paths(tops: Sequence[str], limit: int = ROOT_OWNED_LIMIT) -> list
         if not stat.S_ISDIR(st.st_mode):
             continue
         for dirpath, dirnames, filenames in os.walk(top):
+            progress.count(len(dirnames) + len(filenames))
             for name in dirnames + filenames:
                 path = os.path.join(dirpath, name)
                 try:
@@ -1077,9 +1078,12 @@ def inventory(runner, instance: model.Instance, catalogue: Catalogue, use_brew: 
     link_dependents(packages, aliases)
     inv.packages = sorted(packages, key=lambda p: (p.kind != "formula", p.name))
     inv.used_json = info is not None
+    progress.step(f"Homebrew {prefix}: checking installed files")
+    progress.counting("files")
     _keg_facts(inv, prefix, rack_of)
     inv.caskrooms = {token: room.path for token, room in sorted(room_of.items())}
     inv.cask_versions = {token: list(room.versions) for token, room in sorted(rooms.items())}
+    progress.step(f"Homebrew {prefix}: taps")
     inv.taps = list_taps(runner, instance)
     return inv
 
@@ -1093,9 +1097,12 @@ def scan(runner, environ: Mapping[str, str], host_arch: str) -> list[tuple[model
     @param host_arch  the host's architecture
     @returns          one `(instance, catalogue, inventory)` triple per instance
     """
+    progress.step("finding Homebrew")
     out = []
     for instance in locate.find_instances(runner, environ, host_arch):
+        progress.step(f"Homebrew {instance.prefix}: package catalogue")
         catalogue = Catalogue.load(instance, environ, host_arch)
+        progress.step(f"Homebrew {instance.prefix}: installed packages")
         out.append((instance, catalogue, inventory(runner, instance, catalogue)))
     return out
 

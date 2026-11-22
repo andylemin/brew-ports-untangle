@@ -11,7 +11,7 @@ import os
 from collections.abc import Sequence
 from typing import Any
 
-from . import doctor, model, report, scan, state, system
+from . import doctor, model, progress, report, scan, state, system
 from .context import Context
 from .model import Action, Instance, Manager, Phase, Plan, is_recorded_as
 from .plan_phases import PHASE_NAMES
@@ -215,6 +215,7 @@ class Run:
         self.runner.phase = number
         self.say("")
         self.say(f"== phase {number}: {PHASE_NAMES.get(number, '')}")
+        progress.step(f"phase {number}: {PHASE_NAMES.get(number, '')}")
 
     def show(self, action: Action, skipped: bool = False) -> None:
         """Print an action's line, marked when an earlier attempt ran it with `ok`
