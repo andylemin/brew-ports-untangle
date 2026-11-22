@@ -22,7 +22,7 @@ You also usually end up with two copies of the same packages, half of them never
 database. It recommends a manager to keep and migrates your packages to it,
 asking before each phase.
 
-`--remove-manager` also removes the other manager entirely.
+`--remove-old` also removes the old installations entirely.
 
 > **Status:** every command exists, and unit tests run each one against
 > simulated hosts, but the tool has not yet migrated a real Mac. Until it has,
@@ -126,7 +126,7 @@ The main `plan` options:
 | `--accept-medium` | Accept medium-confidence mappings without asking. |
 | `--casks keep\|drop\|map` | What to do with Homebrew casks when the target is MacPorts. |
 | `--lang-packages report\|pipx` | Report Python, Node, Ruby, and Perl packages, or reinstall Python tools with `pipx`. |
-| `--remove-manager[=PREFIX,…]` | Also remove the old manager itself once its packages are gone. |
+| `--remove-old[=PATH,…]` | After the move, uninstall the old installations: all of them, or those at the paths. |
 | `--start-services` | Start the replacements of the services that were running. |
 | `--repology` | Ask repology.org about packages the offline catalogs cannot match. |
 | `--refresh` | Update the target's catalog (`brew update`, `port sync`) first. |
@@ -144,7 +144,7 @@ The main `plan` options:
 | 3 | Install every replacement, then rebuild target packages that link into the old prefix. |
 | 4 | Gate: each replacement must exist, provide its commands, and link cleanly. |
 | 5 | Remove the source packages, after stopping their services. |
-| 6 | Remove the old manager itself, only with `--remove-manager`, after archiving its data directories. |
+| 6 | Uninstall the old installations, only with `--remove-old`, after archiving their data directories. |
 | 7 | Clean the shell environment and `/etc/paths`. |
 | 8 | Run the `verify` checks, and write `report.md`. |
 

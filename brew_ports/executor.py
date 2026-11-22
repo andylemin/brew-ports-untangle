@@ -304,7 +304,7 @@ def gate(run: Run) -> None:
 # Phase 6 -------------------------------------------------------------------------------------
 
 def remove_managers(run: Run) -> None:
-    """Run phase 6 for every instance `--remove-manager` names
+    """Run phase 6 for every instance `--remove-old` names
 
     `remove_manager` recomputes its lists and checks, and asks its own confirmations through `ctx`.
 

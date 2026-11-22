@@ -94,7 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--casks", choices=["keep", "drop", "map"])
     p.add_argument("--lang-packages", choices=["report", "pipx"], default="report")
     p.add_argument("--start-services", action="store_true")
-    p.add_argument("--remove-manager", nargs="?", const="", metavar="PREFIX,...")
+    p.add_argument("--remove-old", dest="remove_manager", nargs="?", const="", metavar="PATH,...",
+                   help="after the move, uninstall the old installations: all, or those at the paths")
     p.add_argument("--repology", action="store_true")
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--dry-run", action="store_true")
@@ -253,13 +254,13 @@ def check_usage(args: argparse.Namespace) -> None:
     """Refuse the option combinations argparse cannot express (exit 2)
 
     @param args         the parsed command line
-    @throws UsageError  for `apply` without exactly one of PLAN and `--resume`, or `--remove-manager` with `--only`
+    @throws UsageError  for `apply` without exactly one of PLAN and `--resume`, or `--remove-old` with `--only`
     """
     if args.command == "apply":
         if bool(args.plan) == bool(args.resume):
             raise UsageError("apply needs exactly one of PLAN or --resume RUN-ID")
     if args.command == "plan" and args.remove_manager is not None and args.only:
-        raise UsageError("--remove-manager cannot be combined with --only")
+        raise UsageError("--remove-old cannot be combined with --only")
 
 
 def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = None) -> int:

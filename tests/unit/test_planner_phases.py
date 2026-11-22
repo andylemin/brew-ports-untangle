@@ -230,7 +230,7 @@ class RebuildTest(PlannerCase):
 
 
 class Phase6Test(PlannerCase):
-    """The phase 6 previews of the instances `--remove-manager` names"""
+    """The phase 6 previews of the instances `--remove-old` names"""
 
     def test_previews_of_a_named_macports_instance(self):
         src = self.local

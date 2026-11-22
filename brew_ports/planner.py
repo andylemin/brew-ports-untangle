@@ -89,7 +89,7 @@ class PlanOptions:
         """Build the options from the `plan` subparser's namespace
 
         @param args  the parsed `plan` command line
-        @returns     the options, with the comma lists of `--only`, `--keep`, `--drop` and `--remove-manager` split
+        @returns     the options, with the comma lists of `--only`, `--keep`, `--drop` and `--remove-old` split
         """
         remove = None if args.remove_manager is None else _names([args.remove_manager])
         return cls(target=Manager(args.target), target_prefix=args.target_prefix, only=_names(args.only),
@@ -111,7 +111,7 @@ class PlanOptions:
         """Return the options as `Plan.options` text, with the target prefix and removed instances resolved
 
         @param target_prefix  the prefix of the chosen target
-        @param removed        the prefixes of the instances `--remove-manager` names
+        @param removed        the prefixes of the instances `--remove-old` names
         @returns              each option's text by name: a flag `true` or `false`, a list joined with commas
         """
         return {"target": self.target.value, "target_prefix": target_prefix, "only": ",".join(self.only),
@@ -205,7 +205,7 @@ class Draft:
     notes: list[str] = field(default_factory=list)
     language_files: dict[str, str] = field(default_factory=dict)
     stops: list[model.Service] = field(default_factory=list)  # owned services phase 5 stops
-    removed: list[Instance] = field(default_factory=list)   # instances --remove-manager names
+    removed: list[Instance] = field(default_factory=list)   # instances --remove-old names
     units: dict[Key, Unit] = field(default_factory=dict)    # every source unit
 
 
@@ -255,7 +255,8 @@ class _Composer:
         self.dropped: set[Key] = set()
         self.extra_kept: dict[Key, str] = {}
         self.issues: list[Issue] = []
-        self.removed: list[Instance] = []          # the instances --remove-manager names
+        self.removed: list[Instance] = []          # the instances --remove-old names
+        self.told = False                          # the first question carries the overview
         # Placeholders until compose() reaches the step that computes each; no earlier step reads them.
         self.ctx = resolver.Context(target=self.manager)
         self.ties = plan_sets.Ties((), {}, plan_sets.default_data_dirs)
@@ -366,7 +367,7 @@ class _Composer:
         return [u for g in self.graphs.values() for u in g.named(name)]
 
     def instance_at(self, path: str) -> Instance | None:
-        """Return the instance whose prefix a `--remove-manager` value names
+        """Return the instance whose prefix a `--remove-old` value names
 
         @param path  a prefix, in any spelling
         @returns     the instance, or None when none is there
@@ -391,21 +392,21 @@ class _Composer:
             errors.append(f"{name} is named in both --keep and --drop")
         if opts.remove_manager is not None:
             if opts.only:
-                errors.append("--remove-manager cannot be combined with --only")
+                errors.append("--remove-old cannot be combined with --only")
             if not opts.remove_manager:
                 self.removed = list(self.sources)
             for value in opts.remove_manager:
                 inst = self.instance_at(value)
                 if inst is None:
-                    errors.append(f"--remove-manager {value}: no Homebrew or MacPorts instance there")
+                    errors.append(f"--remove-old {value}: no Homebrew or MacPorts instance there")
                 elif inst.prefix == self.target.prefix:
-                    errors.append(f"--remove-manager {value}: that is the target")
+                    errors.append(f"--remove-old {value}: that is the target")
                 elif inst not in self.removed:
                     self.removed.append(inst)
             for inst in self.removed:
                 if (inst.manager is Manager.BREW and self.manager is Manager.PORTS
                         and opts.casks not in ("drop", "map")):
-                    errors.append(f"--remove-manager {inst.prefix}: a Homebrew source of a MacPorts target needs "
+                    errors.append(f"--remove-old {inst.prefix}: a Homebrew source of a MacPorts target needs "
                                   "--casks drop or --casks map, because the default keep leaves Homebrew installed "
                                   "for its casks")
         if errors:
@@ -552,15 +553,25 @@ class _Composer:
 
     # The terminal questions -----------------------------------------------------------------------
 
+    def choose(self, question: str, options: Sequence[str], default: str) -> str:
+        """Ask a question with options, the plan's overview above the first one asked
+
+        @param question  the question
+        @param options   the answers it accepts
+        @param default   the answer under `--yes`, without a terminal, or for an empty reply
+        @returns         the answer
+        """
+        if not self.told:
+            self.told = True
+            question = "\n".join(plan_report.overview(self.target, self.sources, self.removed) + ["", question])
+        return self.ask.choose(question, options, default)
+
     def questions(self) -> None:
         """Ask about the roots without an installed-on-request record, then settle each root's mapping"""
         roots = self.draft.roots
         for key, root in sorted(roots.items()):
             if root.reason == NO_RECORD and key not in self.keep and key not in self.dropped:
-                answer = self.ask.choose(f"{root.unit.label()} has no installed-on-request record: migrate it as a "
-                                         "root, or leave it to the target as a dependency?",
-                                         ("root", "dependency"), "root")
-                if answer == "dependency":
+                if self.choose(plan_report.no_record_question(root.unit), ("yes", "no"), "yes") == "no":
                     del roots[key]
         self.write_language_files()
         for key, root in sorted(roots.items()):
@@ -577,15 +588,14 @@ class _Composer:
         ok = resolver.accepted(mapping, self.ctx)
         if (not ok and mapping.confidence is Confidence.MEDIUM and mapping.target_name
                 and not resolver.is_language(mapping) and root.key not in self.dropped):
-            answer = self.ask.choose(f"Accept the MEDIUM mapping {root.unit.label()} -> {mapping.target_kind} "
-                                     f"{mapping.target_name}? ({'; '.join(mapping.evidence)})", ("yes", "no"), "no")
+            answer = self.choose(plan_report.medium_question(root.unit, mapping, self.target), ("yes", "no"), "no")
             ok = resolver.accepted(mapping, self.ctx, answer == "yes")
         if ok:
             root.status = MIGRATED
             return
         first = mapping.evidence[0] if mapping.evidence else "no equivalent"
         if mapping.confidence is Confidence.MEDIUM and mapping.target_name and not resolver.is_language(mapping):
-            first = f"the MEDIUM mapping to {mapping.target_kind} {mapping.target_name} is not accepted ({first})"
+            first = f"its closest match, {mapping.target_kind} {mapping.target_name}, was not accepted"
         root.note = root.note or first
         unit = root.unit
         if root.key in self.dropped:
@@ -596,9 +606,8 @@ class _Composer:
             root.status = DROPPED
             root.note = f"--casks map found no accepted mapping ({root.note})"
         else:
-            answer = self.ask.choose(f"{unit.label()} cannot be migrated ({root.note}): keep it in {unit.prefix}, "
-                                     "or drop it (removed without a replacement)?", ("keep", "drop"), "keep")
-            root.status = DROPPED if answer == "drop" else UNMIGRATABLE
+            question = plan_report.unmigratable_question(unit, root.note, self.target, unit.inst in self.removed)
+            root.status = DROPPED if self.choose(question, ("keep", "drop"), "keep") == "drop" else UNMIGRATABLE
 
     def write_language_files(self) -> None:
         """Write a requirements file per language, with the names tried as hints and the manual steps
@@ -913,8 +922,8 @@ def _refreshed(bundle: scan.ScanBundle, options: PlanOptions, runner: Any, *, as
     actions = plan_phases.refresh_actions(first.target, runner.host_arch)
     commands = [doctor.describe(a) for a in actions]
     head = [f"refresh: {c}" for c in commands]
-    if not ask.confirm(f"Refresh the catalogue of {first.target.prefix} now ({'; '.join(commands)})?",
-                       default=False):
+    if not ask.confirm(f"Update the package list of {plan_report.place(first.target)} before planning "
+                       f"({'; '.join(commands)})?", default=False):
         draft = _Composer(bundle, options, runner, ask=ask, state_dir=state_dir, run_dir=run_dir).run()
         return _finish(draft, options, run_dir, head + ["refresh declined: planned against the catalogue as it is"])
     try:

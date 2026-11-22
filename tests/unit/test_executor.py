@@ -493,7 +493,7 @@ class PhaseSixTest(ApplyTest):
     """Phase 6 through the stand-in for `remove_manager`"""
 
     def plan_with_phase6(self):
-        """Plan the move of scenario A with `--remove-manager` for its MacPorts source"""
+        """Plan the move of scenario A with `--remove-old` for its MacPorts source"""
         self.scenario_brew()
         note = model.Action(action_id=f"6.note.{state.slug(self.source.prefix)}.checks", kind="note", argv=[],
                             sudo=False, description="the checks", manual=True)

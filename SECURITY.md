@@ -21,8 +21,8 @@ brew-ports keeps these limits on every run of a plan, the `plan.json` that
   that needs root runs through `sudo -n`, after one `sudo -v`. `brew` never
   runs under `sudo`.
 - It installs only the plan's replacements. It removes only the packages in the
-  plan's removal set, their services, and the old manager under
-  `--remove-manager`.
+  plan's removal set, their services, and, under `--remove-old`, the old
+  Homebrew and MacPorts installations.
 - It edits your shell files, `/etc/paths`, `/etc/paths.d`, and `/etc/shells`.
   When the plan removes your login shell's package, brew-ports switches the
   shell with `chsh`. It snapshots each manager first, and backs up each file it

@@ -71,7 +71,7 @@ class RefusalTest(TempDirTest):
         self.assertEqual(run_cli(["apply", "p.json", "--resume", "R"])[0], 2)
 
     def test_remove_manager_with_only_is_a_usage_error(self):
-        self.assertEqual(run_cli(["plan", "--target", "brew", "--only", "jq", "--remove-manager"])[0], 2)
+        self.assertEqual(run_cli(["plan", "--target", "brew", "--only", "jq", "--remove-old"])[0], 2)
 
     def test_lock_held(self):
         sd = state.StateDir(self.path("state"))

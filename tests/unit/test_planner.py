@@ -6,12 +6,13 @@ import os
 import unittest
 from unittest import mock
 
-from brew_ports import cli, model, planner, report
+from brew_ports import cli, model, plan_report, plan_sets, planner, report
 from brew_ports.context import Context
 from brew_ports.model import Blocks, Confidence, Manager, Severity
 from brew_ports.runner import FakeResponse
 from tests.unit.fixtures.planner.builders import (BREW, PORTS, FakeAsk, PlannerCase, World, actions, blocker, cask,
                                                   fake_runner, formula, options, port)
+from tests.unit.helpers import make_instance, make_package
 
 
 # Roles and the target choice --------------------------------------------------------------------
@@ -81,7 +82,7 @@ class OptionsTest(PlannerCase):
 
     def test_from_args(self):
         opts = self.parse("--target", "ports", "--only", "a,b", "--only", "c", "--keep", "k", "--map", "x=y",
-                          "--casks", "drop", "--remove-manager=/usr/local,/opt/homebrew", "--accept-medium")
+                          "--casks", "drop", "--remove-old=/usr/local,/opt/homebrew", "--accept-medium")
         self.assertEqual(opts.target, Manager.PORTS)
         self.assertEqual(opts.only, ["a", "b", "c"])
         self.assertEqual(opts.keep, ["k"])
@@ -95,7 +96,7 @@ class OptionsTest(PlannerCase):
         self.assertEqual(planner._names(None), [])
 
     def test_bare_remove_manager_names_every_source(self):
-        self.assertEqual(self.parse("--target", "brew", "--remove-manager").remove_manager, [])
+        self.assertEqual(self.parse("--target", "brew", "--remove-old").remove_manager, [])
         self.assertIsNone(self.parse("--target", "brew").remove_manager)
 
     def test_casks_default_to_keep(self):
@@ -162,7 +163,7 @@ class UsageTest(PlannerCase):
 
 
 class RemoveManagerOrderTest(PlannerCase):
-    """`--remove-manager` of a Homebrew source: usage errors, then blocking findings, then refusals"""
+    """`--remove-old` of a Homebrew source: usage errors, then blocking findings, then refusals"""
 
     def setUp(self):
         super().setUp()
@@ -186,7 +187,7 @@ class RemoveManagerOrderTest(PlannerCase):
         outcome = self.plan(remove_manager=[self.usr_local], casks="drop", keep=["libfoo"])
         self.assert_exit(outcome, 1)
         text = self.text(outcome)
-        self.assertIn(f"--remove-manager {self.usr_local}: it keeps packages: libfoo", text)
+        self.assertIn(f"--remove-old {self.usr_local}: it keeps packages: libfoo", text)
         self.assertIn("it has manual casks", text)
         self.assertIn(f"{self.usr_local}/bin/brew uninstall --cask zap", text)
 
@@ -214,17 +215,17 @@ class QuestionsTest(PlannerCase):
         self.assertEqual(plan.removal_set, {self.local: [("port", "old"), ("port", "wget")]})
 
     def test_terminal_answers(self):
-        ask = FakeAsk({"aria2": "dependency", "MEDIUM mapping": "yes", "libidn2": "drop"})
+        ask = FakeAsk({"aria2": "no", "to replace it?": "yes", "libidn2": "drop"})
         plan = self.plan(ask=ask).plan
         self.assertEqual(sorted(m.source.name for m in plan.mappings), ["dd_rescue", "wget"])
         self.assertNotIn("aria2", [p.name for p in plan.roots])
         self.assertEqual(plan.removal_set[self.local], [("port", "aria2"), ("port", "dd_rescue"), ("port", "libidn2"),
                                                         ("port", "old"), ("port", "wget")])
-        self.assertTrue(any("installed-on-request" in q for q in ask.asked))
-        self.assertTrue(any("cannot be migrated" in q for q in ask.asked))
+        self.assertTrue(any("whether you installed it yourself" in q for q in ask.asked))
+        self.assertTrue(any("no replacement in Homebrew" in q for q in ask.asked))
 
     def test_yes_takes_every_default(self):
-        ask = FakeAsk({"MEDIUM mapping": "yes", "libidn2": "drop"}, yes=True)
+        ask = FakeAsk({"to replace it?": "yes", "libidn2": "drop"}, yes=True)
         plan = self.plan(ask=ask).plan
         self.assertEqual([m.source.name for m in plan.mappings], ["wget"])
 
@@ -232,7 +233,23 @@ class QuestionsTest(PlannerCase):
         ask = FakeAsk()
         plan = self.plan(ask=ask, accept_medium=True).plan
         self.assertIn("dd_rescue", [m.source.name for m in plan.mappings])
-        self.assertFalse(any("MEDIUM" in q for q in ask.asked))
+        self.assertFalse(any("to replace it?" in q for q in ask.asked))
+
+    def test_the_overview_comes_first_and_questions_name_both_sides(self):
+        ask = FakeAsk({"aria2": "no", "to replace it?": "yes", "libidn2": "drop"})
+        self.plan(ask=ask)
+        self.assertTrue(ask.asked[0].startswith("Moving packages into Homebrew"))
+        self.assertIn(f"\n  from MacPorts 2.12.7 at {self.local}", ask.asked[0])
+        self.assertFalse(any("Moving packages into" in q for q in ask.asked[1:]))
+        medium = next(q for q in ask.asked if "to replace it?" in q)
+        self.assertIn(f"dd_rescue 1.29 (MacPorts at {self.local}): Homebrew has no exact match.", medium)
+        self.assertTrue(medium.endswith(f"into {self.target.prefix} to replace it?"))
+
+    def test_keeping_a_package_says_it_stops_remove_old(self):
+        ask = FakeAsk({"aria2": "no", "to replace it?": "yes"})
+        self.plan(ask=ask, remove_manager=[self.local])
+        question = next(q for q in ask.asked if "libidn2" in q)
+        self.assertIn(f"Keeping it stops --remove-old from uninstalling MacPorts at {self.local}.", question)
 
     def test_a_dropped_root_is_not_asked_about(self):
         ask = FakeAsk()
@@ -488,6 +505,73 @@ class CommandTest(PlannerCase):
         out = console.stream.getvalue()
         self.assertIn("plan written: ", out)
         self.assertIn("wget", out)
+
+
+class PlanWordsTest(unittest.TestCase):
+    """The plain words of the plan's overview and of its questions"""
+
+    def setUp(self):
+        self.target = make_instance(BREW, "/opt/homebrew", version="5.0.2")
+        self.ports = make_instance(PORTS, "/opt/local", version="2.10.5")
+        self.intel = make_instance(BREW, "/usr/local", version="4.6.0", arch="x86_64")
+
+    def unit(self, name: str, version: str) -> plan_sets.Unit:
+        """Return the unit of a MacPorts port at `/opt/local`
+
+        @param name     the port
+        @param version  its version as MacPorts records it
+        @returns        the unit
+        """
+        return plan_sets.units_of(self.ports, [make_package(name, "port", "/opt/local", version=version)])[0]
+
+    @staticmethod
+    def mapping(unit: plan_sets.Unit, name: str, version: str, evidence: tuple[str, ...] = ()) -> model.Mapping:
+        """Return a MEDIUM mapping of a unit to a formula
+
+        @param unit      the source unit
+        @param name      the formula
+        @param version   its catalogue version
+        @param evidence  the matcher's evidence lines
+        @returns         the mapping
+        """
+        return model.Mapping(source=unit.pkg, target_kind="formula", target_name=name, target_version=version,
+                             confidence=Confidence.MEDIUM, evidence=list(evidence), companions=[], selections=[],
+                             variants_note=None)
+
+    def test_the_overview_names_every_installation_and_the_removals(self):
+        self.assertEqual(plan_report.overview(self.target, [self.ports, self.intel], [self.ports, self.intel]), [
+            "Moving packages into Homebrew 5.0.2 at /opt/homebrew (Apple Silicon)",
+            "  from MacPorts 2.10.5 at /opt/local (Apple Silicon)",
+            "  from Homebrew 4.6.0 at /usr/local (Intel)",
+            "  then uninstalling MacPorts at /opt/local and Homebrew at /usr/local"])
+
+    def test_an_installation_that_cannot_be_driven_says_so(self):
+        broken = make_instance(PORTS, "/opt/local", version=None, arch=None, drivable=False,
+                               usability=model.Usability.NO_REGISTRY)
+        self.assertEqual(plan_report.place(broken), "MacPorts at /opt/local (cannot be driven: no-registry)")
+
+    def test_a_major_version_jump_is_said_in_plain_words(self):
+        unit = self.unit("giflib", "4.2.3_0")
+        self.assertEqual(plan_report.medium_question(unit, self.mapping(unit, "giflib", "5.2.2"), self.target),
+                         "giflib 4.2.3 (MacPorts at /opt/local): Homebrew has no exact match. The closest is formula "
+                         "giflib 5.2.2: a newer major version, so programs built against 4.x may not work with it.\n"
+                         "Install giflib 5.2.2 into /opt/homebrew to replace it?")
+
+    def test_another_name_or_else_the_evidence_says_how_it_differs(self):
+        unit = self.unit("dd_rescue", "1.29")
+        self.assertIn("formula ddrescue 1.30: another name, for what looks like the same software.",
+                      plan_report.medium_question(unit, self.mapping(unit, "ddrescue", "1.30"), self.target))
+        unit = self.unit("foo", "1.2")
+        line = "version: foo and foo2 share the source's major; foo is the newest"
+        self.assertIn(f"formula foo 1.3: {line}.",
+                      plan_report.medium_question(unit, self.mapping(unit, "foo", "1.3", (line,)), self.target))
+
+    def test_keeping_a_package_names_the_installation_it_keeps(self):
+        unit = self.unit("zlib", "1.3")
+        self.assertEqual(plan_report.unmigratable_question(unit, "no equivalent", self.target, True).splitlines(), [
+            "zlib 1.3 (MacPorts at /opt/local): no replacement in Homebrew (no equivalent).",
+            "Keeping it stops --remove-old from uninstalling MacPorts at /opt/local.",
+            "Keep it in MacPorts, or drop it (uninstall it with no replacement)?"])
 
 
 if __name__ == "__main__":

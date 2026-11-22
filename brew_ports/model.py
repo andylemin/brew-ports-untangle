@@ -69,7 +69,7 @@ class Blocks(enum.Enum):
     TARGET = "target"        # plans whose target instance this is
     CASKS = "casks"          # plans that remove casks from this instance
     UNINSTALL = "uninstall"  # plans whose removal set holds any package of this instance
-    REMOVE = "remove"        # plans that remove this instance (--remove-manager)
+    REMOVE = "remove"        # plans that remove this instance (--remove-old)
 
 
 @dataclass
@@ -264,7 +264,7 @@ class Plan:
     target_prefix: str
     roots: list[Package]
     kept: list[Package]              # packages the user keeps, with their closure
-    left_in_place: list[Package]     # packages of an undrivable source instance that --remove-manager does not name
+    left_in_place: list[Package]     # packages of an undrivable source instance that --remove-old does not name
     mappings: list[Mapping]
     unmigratable: list[Mapping]
     removal_set: dict[str, list[tuple[str, str]]]  # drivable source prefix -> (kind, name) pairs; every version of each

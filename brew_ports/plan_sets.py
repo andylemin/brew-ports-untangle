@@ -435,7 +435,7 @@ class Inputs:
     ties: Ties
     policy: str                                     # the cask policy of a ports target
     only: set[Key] | None = None                 # --only: the named units
-    remove: set[str] = field(default_factory=set)   # instances --remove-manager names
+    remove: set[str] = field(default_factory=set)   # instances --remove-old names
     extra_kept: dict[Key, str] = field(default_factory=dict)   # kept for the login shell or colliding files
 
 
@@ -697,7 +697,7 @@ class _Builder:
     def undrivable(self, kept: dict[Key, str]) -> None:
         """Uninstall nothing through an undrivable source
 
-        Its packages are `path_removed` when `--remove-manager` names it, else left in place (exit 1 in a full
+        Its packages are `path_removed` when `--remove-old` names it, else left in place (exit 1 in a full
         migration).
 
         @param kept  the kept set, whose packages are never `path_removed`
@@ -717,12 +717,12 @@ class _Builder:
             if not inst.inventory_known:
                 self.out.refusals.append(
                     f"{prefix} cannot be driven ({inst.usability.value}) and its packages are unknown "
-                    "(ports-damaged-registry): a full migration must name it in --remove-manager, which that finding "
+                    "(ports-damaged-registry): a full migration must name it in --remove-old, which that finding "
                     "blocks; plan with --only instead")
             elif units:
                 self.out.refusals.append(
                     f"{prefix} cannot be driven ({inst.usability.value}), so it uninstalls nothing: name it in "
-                    "--remove-manager (phase 6 deletes it by path) or plan with --only; these would stay in place: "
+                    "--remove-old (phase 6 deletes it by path) or plan with --only; these would stay in place: "
                     f"{', '.join(u.name for u in units)}")
 
     def yielded(self, kept: dict[Key, str]) -> None:
@@ -763,16 +763,16 @@ class _Builder:
                                              f"({why}){hint}")
 
     def remove_manager_check(self) -> None:
-        """Refuse every instance `--remove-manager` names that keeps packages or has manual casks"""
+        """Refuse every instance `--remove-old` names that keeps packages or has manual casks"""
         for prefix in sorted(self.inp.remove):
             kept = sorted(self.units[k].name for k in self.out.kept if k[0] == prefix)
             if kept:
-                self.out.refusals.append(f"--remove-manager {prefix}: it keeps packages: {', '.join(kept)}")
+                self.out.refusals.append(f"--remove-old {prefix}: it keeps packages: {', '.join(kept)}")
             manual = [u for u in self.out.manual_casks if u.prefix == prefix]
             if manual:
                 lines = "; ".join(f"{u.inst.binary or prefix + '/bin/brew'} uninstall --cask {u.name}"
                                   for u in manual)
-                self.out.refusals.append(f"--remove-manager {prefix}: it has manual casks; run these on a terminal "
+                self.out.refusals.append(f"--remove-old {prefix}: it has manual casks; run these on a terminal "
                                          f"first, then plan again: {lines}")
 
 

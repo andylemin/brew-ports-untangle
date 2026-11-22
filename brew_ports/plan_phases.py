@@ -732,7 +732,7 @@ def _dedicated_notes(inst: Instance, deletes: Sequence[str], target: Instance, h
 def _caches_notes(named: Sequence[Instance], survivors: Sequence[Instance], home: str) -> list[Action]:
     """Return the note of the shared Homebrew caches and logs, which phase 6 deletes last when no Homebrew stays
 
-    @param named      the instances `--remove-manager` names
+    @param named      the instances `--remove-old` names
     @param survivors  the instances that stay
     @param home       the user's home directory
     @returns          the note; none while a Homebrew instance stays, or when none of the caches exists
@@ -747,13 +747,13 @@ def _caches_notes(named: Sequence[Instance], survivors: Sequence[Instance], home
 
 def phase6(named: Sequence[Instance], target: Instance, services: Sequence[Service], environ: dict[str, str],
            survivors: Sequence[Instance]) -> list[Action]:
-    """Return manual previews of phase 6 for every instance `--remove-manager` names
+    """Return manual previews of phase 6 for every instance `--remove-old` names
 
     They show the archives, the deletions and the paths the safety rules refuse as they stand at plan time,
     then what goes last: a dedicated Homebrew prefix's remaining entries and the prefix, and the shared Homebrew
     caches; `apply` recomputes every action of this phase.
 
-    @param named      the instances `--remove-manager` names
+    @param named      the instances `--remove-old` names
     @param target     the target instance, which the safety rules protect
     @param services   the scan's services
     @param environ    the environment, for `HOME`
@@ -810,14 +810,14 @@ def phase6(named: Sequence[Instance], target: Instance, services: Sequence[Servi
 
 def assemble(phase2_actions: list[Action], phase3_actions: list[Action], phase6_actions: list[Action],
              remove: bool) -> list[Phase]:
-    """Return phases 0 to 8, with phase 6 only when `--remove-manager` names an instance
+    """Return phases 0 to 8, with phase 6 only when `--remove-old` names an instance
 
     `apply` computes the phases without actions.
 
     @param phase2_actions  the repairs of the target
     @param phase3_actions  the installs, upgrades, marks and rebuilds
     @param phase6_actions  the manual previews of the removals
-    @param remove          whether `--remove-manager` names an instance
+    @param remove          whether `--remove-old` names an instance
     @returns               the phases, with the ones that ask first marked `confirm`
     """
     actions = {2: phase2_actions, 3: phase3_actions, 6: phase6_actions}

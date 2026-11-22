@@ -404,7 +404,7 @@ class LanguageTest(PlannerCase):
 
 
 class TwoSourcesTest(PlannerCase):
-    """`--remove-manager` naming one of two sources"""
+    """`--remove-old` naming one of two sources"""
 
     def test_remove_manager_names_one_of_two_sources(self):
         self.ports_source(port("wget", self.local, "1.25.0"))
