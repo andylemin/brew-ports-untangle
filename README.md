@@ -141,7 +141,7 @@ uninstalls, or edits something, unless you give `--yes`.
 | Phase | Step |
 | --- | --- |
 | 0 | Checks before starting: the blocking health findings, the tool checks, the disk check, and `sudo`. |
-| 1 | Save a record for undo: package lists, `Brewfile`, registry backup, services, shell files. |
+| 1 | Save a record for undo: package lists, `Brewfile`, registry backup, services, shell files, and a local snapshot of the disk (see below). |
 | 2 | Repair the installation that stays, where the packages it installs need repair. |
 | 3 | Install the replacements, then rebuild packages that link into the old installation. |
 | 4 | Check the replacements: each must exist, provide its commands, and link cleanly. |
@@ -155,6 +155,30 @@ run: phases 1 to 3 skip the work that succeeded, and the later phases recompute
 the remaining work from the host. After phase 6,
 `rollback` prints how to reinstall the removed manager, and restores its
 packages when run again.
+
+### The disk snapshot of phase 1
+
+Besides its own record in the run folder, phase 1 asks macOS for a local
+snapshot of the disk (`tmutil localsnapshot`). It is the kind of snapshot Time
+Machine takes every hour, and it is a second safety net:
+
+- It holds the files of the Mac's APFS volumes as they were before the run
+  changed anything, not only the packages.
+- `brew-ports rollback` does not use it. Rollback reinstalls from the record
+  in the run folder.
+- macOS keeps a local snapshot for about 24 hours, and deletes it sooner when
+  it needs the space. Until then the space of what the run uninstalled is
+  still in use, although macOS already counts it as available.
+- `tmutil listlocalsnapshots /` lists the snapshots by date, and
+  `tmutil deletelocalsnapshots DATE` deletes one.
+- To get a file back from it, open Time Machine and go back to the time of
+  the run. Apple describes both:
+  [About Time Machine local snapshots](https://support.apple.com/en-us/102154)
+  and
+  [Restore items backed up with Time Machine on Mac](https://support.apple.com/guide/mac-help/restore-files-mh11422/mac).
+
+When macOS cannot take the snapshot, the run goes on: phase 1 says so, and
+`snapshot/notes.txt` in the run folder says why.
 
 ## Safety
 
