@@ -688,6 +688,14 @@ class EnvironmentAndOwnershipTest(HealthCase):
         self.assertEqual(self.fixes(issues[1]), ["Fix: remove these lines from ~/.homebrew/brew.env, or put a # in "
                                                  "front of each."])
 
+    def test_a_brew_env_line_that_turns_the_dependents_check_off(self):
+        user_file = os.path.join(self.home, ".homebrew", "brew.env")
+        self.inv.brew_env = [locate.EnvLine(user_file, 1, "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", "1")]
+        issue = self.found("brew-env-override", self.detect())[0]
+        self.assertEqual(issue.evidence, [
+            "line 1: HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1 sets HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK for every "
+            "`brew` command, where brew-ports sets it only for the installs and upgrades of a move"])
+
     def test_brew_env_lines_that_keep_the_profile(self):
         system_file = "/etc/homebrew/brew.env"
         self.inv.brew_env = [locate.EnvLine(system_file, 1, "HOMEBREW_NO_SUDO", "1"),

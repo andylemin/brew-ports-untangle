@@ -6,11 +6,11 @@ import types
 import unittest
 from unittest import mock
 
-from brew_ports import doctor, exec_install, executor, state
+from brew_ports import doctor, exec_install, executor, runner, state
 from brew_ports.homebrew import actions as brew_actions
 from brew_ports.model import OnFailure
 from tests.unit.fixtures.executor import builders as b
-from tests.unit.helpers import TempDirTest, make_package
+from tests.unit.helpers import TempDirTest, make_instance, make_package
 from tests.unit.test_executor import ApplyTest
 
 
@@ -120,6 +120,13 @@ class FindingTest(unittest.TestCase):
         self.assertEqual((issue.code, issue.subject, issue.instance_prefix),
                          ("brew-keg-without-receipt", "python@3.12", "/opt/homebrew"))
         self.assertEqual(exec_install.finding([self.other]).subject, "jq")
+
+    def test_a_rebuild_keeps_homebrew_to_the_one_formula(self):
+        run = types.SimpleNamespace(runner=types.SimpleNamespace(host_arch="arm64"), homebrew_present=True)
+        again = exec_install.rebuild_action(run, make_instance(prefix="/opt/homebrew", arch="arm64"), "curl", [])
+        self.assertEqual(again.argv[-3:], ["reinstall", "--formula", "curl"])
+        # Homebrew must not go on to upgrade what uses curl: the plan lists every upgrade of the move.
+        self.assertEqual(again.env_profile, runner.BREW_NAMED_ONLY)
 
 
 class ReinstallSplitTest(TempDirTest):

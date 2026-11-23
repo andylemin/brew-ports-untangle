@@ -243,8 +243,9 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
     """Return the target upgrades the plan causes, and the pinned packages among them as blockers
 
     The outdated mapped targets, companions and reinstalled packages are upgraded, with what a mapped target
-    needs when phase 3 installs or upgrades that target. Every package that depends on one of them is checked
-    after the upgrades: Homebrew upgrades the outdated ones among them, `port upgrade` leaves them as they are.
+    needs when phase 3 installs or upgrades that target. Every package that depends on one of them is only
+    checked after the upgrades: a command of phase 3 upgrades what it names and what that needs, with either
+    manager.
 
     @param view               the target's installed packages and catalogue
     @param targets            the roots that need each mapped target and companion, by target name
@@ -279,9 +280,15 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
                 out.explicit.append(view.key(name))
     for name in reinstalled:
         pkg = view.installed(name)
+        roots = [r for t, rs in targets.items() for r in rs if view.key(name) in closures[t]]
         if pkg is not None and pkg.outdated:
-            add(name, "reinstalled by the plan", [r for t, rs in targets.items() for r in rs
-                                                  if view.key(name) in closures[t]])
+            add(name, "reinstalled by the plan", roots)
+        # `brew reinstall` brings what the formula needs up to date as an install does. A port is rebuilt
+        # without its dependencies.
+        for dep in view.closure([name])[1:] if view.brew else []:
+            found = view.installed(dep)
+            if found is not None and found.outdated:
+                add(dep, f"a dependency of {name}", roots)
     again = {view.key(name) for name in reinstalled}
     for name, roots in targets.items():
         pkg = view.installed(name)
@@ -294,7 +301,7 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
     upgraded = list(out.names)
     for name in upgraded:
         for dependent in view.dependents_of([name]):
-            add(dependent, f"depends on {name}", cause.get(name, ()), upgraded=view.brew)
+            add(dependent, f"depends on {name}", cause.get(name, ()), upgraded=False)
     for name in out.names:
         pkg = view.installed(name)
         if pkg is not None and pkg.pinned:
@@ -489,16 +496,10 @@ def every_upgrade(view: TargetView, host_arch: str, ups: Upgrades, versions: tup
         if name in ups.names and name not in ups.checked:
             if why is None:
                 ups.also.append(name)
-            elif ups.reasons.get(name, "").startswith("depends on "):
-                # Homebrew would upgrade it after the formula it uses. The commands of a plan with the option
-                # keep Homebrew from that, so it is only checked.
-                ups.checked.append(name)
-                ups.versions[name] = pkg.version or "?"
-                ups.left[name] = why
         elif why is not None:
             ups.left[name] = why
         else:
-            if name in ups.checked:     # a port that uses an upgraded one: only the option upgrades it
+            if name in ups.checked:     # it uses an upgraded package: only the option upgrades it
                 ups.checked.remove(name)
             else:
                 ups.names.append(name)
@@ -556,7 +557,8 @@ def phase2_issues(issues: Sequence[Issue], view: TargetView, closure: set[str]) 
 def phase2(issues: Sequence[Issue]) -> list[Action]:
     """Return the remedies of the phase 2 findings, each description naming its finding
 
-    Their `doctor.<code>.<subject>.<step>` ids become `2.<code>.<subject>.<step>`.
+    Their `doctor.<code>.<subject>.<step>` ids become `2.<code>.<subject>.<step>`. A `brew` command runs under
+    `BREW_NAMED_ONLY`, as those of phase 3 do: Homebrew upgrades no formula that uses a repaired one.
 
     @param issues  the findings phase 2 repairs, in their order
     @returns       the actions of phase 2
@@ -565,8 +567,27 @@ def phase2(issues: Sequence[Issue]) -> list[Action]:
     for issue in issues:
         for action in _runnable(issue):
             rest = action.action_id.split(".", 1)[1] if action.action_id.startswith("doctor.") else action.action_id
-            out.append(dataclasses.replace(action, action_id="2." + rest,
+            profile = BREW_NAMED_ONLY if action.env_profile == "brew" else action.env_profile
+            out.append(dataclasses.replace(action, action_id="2." + rest, env_profile=profile,
                                            description=f"{issue.code} {issue.subject}: {action.description}"))
+    return out
+
+
+def installed_by(actions: Sequence[Action]) -> list[str]:
+    """Return the formulae that the `brew install` and `brew reinstall` commands among the actions name
+
+    Such a command brings what its formulae need up to date, so the plan counts that among its upgrades.
+
+    @param actions  the actions of phase 2
+    @returns        the names, each once, in action order
+    """
+    out: list[str] = []
+    for action in actions:
+        if action.env_profile != BREW_NAMED_ONLY or "--cask" in action.argv:
+            continue
+        verbs = [index for index, word in enumerate(action.argv) if word in ("install", "reinstall")]
+        if verbs:
+            out += [word for word in action.argv[verbs[0] + 1:] if not word.startswith("-") and word not in out]
     return out
 
 
@@ -641,7 +662,7 @@ def _pipx(target: Instance, host_arch: str, project: str) -> Action:
 
 
 def phase3_brew(view: TargetView, host_arch: str, items: Sequence[Install], *, projects: Sequence[str],
-                ups: Upgrades, rebuilds: Sequence[str], named_only: bool = False) -> list[Action]:
+                ups: Upgrades, rebuilds: Sequence[str]) -> list[Action]:
     """Return the phase 3 actions of a Homebrew target
 
     The pins the user answered to remove go first; then the upgrades the replacements need, those that
@@ -649,30 +670,27 @@ def phase3_brew(view: TargetView, host_arch: str, items: Sequence[Install], *, p
     pipx and the rebuilds. The upgrades that the option adds are a command of their own, so that a failure
     in it is not one of the upgrades the replacements need.
 
-    @param view        the target's installed packages and catalogue
-    @param host_arch   the host's architecture
-    @param items       the target packages of the accepted mappings and companions
-    @param projects    the PyPI projects pipx installs
-    @param ups         the upgrades of the plan and the pins it removes
-    @param rebuilds    the target formulae to reinstall
-    @param named_only  whether the plan was made with `--upgrade-all`: its upgrade commands name every formula
-                       to upgrade, so Homebrew must add none of the formulae that use one of them, which the
-                       plan upgrades by name or leaves as they are
-    @returns           the actions
+    Each command runs under `BREW_NAMED_ONLY`: Homebrew upgrades what the command names and what that needs,
+    and no formula that uses one of them. The plan lists what is upgraded, and phase 3 checks the users itself.
+
+    @param view       the target's installed packages and catalogue
+    @param host_arch  the host's architecture
+    @param items      the target packages of the accepted mappings and companions
+    @param projects   the PyPI projects pipx installs
+    @param ups        the upgrades of the plan and the pins it removes
+    @param rebuilds   the target formulae to reinstall
+    @returns          the actions
     """
     target = view.target
     out: list[Action] = []
-    profile = BREW_NAMED_ONLY if named_only else "brew"
     if ups.unpin:
         out.append(brew_actions.unpin(target, host_arch, "3.unpin.formulae", list(ups.unpin)))
     if ups.unpin_casks:
         out.append(brew_actions.unpin(target, host_arch, "3.unpin.casks", list(ups.unpin_casks), casks=True))
     if ups.explicit:
-        needed = brew_actions.upgrade_formulae(target, host_arch, "3.upgrade.formulae", ups.explicit)
-        out.append(dataclasses.replace(needed, env_profile=profile))
+        out.append(brew_actions.upgrade_formulae(target, host_arch, "3.upgrade.formulae", ups.explicit))
     if ups.also:
-        others = brew_actions.upgrade_formulae(target, host_arch, "3.upgrade.others", ups.also)
-        out.append(dataclasses.replace(others, env_profile=profile))
+        out.append(brew_actions.upgrade_formulae(target, host_arch, "3.upgrade.others", ups.also))
     if ups.casks:
         out.append(brew_actions.upgrade_casks(target, host_arch, "3.upgrade.casks", list(ups.casks)))
     formulae = [i.name for i in items if i.kind in ("formula", "") and view.installed(i.name) is None]
@@ -697,7 +715,7 @@ def phase3_brew(view: TargetView, host_arch: str, items: Sequence[Install], *, p
     for name in rebuilds:
         out.append(brew_actions.reinstall(target, host_arch, f"3.{name}.rebuild", [name],
                                           on_failure=OnFailure.PROBE))
-    return out
+    return [dataclasses.replace(action, env_profile=BREW_NAMED_ONLY) for action in out]
 
 
 def phase3_ports(view: TargetView, host_arch: str, items: Sequence[Install], *, projects: Sequence[str],

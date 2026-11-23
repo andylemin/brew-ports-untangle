@@ -1656,6 +1656,9 @@ def _env_line_effect(name: str, value: str) -> str | None:
         if not value or value.lower() in FALSY:
             return f"turns off {name}={BREW_SET[name]}, which brew-ports sets for every `brew` command it runs"
         return None
+    if value and name == "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK":
+        return (f"sets {name} for every `brew` command, where brew-ports sets it only for the installs and upgrades "
+                "of a move")
     if value and (name in BREW_DENY or name.startswith(BREW_DENY_PREFIXES)):
         return f"sets {name}, which brew-ports keeps away from every `brew` command it runs"
     return None

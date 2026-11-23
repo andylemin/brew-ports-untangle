@@ -159,6 +159,10 @@ uninstalls, or edits something, unless you give `--yes`.
 | 7 | Clean up the shell files and `/etc/paths`. |
 | 8 | Final check: run the `verify` checks, and write `report.md`. |
 
+In phases 2 and 3, Homebrew upgrades only what the plan lists. brew-ports
+turns off Homebrew's own upgrade of the packages that use an upgraded one,
+checks those packages itself, and installs again one that lost a library.
+
 `--stop-after N` ends a run after phase N. `apply --resume RUN-ID` continues a
 run: phases 1 to 3 skip the work that succeeded, and the later phases recompute
 the remaining work from the host. After phase 6,

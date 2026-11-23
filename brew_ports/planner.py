@@ -1086,9 +1086,11 @@ class _Composer:
         targets = self.target_roots(mappings)
         used = set(view.closure(targets))                  # the replacements and everything they use
         repairs = plan_phases.phase2_issues(self.issues, view, used)
+        phase2 = plan_phases.phase2(repairs)
         repaired = [i.subject for i in repairs if i.code in plan_phases.REINSTALL_CODES and i.subject]
         rebuild = [n for n in self.rebuilds() if view.key(n) not in {view.key(r) for r in repaired}]
-        ups = plan_phases.upgrades(view, targets, repaired + rebuild, self.outdated())
+        again = repaired + rebuild + [n for n in plan_phases.installed_by(phase2) if n not in repaired]
+        ups = plan_phases.upgrades(view, targets, again, self.outdated())
         refusals = list(self.sets.refusals) + self.refusals
         refusals += self.pins_in_the_way(view, ups, bool(refusals))
         survivors = [i for i in self.result.instances if i not in self.removed]
@@ -1100,13 +1102,13 @@ class _Composer:
         items, projects = plan_phases.installs(mappings)
         if self.manager is Manager.BREW:
             phase3 = plan_phases.phase3_brew(view, self.host_arch, items, projects=projects, ups=ups,
-                                             rebuilds=rebuild, named_only=self.options.upgrade_all)
+                                             rebuilds=rebuild)
         else:
             homebrew = any(i.manager is Manager.BREW for i in self.result.instances)
             phase3 = plan_phases.phase3_ports(view, self.host_arch, items, projects=projects, homebrew_present=homebrew,
                                               rebuilds=rebuild, others=ups.also)
         phase6 = plan_phases.phase6(self.removed, self.target, self.result.services, self.environ, survivors)
-        phases = plan_phases.assemble(plan_phases.phase2(repairs), phase3, phase6, bool(self.removed))
+        phases = plan_phases.assemble(phase2, phase3, phase6, bool(self.removed))
         self.draft.stops = self.stops()
         self.draft.todo += self.user_jobs()
         self.draft.notes += self.sets.notes

@@ -17,7 +17,7 @@ from .macports import actions as mp_actions, registry
 from .model import Action, Instance, Issue, Manager, OnFailure, Severity
 from .plan_phases import OPEN_APPS
 from .report import counted, some
-from .runner import ActionFailed
+from .runner import BREW_NAMED_ONLY, ActionFailed
 
 OTHERS = "3.upgrade.others"             # the formulae that `--upgrade-all` upgrades by name
 CASK_UPGRADES = "3.upgrade.casks"
@@ -335,6 +335,7 @@ def rebuild_action(run, target: Instance, name: str, variants: Sequence[str]) ->
     """Return the rebuild of a target package: `brew reinstall`, or the missing-image remedy pair
 
     Its id is `3.<package>.rebuild`; the MacPorts pair runs in trace mode while a Homebrew prefix exists.
+    Homebrew installs the one formula again and upgrades none that uses it, as with every command of phase 3.
 
     @param run       the run
     @param target    the target instance
@@ -345,7 +346,8 @@ def rebuild_action(run, target: Instance, name: str, variants: Sequence[str]) ->
     host = run.runner.host_arch
     action_id = f"3.{name}.rebuild"
     if target.manager is Manager.BREW:
-        return brew_actions.reinstall(target, host, action_id, [name], on_failure=OnFailure.PROBE)
+        again = brew_actions.reinstall(target, host, action_id, [name], on_failure=OnFailure.PROBE)
+        return dataclasses.replace(again, env_profile=BREW_NAMED_ONLY)
     return mp_actions.upgrade_forced(target, host, action_id, name, variants, homebrew_present=run.homebrew_present)
 
 

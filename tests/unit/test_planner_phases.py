@@ -66,15 +66,26 @@ class BrewUpgradesTest(PlannerCase):
         self.assertNotIn("3.upgrade.formulae", ids(plan, 3))
         self.assertNotIn("pkgconf", plan.target_upgrades)
 
-    def test_homebrew_upgrades_what_uses_an_upgraded_formula(self):
+    def test_what_uses_an_upgraded_formula_is_only_checked(self):
         prefix = self.path("opt", "homebrew")
         self.brew_target(formula("openssl@3", prefix, version="3.5.0", outdated=True, requested=False),
                          formula("curl", prefix, version="8.16.0", deps=["openssl@3"], outdated=True),
                          payload=PAYLOAD, outdated_formulae={"openssl@3": "3.6.0", "curl": "8.17.0"})
         outcome = self.plan()
         self.assert_exit(outcome, 0)
-        self.assertRegex(self.text(outcome), r"\n  curl +8\.16\.0 -> 8\.17\.0 +depends on openssl@3\n")
-        self.assertNotIn("Checked after the upgrades", self.text(outcome))
+        # curl has a newer version too. Homebrew would upgrade it after openssl@3, with what curl needs; the
+        # commands of phase 3 keep Homebrew to what they name, so the plan lists all that is upgraded.
+        text = self.text(outcome)
+        self.assertIn("\n  Checked after the upgrades, and installed again if one lost a library: curl\n", text)
+        self.assertNotIn("8.16.0 ->", text)
+        for action in actions(outcome.plan, 3):
+            env = runner.profile_env(action.env_profile, {}, prefix=prefix)
+            self.assertEqual(env["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"], "1", action.action_id)
+        # With --upgrade-all the plan upgrades curl by name.
+        every = self.plan(upgrade_all=True)
+        self.assertEqual(next(a.argv[-2:] for a in actions(every.plan, 3) if a.action_id == "3.upgrade.others"),
+                         ["curl", "openssl@3"])
+        self.assertRegex(self.text(every), r"\n  curl +8\.16\.0 -> 8\.17\.0\n")
 
     def duplicate(self, **openssl):
         """Add a Homebrew target that holds wget too, at the version of the catalogue, on an outdated openssl@3
@@ -482,7 +493,7 @@ class UpgradeAllTest(PlannerCase):
         self.assertEqual(acts["3.upgrade.others"].argv[2:], [brew, "upgrade", "--formula", "ddrescue"])
         self.assertIn("  gnu-sed 4.10: the pin is removed, as you answered\n", self.text(freed))
 
-    def test_the_upgrade_commands_keep_homebrew_to_what_they_name(self):
+    def test_what_a_pin_holds_back_stays_beside_an_upgrade(self):
         self.brew_host()
         prefix = self.path("opt", "homebrew")
         # pkgconf is a replacement to upgrade; bat uses it and ddrescue, which the pinned gnu-sed keeps as it is.
@@ -492,7 +503,7 @@ class UpgradeAllTest(PlannerCase):
         self.assert_exit(outcome, 0)
         acts = {a.action_id: a for a in actions(outcome.plan, 3)}
         self.assertEqual(acts["3.upgrade.formulae"].argv[-1], "pkgconf")
-        # Homebrew would upgrade bat after pkgconf, and ddrescue with it. Under the option it adds nothing itself.
+        # Left to itself, Homebrew would upgrade bat after pkgconf, and ddrescue with it.
         self.assertEqual({acts[i].env_profile for i in ("3.upgrade.formulae", "3.upgrade.others")},
                          {runner.BREW_NAMED_ONLY})
         self.assertNotIn("bat", acts["3.upgrade.others"].argv)
@@ -500,9 +511,6 @@ class UpgradeAllTest(PlannerCase):
         self.assertIn("\n  Checked after the upgrades, and installed again if one lost a library: bat\n", text)
         self.assertIn("\n  bat: its upgrade would also upgrade ddrescue, which a pinned formula uses. ", text)
         self.assertNotIn("0.24 ->", text)
-        # Without the option Homebrew's own check of what uses an upgraded formula stays on.
-        plain = {a.action_id: a for a in actions(self.plan().plan, 3)}
-        self.assertEqual(plain["3.upgrade.formulae"].env_profile, "brew")
 
     def test_a_pinned_app_is_asked_about_like_a_pinned_formula(self):
         prefix = self.path("opt", "homebrew")
@@ -610,7 +618,7 @@ class Phase3BrewTest(PlannerCase):
         self.assertEqual(acts["3.adopt.firefox"].retry_argv[-2:], ["--force", "firefox"])
         self.assertEqual(acts["3.mark.gnu-sed"].argv[-2:], ["--installed-on-request", "gnu-sed"])
         for action in acts.values():
-            self.assertEqual(action.env_profile, "brew")
+            self.assertEqual(action.env_profile, runner.BREW_NAMED_ONLY)
             self.assertFalse(action.sudo)
             self.assertNotEqual(action.on_failure, OnFailure.STOP, action.action_id)
         self.assertEqual(acts["3.install.bottled"].split_head, len(acts["3.install.bottled"].argv) - 1)
@@ -676,6 +684,28 @@ class Phase2Test(PlannerCase):
         self.assertEqual([a.action_id for a in acts], ["2.brew-keg-without-receipt.openssl@3.reinstall",
                                                        "2.brew-broken-linkage.openssl@3.reinstall"])
         self.assertTrue(acts[0].description.startswith("brew-keg-without-receipt openssl@3: "))
+        # A repair keeps Homebrew to the formula it names, as the commands of phase 3 do.
+        self.assertEqual({a.env_profile for a in acts}, {runner.BREW_NAMED_ONLY})
+
+    def test_what_a_repair_installs_counts_among_the_upgrades(self):
+        self.ports_source(port("wget", self.local, "1.25.0"))
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("wget", prefix, version="1.25.0", deps=["openssl@3"]),
+                         formula("pkgconf", prefix, version="2.4.0", outdated=True, requested=False),
+                         formula("ddrescue", prefix, version="1.29", deps=["pkgconf"]),
+                         payload=dict(PAYLOAD, formulae=dict(PAYLOAD["formulae"], **{
+                             "openssl@3": {"stable_version": "3.6.0", "stable_dependencies": ["pkgconf"]}})),
+                         outdated_formulae={"pkgconf": "2.5.1"})
+        missing = "brew-missing-dependency"
+        install = brew_actions.install_formulae(self.target, "arm64", f"doctor.{missing}.wget.install", ["openssl@3"])
+        issue = doctor._issue(missing, Severity.HIGH, "Missing dependency", "wget", prefix, evidence=[],
+                              remedies=[install], repairs_install=True)
+        outcome = self.plan(issues=[issue])
+        self.assert_exit(outcome, 0)
+        self.assertEqual(plan_phases.installed_by(actions(outcome.plan, 2)), ["openssl@3"])
+        # Installing the missing openssl@3 may bring pkgconf up to date, which ddrescue uses too.
+        self.assertEqual(outcome.plan.target_upgrades, ["pkgconf", "ddrescue"])
+        self.assertRegex(self.text(outcome), r"\n  pkgconf +2\.4\.0 -> 2\.5\.1 +a dependency of openssl@3\n")
 
 
 class RebuildTest(PlannerCase):
@@ -704,6 +734,29 @@ class RebuildTest(PlannerCase):
         kept = self.plan(keep=["zlib"])
         self.assertNotIn("3.tool.rebuild", ids(kept.plan, 3))
         self.assertIn(f"  tool ({binary}) still uses {lib}, which stays: nothing to do", kept.report)
+
+    def test_what_a_rebuilt_formula_needs_is_listed_as_an_upgrade(self):
+        lib = self.local + "/lib/libz.1.dylib"
+        self.world.files[self.local] = {("zlib", "@1.3_0"): [(lib, True)]}
+        self.ports_source(port("wget", self.local, "1.25.0", deps=["zlib"]),
+                          port("zlib", self.local, "1.3", requested=False))
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("tool", prefix, deps=["pcre2"]),
+                         formula("pcre2", prefix, version="10.44", outdated=True, requested=False),
+                         formula("grep", prefix, version="3.11", deps=["pcre2"]),
+                         outdated_formulae={"pcre2": "10.45"})
+        self.world.linkage = {"binaries": {prefix + "/Cellar/tool/1.0/bin/tool": {
+            "package": f"{prefix}|formula|tool", "instance_prefix": prefix,
+            "references": [{"name": lib, "resolved": lib, "class": "other"}]}}}
+        outcome = self.plan()
+        self.assert_exit(outcome, 0)
+        self.assertIn("3.tool.rebuild", ids(outcome.plan, 3))
+        # `brew reinstall tool` may bring pcre2 up to date. Homebrew does not look after grep, which uses pcre2
+        # too, so the plan names both: phase 3 checks grep and installs it again if it lost a library.
+        self.assertEqual(outcome.plan.target_upgrades, ["pcre2", "grep", "tool"])
+        self.assertRegex(self.text(outcome), r"\n  pcre2 +10\.44 -> 10\.45 +a dependency of tool\n"
+                                             r"  Checked after the upgrades, and installed again if one lost a "
+                                             r"library: grep, tool\n")
 
     def test_a_link_into_a_rack_under_an_old_name_is_rebuilt(self):
         keg = self.usr_local + "/Cellar/oldwget/1.25.0"
