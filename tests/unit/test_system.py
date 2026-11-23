@@ -90,6 +90,13 @@ class FactsTest(TempDirTest):
         self.assertGreater(free, 0)
         self.assertIsNone(system.free_bytes(self.path("nope")))
 
+    def test_a_darwin_major_reads_as_its_macos_release(self):
+        self.assertEqual([system.macos_name(major) for major in (19, 20, 24, 25, 26)], [
+            "macOS 10.15 (Darwin 19)", "macOS 11 (Darwin 20)", "macOS 15 (Darwin 24)", "macOS 26 (Darwin 25)",
+            "macOS 27 (Darwin 26)"])
+        # A major with no release that is known gets no guess.
+        self.assertEqual((system.macos_name(27), system.macos_name(0)), ("Darwin 27", "Darwin 0"))
+
 
 if __name__ == "__main__":
     unittest.main()

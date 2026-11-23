@@ -4,11 +4,12 @@ import os
 import time
 import unittest
 
-from brew_ports import model, state, system
+from brew_ports import doctor_report, model, state, system
 from brew_ports.env import services as env_services
-from brew_ports.macports import health
+from brew_ports.macports import health, macho as macho_header
 from brew_ports.macports.portindex import PortEntry
 from brew_ports.model import Blocks, OnFailure, Severity, Usability
+from brew_ports.report import MOVE_OUT, typed
 from brew_ports.runner import RM, FakeResponse
 from tests.unit.fixtures.macports.builders import fake_runner, port, write_sources_conf
 from tests.unit.fixtures.macports_health.sites import (ARM64, PLATFORM, X86_64, Site, macho, port_argv, service, sql,
@@ -72,12 +73,21 @@ class HealthTest(TempDirTest):
         return found[0]
 
     def argvs(self, issue):
-        """Return the argv of each remedy of a finding
+        """Return the argv of each command among the remedies of a finding
 
         @param issue  the finding
         @returns      the argvs, in remedy order
         """
-        return [a.argv for a in issue.remedies]
+        return [a.argv for a in issue.remedies if a.kind == "command"]
+
+    @staticmethod
+    def fixes(issue):
+        """Return what the report tells the user to do about a finding
+
+        @param issue  the finding
+        @returns      the lines the report prints under it
+        """
+        return doctor_report.fix_lines(issue)
 
     def step(self, issue):
         """Return the `<step>` of an issue's first remedy id
@@ -121,13 +131,19 @@ class DiagnoseTest(HealthTest):
         found = self.detect(site.bundle(), {key: FakeResponse(stderr=self.STDERR)})
         issues = self.only(found, "ports-diagnose-warning")
         self.assertEqual([i.subject for i in issues], [site.prefix, site.prefix, "foo"])
-        self.assertEqual(issues[0].remedies[0].description,
-                         "Warning: Xcode Command Line Tools are not installed! To install them, please enter the "
-                         "command: xcode-select --install")
+        # The warning is the evidence and is printed once; the fix line does not repeat it.
+        self.assertEqual((issues[0].title, issues[0].evidence, self.fixes(issues[0])),
+                         ("MacPorts' own check, `port diagnose`, reports a problem",
+                          ["Warning: Xcode Command Line Tools are not installed! To install them, please enter the "
+                           "command: xcode-select --install"],
+                          ["brew-ports offers no fix: what to do about it, if anything, is in MacPorts' message."]))
         self.assertTrue(all(i.severity is Severity.MEDIUM and i.remedies[0].manual for i in issues))
-        self.assertEqual(issues[2].evidence, ["port diagnose: missing /opt/local/bin/a",
-                                              "port diagnose: missing /opt/local/bin/b"])
-        self.assertIn("(and 1 more files of foo)", issues[2].remedies[0].description)
+        self.assertEqual((issues[2].title, issues[2].evidence),
+                         ("`port diagnose` cannot find 2 files of foo", ["/opt/local/bin/a", "/opt/local/bin/b"]))
+        # A command for the user names this installation's `port`, which may not be the one on the PATH.
+        port_bin = os.path.join(site.prefix, "bin", "port")
+        self.assertEqual(self.fixes(issues[2]), [f"Fix: `sudo {port_bin} -f deactivate foo`, then `sudo {port_bin} "
+                                                 "-f activate foo`, as MacPorts advises."])
         self.assertTrue(self.step(issues[0]).startswith("warning-"))
         self.assertFalse(any(i.confirm_each or i.auto_fix or i.blocks for i in issues))
 
@@ -139,7 +155,8 @@ class DiagnoseTest(HealthTest):
         found = self.detect(bundle, {key: FakeResponse(stderr=self.STDERR)})
         self.assertEqual(self.only(found, "ports-diagnose-warning"), [])
         self.assertNotIn(key, self.runner.calls)
-        self.assertTrue(any("port diagnose skipped" in n for n in bundle.notes))
+        self.assertEqual(bundle.notes, [f"What `port diagnose` reports about MacPorts at {site.prefix}: its `port` "
+                                        "command cannot run"])
 
     def test_parse_diagnose(self):
         text = "Checking for things\nWarning: one\n  two\nError: three\nPlease refer to the guide\n  ignored\n"
@@ -151,31 +168,65 @@ class BaseTest(HealthTest):
 
     def test_platform_mismatch_with_migrate(self):
         site = self.site(os_major="24")
-        inst = site.instance(usability=Usability.PLATFORM_MISMATCH, usability_detail="base is built for darwin 24")
+        detail = "MacPorts was built for macOS 15 (Darwin 24); this Mac runs macOS 26 (Darwin 25)"
+        inst = site.instance(usability=Usability.PLATFORM_MISMATCH, usability_detail=detail)
         issue = self.one(self.detect(site.bundle(inst)), "ports-platform-mismatch")
         self.assertEqual(self.argvs(issue),
                          [port_argv(site.prefix, "migrate", "--all"), port_argv(site.prefix, "sync")])
-        self.assertTrue(all(a.sudo for a in issue.remedies))
+        self.assertTrue(all(a.sudo for a in issue.remedies if a.kind == "command"))
         self.assertEqual((issue.severity, issue.confirm_each, issue.blocks), (Severity.HIGH, True, (Blocks.TARGET,)))
-        self.assertEqual(issue.evidence[0], "base is built for darwin 24")
+        self.assertEqual((issue.title, issue.evidence),
+                         ("MacPorts itself was built for another version of macOS", [detail]))
         slugged = site.prefix.replace("/", "%")
         self.assertEqual([a.action_id for a in issue.remedies],
-                         [f"doctor.ports-platform-mismatch.{slugged}.migrate",
-                          f"doctor.ports-platform-mismatch.{slugged}.sync"])
+                         [f"doctor.ports-platform-mismatch.{slugged}.{step}"
+                          for step in ("migrate", "sync", "long", "leaving")])
+        port_bin = os.path.join(site.prefix, "bin", "port")
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: brew-ports doctor --fix (asks, then runs `sudo {port_bin} -N migrate --all`, then "
+            f"`sudo {port_bin} -N sync`)",
+            "`port migrate` builds MacPorts itself again for this Mac, switches every port off, builds again the "
+            "ports made for another macOS or processor, and switches the others back on. That can take a long time.",
+            MOVE_OUT % site.prefix])
         self.assertIsNone(health.removes_package(issue))
+
+    def test_the_title_of_a_mismatch_names_its_cause(self):
+        site = self.site()
+        intel = site.instance(usability=Usability.PLATFORM_MISMATCH, arch="x86_64",
+                              usability_detail="MacPorts runs as Intel code on this Apple Silicon Mac")
+        issue = self.one(self.detect(site.bundle(intel)), "ports-platform-mismatch")
+        self.assertEqual((issue.title, issue.evidence),
+                         ("MacPorts itself is an Intel build, and this Mac is Apple Silicon", []))
+        other = site.instance(usability=Usability.PLATFORM_MISMATCH,
+                              usability_detail="Error: Current platform \"darwin 25\" does not match expected "
+                                               "platform \"freebsd 14\"")
+        issue = self.one(self.detect(site.bundle(other)), "ports-platform-mismatch")
+        self.assertEqual((issue.title, issue.evidence), ("MacPorts itself does not match this Mac", [
+            "Error: Current platform \"darwin 25\" does not match expected platform \"freebsd 14\""]))
 
     def test_platform_mismatch_on_an_old_base(self):
         site = self.site(version="2.8.1", os_major="24")
         inst = site.instance(usability=Usability.PLATFORM_MISMATCH)
         issue = self.one(self.detect(site.bundle(inst)), "ports-platform-mismatch")
-        self.assertEqual([a.kind for a in issue.remedies], ["note", "command", "command"])
-        self.assertEqual(self.argvs(issue)[1:], [port_argv(site.prefix, "sync"),
-                                                 port_argv(site.prefix, "migrate", "--all")])
+        self.assertEqual(self.argvs(issue), [port_argv(site.prefix, "sync"),
+                                             port_argv(site.prefix, "migrate", "--all")])
         self.assertTrue(issue.confirm_each)
+        # The installer comes first, so the fix is said in words: the two commands alone would not run.
+        port_bin = os.path.join(site.prefix, "bin", "port")
+        self.assertEqual(self.fixes(issue)[:2], [
+            f"Fix: brew-ports doctor --fix (asks, then installs MacPorts over {site.prefix} again from its official "
+            f"signed installer, then runs `sudo {port_bin} -N migrate --all`)",
+            "It downloads the installer from MacPorts' releases, checks its signature and runs it with your password "
+            "(sudo). The installer adds MacPorts to the PATH in your shell's login files. The installer keeps your "
+            "ports; `port migrate` then builds them again."])
         elsewhere = self.one(self.detect(site.bundle(inst), default_prefix=self.path("other")),
                              "ports-platform-mismatch")
-        self.assertEqual([a.kind for a in elsewhere.remedies], ["note"])
-        self.assertIn(f"./configure --prefix={site.prefix}", elsewhere.remedies[0].description)
+        # MacPorts 2.8.1 has no `port migrate`, so it is the current MacPorts that is to be built.
+        self.assertEqual(self.fixes(elsewhere)[0],
+                         "Fix: MacPorts' installer installs to /opt/local only, so build the current MacPorts from "
+                         f"source with `./configure --prefix={site.prefix}`, then run `sudo {port_bin} -N migrate "
+                         "--all`.")
+        self.assertNotIn("2.8.1", self.fixes(elsewhere)[0])
         self.assertFalse(elsewhere.confirm_each)
         self.assertEqual(elsewhere.blocks, (Blocks.TARGET,))
 
@@ -183,7 +234,8 @@ class BaseTest(HealthTest):
         site = self.site(os_major="24", binary=False)
         issue = self.one(self.detect(site.bundle(site.instance(usability=Usability.MISSING_BINARY))),
                          "ports-platform-mismatch")
-        self.assertIn("Darwin 24", issue.evidence[0])
+        self.assertEqual(issue.evidence, ["MacPorts was built for macOS 15 (Darwin 24); this Mac runs macOS 26 "
+                                          "(Darwin 25)"])
         self.assertEqual(issue.remedies[0].kind, "note")
         self.assertEqual(self.only(self.detect(self.site().bundle()), "ports-platform-mismatch"), [])
 
@@ -193,10 +245,29 @@ class BaseTest(HealthTest):
         inst = site.instance(inventory_known=False, inventory_error="RegistryDamaged: malformed",
                              usability=Usability.DAMAGED_REGISTRY)
         issue = self.one(self.detect(site.bundle(inst)), "ports-damaged-registry")
-        self.assertEqual(issue.evidence[0], "RegistryDamaged: malformed")
-        self.assertIn("image archive: curl: curl-8.9.1_0.darwin_25.arm64.tbz2", issue.evidence)
-        self.assertEqual((issue.remedies, issue.blocks), ([], (Blocks.TARGET, Blocks.REMOVE)))
+        software = os.path.join(inst.portdbpath, "software")
+        self.assertEqual((issue.title, issue.evidence),
+                         ("MacPorts' record of installed ports cannot be read",
+                          ["the record's file is damaged: malformed", f"1 port left files in {software}: curl"]))
+        self.assertEqual(issue.blocks, (Blocks.TARGET, Blocks.REMOVE))
+        record = os.path.join(inst.portdbpath, "registry", "registry.db")
+        self.assertEqual(self.fixes(issue), [
+            "brew-ports offers no fix: without that record it can tell neither which ports are installed nor how "
+            f"to uninstall them. Restore {record} from a backup, or install what you need with Homebrew yourself."])
         self.assertEqual(self.only(self.detect(self.site().bundle()), "ports-damaged-registry"), [])
+
+    def test_a_record_error_reads_in_plain_words(self):
+        self.assertEqual([health._plain(error) for error in (
+            "RegistryMissing: /opt/local/var/macports/registry/registry.db; images or files of ports remain",
+            "RegistryBusy: no progress for 30 s: another port process holds the registry",
+            "RegistryBusy: the registry kept changing while it was copied",
+            "RegistryUnreadable: PermissionError: [Errno 13] Permission denied: '/x/registry.db'",
+            "something else", None)], [
+                "/opt/local/var/macports/registry/registry.db is missing, but files of ports are still installed",
+                "brew-ports waited 30 seconds for it to let go of the record",
+                "the record kept changing while brew-ports read it",
+                "the record cannot be read: Permission denied: '/x/registry.db'",
+                "something else", ""])
 
     def test_busy_registry_is_not_damaged(self):
         site = self.site()
@@ -204,7 +275,11 @@ class BaseTest(HealthTest):
         issues = self.detect(site.bundle(inst))
         issue = self.one(issues, "ports-registry-busy")
         self.assertEqual((issue.severity, issue.blocks), (Severity.CRITICAL, (Blocks.ANY,)))
-        self.assertTrue(issue.remedies[0].manual)
+        self.assertEqual((issue.title, issue.evidence),
+                         ("Another `port` command is running, so MacPorts' record of installed ports cannot be read",
+                          ["brew-ports waited 30 seconds for it to let go of the record"]))
+        self.assertEqual(self.fixes(issue), ["Fix: wait until that command ends, then run `brew-ports doctor` "
+                                             "again."])
         self.assertEqual(self.only(issues, "ports-damaged-registry"), [])
         self.assertEqual(self.only(self.detect(self.site().bundle()), "ports-registry-busy"), [])
 
@@ -215,17 +290,31 @@ class BaseTest(HealthTest):
         self.assertEqual(self.argvs(issue), [port_argv(site.prefix, "version")])
         self.assertTrue(issue.remedies[0].sudo and issue.confirm_each)
         self.assertEqual(issue.blocks, (Blocks.TARGET,))
+        self.assertEqual(issue.title, "MacPorts was updated and needs one run as root to bring its record of "
+                                      "installed ports up to date")
         self.assertEqual(self.only(self.detect(self.site().bundle()), "ports-registry-schema-update"), [])
 
     def test_cannot_run_needs_registry_rows(self):
         site = self.site([port(1, "curl", "8.9.1")], binary=False)
         inst = site.instance(usability=Usability.MISSING_BINARY)
         issue = self.one(self.detect(site.bundle(inst)), "ports-cannot-run")
-        self.assertEqual([a.kind for a in issue.remedies], ["note", "command"])
-        self.assertEqual(issue.remedies[1].argv, port_argv(site.prefix, "sync"))
+        self.assertEqual(self.argvs(issue), [port_argv(site.prefix, "sync")])
         self.assertEqual((issue.confirm_each, issue.blocks), (True, (Blocks.TARGET,)))
+        self.assertEqual((issue.title, issue.evidence[-1]),
+                         (f"The `port` command of MacPorts at {site.prefix} is missing or does not start",
+                          "MacPorts' record lists 1 installed port"))
+        # `port sync` cannot run before the installer has put `port` back, so the report does not print it.
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: brew-ports doctor --fix (asks, then installs MacPorts over {site.prefix} again from its official "
+            "signed installer)",
+            "It downloads the installer from MacPorts' releases, checks its signature and runs it with your password "
+            "(sudo). The installer adds MacPorts to the PATH in your shell's login files. Your installed ports "
+            "stay.",
+            MOVE_OUT % site.prefix])
         elsewhere = self.one(self.detect(site.bundle(inst), default_prefix=self.path("other")), "ports-cannot-run")
-        self.assertEqual(([a.kind for a in elsewhere.remedies], elsewhere.confirm_each), (["note"], False))
+        self.assertEqual((self.argvs(elsewhere), elsewhere.confirm_each), ([], False))
+        self.assertEqual(self.fixes(elsewhere)[0], "Fix: MacPorts' installer installs to /opt/local only, so build "
+                         f"the current MacPorts from source with `./configure --prefix={site.prefix}`.")
         empty = self.site([], binary=False)
         found = self.detect(empty.bundle(empty.instance(usability=Usability.CANNOT_RUN)))
         self.assertEqual(self.only(found, "ports-cannot-run"), [])
@@ -275,7 +364,7 @@ class RowsTest(HealthTest):
         issues = self.only(self.detect(s.bundle(brew=True)), "ports-missing-image")
         by = {(i.subject, self.step(i)): i for i in issues}
         self.assertEqual(sorted(by, key=str), sorted([("curl", "rebuild"), ("curl", "uninstall@8.8.0_0"),
-                                                      ("zlib", "upgrade"), ("gnome-themes-standard", None),
+                                                      ("zlib", "upgrade"), ("gnome-themes-standard", "replaced"),
                                                       ("vim", "rebuild")], key=str))
         rebuild = by[("curl", "rebuild")].remedies[0]
         self.assertEqual(rebuild.argv, port_argv(s.prefix, "-n", "-t", "upgrade", "--force", "--no-replace",
@@ -291,14 +380,20 @@ class RowsTest(HealthTest):
         uninstall = by[("curl", "uninstall@8.8.0_0")]
         self.assertEqual(uninstall.remedies[0].argv, port_argv(s.prefix, "uninstall", "curl", "@8.8.0_0"))
         self.assertEqual((uninstall.confirm_each, uninstall.repairs_install), (True, False))
+        self.assertEqual((uninstall.title, uninstall.evidence),
+                         ("MacPorts' stored copy of the unused version 8.8.0_0 of curl is missing",
+                          [f"it should be {s.gone('curl', '8.8.0_0')}",
+                           "without it, MacPorts can never switch that version on again"]))
         self.assertTrue(health.needs_terminal_answer(uninstall))
         self.assertEqual(health.removes_package(uninstall), ("port", "curl"))
         active = by[("curl", "rebuild")]
         self.assertEqual((active.confirm_each, active.repairs_install, active.severity), (True, True, Severity.HIGH))
+        self.assertEqual(active.title, "MacPorts' stored copy of curl 8.9.1_0 is missing")
         self.assertFalse(health.needs_terminal_answer(active))
         self.assertEqual(health.removes_package(active), ("port", "curl"))
-        replaced = by[("gnome-themes-standard", None)]
-        self.assertIn("replaced by adwaita-icon-theme: reported only", replaced.evidence[-1])
+        replaced = by[("gnome-themes-standard", "replaced")]
+        self.assertEqual(self.fixes(replaced), ["The fix is with the finding that MacPorts replaced "
+                                                "gnome-themes-standard with adwaita-icon-theme."])
         self.assertEqual((replaced.confirm_each, replaced.repairs_install), (False, False))
         self.assertIsNone(health.removes_package(replaced))
 
@@ -310,9 +405,9 @@ class RowsTest(HealthTest):
         undrivable = s.bundle(s.instance(usability=Usability.PLATFORM_MISMATCH))
         issues = self.only(self.detect(undrivable), "ports-missing-image")
         self.assertEqual(len(issues), 5)
-        self.assertTrue(all(not i.remedies for i in issues))
-        self.assertTrue(all("no remedy while MacPorts" in i.evidence[-1] for i in issues
-                            if i.subject != "gnome-themes-standard"))
+        self.assertTrue(all(not self.argvs(i) and not i.confirm_each for i in issues))
+        self.assertTrue(all(self.fixes(i) == [f"No fix until the `port` command of MacPorts at {s.prefix} runs."]
+                            for i in issues if i.subject != "gnome-themes-standard"))
 
     def test_imaged_rows_raise_nothing(self):
         s = self.site([port(1, "curl", "8.9.1")])
@@ -323,15 +418,33 @@ class RowsTest(HealthTest):
     def test_inactive_versions_and_imaged_only(self):
         s = self.build()
         issues = self.only(self.detect(s.bundle()), "ports-inactive-versions")
-        beside = [i for i in issues if i.remedies]
+        beside = [i for i in issues if self.argvs(i)]
         self.assertEqual([(i.subject, i.remedies[0].argv[-1]) for i in beside], [("curl", "@8.7.0_0")])
         self.assertEqual(beside[0].remedies[0].action_id, self.id_head(beside[0]) + "uninstall@8.7.0_0")
+        # No age is compared: the version offered for uninstall is the one that is not in use.
+        self.assertEqual((beside[0].title, beside[0].evidence),
+                         ("Version 8.7.0_0 of curl is stored but not in use", ["in use: 8.9.1_0"]))
         self.assertTrue(health.needs_terminal_answer(beside[0]))
         self.assertEqual(beside[0].severity, Severity.LOW)
-        listed = [i for i in issues if not i.remedies]
-        self.assertEqual([i.subject for i in listed], ["libiconv"])
-        self.assertIn("deactivated on purpose", listed[0].evidence[0])
+        listed = [i for i in issues if not self.argvs(i)]
+        self.assertEqual([(i.subject, i.title, i.evidence) for i in listed],
+                         [("libiconv", "libiconv is installed but switched off", ["stored: 1.17_0"])])
+        # The command names the version, which `port activate` needs once several are stored.
+        self.assertEqual(self.fixes(listed[0]), ["Nothing to do. To use it again: sudo "
+                                                 f"{os.path.join(s.prefix, 'bin', 'port')} activate libiconv @1.17_0"])
         self.assertFalse(health.needs_terminal_answer(listed[0]))
+        self.assertTrue(doctor_report.asks_nothing(listed[0]))
+
+    def test_the_activate_hint_names_the_newest_stored_version(self):
+        s = self.site(registry_db=False)
+        s.fill([port(1, "vim", "9.1.0", state="imaged", location=s.image("vim", "9.1.0_0")),
+                port(2, "vim", "9.0.2", state="imaged", location=s.image("vim", "9.0.2_0"))])
+        issue = self.one(self.detect(s.bundle()), "ports-inactive-versions")
+        self.assertEqual((issue.evidence, self.fixes(issue)), (["stored: 9.0.2_0, 9.1.0_0"], [
+            f"Nothing to do. To use it again: sudo {os.path.join(s.prefix, 'bin', 'port')} activate vim @9.1.0_0"]))
+        # A `port` that cannot run gets no command to copy.
+        broken = self.one(self.detect(s.bundle(s.instance(usability=Usability.CANNOT_RUN))), "ports-inactive-versions")
+        self.assertEqual(self.fixes(broken), ["Nothing to do."])
 
     def test_unrequested_leaf_active_only(self):
         s = self.build()
@@ -339,7 +452,9 @@ class RowsTest(HealthTest):
         self.assertEqual([(i.subject, self.argvs(i)) for i in issues],
                          [("gettext", [port_argv(s.prefix, "uninstall", "gettext", "@0.22.5_0")])])
         self.assertTrue(health.needs_terminal_answer(issues[0]))
-        self.assertEqual(issues[0].severity, Severity.INFO)
+        self.assertEqual((issues[0].severity, issues[0].title, issues[0].evidence),
+                         (Severity.INFO, "gettext came in as a dependency, and no installed port needs it",
+                          ["installed: 0.22.5_0"]))
         self.assertEqual(health.removes_package(issues[0]), ("port", "gettext"))
 
     def test_unrequested_leaf_negative(self):
@@ -349,13 +464,17 @@ class RowsTest(HealthTest):
     def test_obsolete_port_needs_a_portindex(self):
         s = self.site([port(1, "obsolete-tool", "1.0"), port(2, "curl", "8.9.1")], entries=[PortEntry("curl", "8.9.1")])
         issue = self.one(self.detect(s.bundle()), "ports-obsolete-port")
-        self.assertEqual((issue.subject, issue.remedies, issue.severity), ("obsolete-tool", [], Severity.INFO))
+        self.assertEqual((issue.subject, issue.severity), ("obsolete-tool", Severity.INFO))
+        self.assertEqual((issue.title, self.fixes(issue)),
+                         ("obsolete-tool is installed, but MacPorts' package list does not have it",
+                          ["Nothing to do. A move out of this MacPorts still looks for a replacement."]))
         self.assertEqual(self.only(self.detect(s.bundle(index=None)), "ports-obsolete-port"), [])
 
     def test_replaced_port(self):
         s = self.build()
         issue = self.one(self.detect(s.bundle()), "ports-replaced-port")
-        self.assertEqual(issue.subject, "gnome-themes-standard")
+        self.assertEqual((issue.subject, issue.title), ("gnome-themes-standard", "MacPorts replaced "
+                                                        "gnome-themes-standard with adwaita-icon-theme"))
         self.assertEqual(self.argvs(issue),
                          [port_argv(s.prefix, "upgrade", "--no-rev-upgrade", "gnome-themes-standard")])
         self.assertIn("with adwaita-icon-theme", issue.remedies[0].description)
@@ -402,14 +521,25 @@ class FilesTest(HealthTest):
         s = self.build()
         issue = self.one(self.detect(s.bundle(services=self.services)), "ports-missing-file")
         p = s.prefix
-        self.assertEqual(issue.subject, "curl")
-        self.assertEqual(issue.evidence[0], "2 registered file(s) of curl @8.9.1_0 are missing on disk")
-        self.assertEqual(issue.evidence[1:3], [p + "/share/man/man1/curl.1", p + "/bin/curl/oops"])
-        self.assertIn("1 file(s) could not be checked", issue.evidence[-1])
+        self.assertEqual((issue.subject, issue.title), ("curl", "2 files of curl 8.9.1_0 are missing"))
+        self.assertEqual(issue.evidence, [p + "/share/man/man1/curl.1", p + "/bin/curl/oops",
+                                          "1 more file could not be looked at"])
         self.assertEqual(self.argvs(issue), [port_argv(p, "-f", "deactivate", "curl", "@8.9.1_0"),
                                              port_argv(p, "-f", "activate", "curl", "@8.9.1_0")])
         self.assertEqual((issue.confirm_each, issue.repairs_install), (True, True))
         self.assertIsNone(health.removes_package(issue))
+
+    def test_missing_files_of_a_port_are_reported_once(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads every directory")
+        s = self.build()
+        advice = "Please deactivate and reactivate the port to fix this issue."
+        stderr = (f"Warning: couldn't find file '{s.prefix}/share/man/man1/curl.1' for port 'curl'. {advice}\n"
+                  f"Warning: couldn't find file '{s.prefix}/bin/ghost' for port 'ghost'. {advice}\n")
+        key = tuple(port_argv(s.prefix, "diagnose", "--quiet"))
+        found = self.detect(s.bundle(services=self.services), {key: FakeResponse(stderr=stderr)})
+        about = [(i.code, i.subject) for i in found if i.code in ("ports-diagnose-warning", "ports-missing-file")]
+        self.assertEqual(about, [("ports-diagnose-warning", "ghost"), ("ports-missing-file", "curl")])
 
     def test_missing_file_loads_a_loaded_item(self):
         s = self.build(loaded=True)
@@ -467,31 +597,44 @@ class StraysTest(HealthTest):
     def test_unregistered_file_removal_and_listing(self):
         p = self.s.prefix
         strays = self.only(self.detect(self.s.bundle(extras=self.extras)), "ports-unregistered-file")
-        removable = [i for i in strays if i.remedies]
+        removable = [i for i in strays if i.confirm_each]
         self.assertEqual([i.subject for i in removable], [p + "/bin/stray", p + "/include/foo.h"])
         stray = removable[0]
-        tar, rm = stray.remedies
+        _, tar, rm = stray.remedies
         self.assertEqual(tar.argv, [health.TAR, "-cf", "-", "-C", "/", (p + "/bin/stray").lstrip("/")])
         assert self.run_dir is not None
         self.assertEqual(tar.dst, os.path.join(self.run_dir.path, "backup", "strays",
                                                (p + "/bin/stray").replace("/", "%") + ".tar"))
         self.assertEqual((tar.sudo, rm.sudo, rm.argv), (True, True, [RM, p + "/bin/stray"]))
         self.assertEqual((stray.confirm_each, stray.severity), (True, Severity.MEDIUM))
+        self.assertEqual((stray.title, self.fixes(stray)),
+                         (f"No port installed {p}/bin/stray",
+                          ["Fix: brew-ports doctor --fix (asks, then saves the file in the run folder, then deletes "
+                           "it)"]))
         self.assertTrue(health.needs_terminal_answer(stray))
         self.assertIsNone(health.removes_package(stray))
-        listed = [i for i in strays if not i.remedies]
+        listed = [i for i in strays if not i.confirm_each]
         self.assertEqual(len(listed), 1)
-        self.assertEqual(sorted(listed[0].evidence), sorted([
-            p + "/bin/httpie (interpreter extras)", p + "/bin/oldlink (symlink)",
-            p + "/lib/node_modules/left-pad/index.js (interpreter extras)",
-            p + "/share/doc/readme.txt (outside bin, sbin, lib and include)",
+        self.assertEqual(listed[0].title, f"5 files in {p} were not installed by any port, and brew-ports leaves "
+                                          "them alone")
+        # The first line counts the files by what keeps each; the files follow, for `--verbose`.
+        self.assertEqual(listed[0].evidence[0], "2 belong to packages that pip, gem, cpan or npm installed, 2 lie "
+                                                "outside bin, sbin, lib and include, 1 is a link")
+        self.assertEqual(sorted(listed[0].evidence[1:]), sorted([
+            p + "/bin/httpie (belongs to a package that pip, gem, cpan or npm installed)",
+            p + "/bin/oldlink (is a link)",
+            p + "/lib/node_modules/left-pad/index.js (belongs to a package that pip, gem, cpan or npm installed)",
+            p + "/share/doc/readme.txt (lies outside bin, sbin, lib and include)",
             p + "/Library/Frameworks/Python.framework/Versions/3.12/lib/python3.12/site-packages/x/__init__.py "
-                "(outside bin, sbin, lib and include)"]))
+                "(lies outside bin, sbin, lib and include)"]))
+        self.assertEqual(self.fixes(listed[0]), ["Nothing to do. Uninstalling this MacPorts deletes them with it."])
         self.assertFalse(health.needs_terminal_answer(listed[0]))
 
     def test_unregistered_file_without_run_or_inventory(self):
         strays = self.only(self.detect(self.s.bundle(extras=self.extras), run_dir=False), "ports-unregistered-file")
-        self.assertTrue(strays and all(not i.remedies for i in strays))
+        self.assertTrue(strays and all(not i.confirm_each for i in strays))
+        self.assertEqual(self.fixes(strays[0]),
+                         ["Fix, if you do not need it: sudo " + typed([RM, self.s.prefix + "/bin/stray"])])
         unknown = self.s.instance(inventory_known=False, inventory_error="RegistryDamaged: x")
         found = self.detect(self.s.bundle(unknown, extras=self.extras))
         self.assertEqual(self.only(found, "ports-unregistered-file"), [])
@@ -520,11 +663,12 @@ class StraysTest(HealthTest):
                       cpan=[{"instance_prefix": p, "module": "JSON::XS", "path": arch + "/JSON/XS.pm"},
                             {"instance_prefix": p, "module": "Try::Tiny", "path": perl + "/Try/Tiny.pm"}])
         strays = self.only(self.detect(self.s.bundle(extras=extras)), "ports-unregistered-file")
-        removable = [i.subject for i in strays if i.remedies]
+        removable = [i.subject for i in strays if i.confirm_each]
         self.assertEqual([path for path in kept if path in removable], [])
         self.assertEqual([path for path in others if path not in removable], [])
-        listed = next(i for i in strays if not i.remedies).evidence
-        self.assertEqual([path for path in kept if f"{path} (interpreter extras)" not in listed], [])
+        listed = next(i for i in strays if not i.confirm_each).evidence
+        why = "belongs to a package that pip, gem, cpan or npm installed"
+        self.assertEqual([path for path in kept if f"{path} ({why})" not in listed], [])
 
 
 class LinkageTest(HealthTest):
@@ -547,7 +691,9 @@ class LinkageTest(HealthTest):
                                         {"name": "@rpath/libx.dylib", "class": "unresolved", "resolved": None},
                                         {"name": "/opt/local/lib/libw.dylib", "class": "weak", "resolved": None}])
         issue = self.one(self.detect(bundle), "ports-broken-binaries")
-        self.assertEqual(issue.evidence, [f"{binary}: missing /opt/local/lib/libgone.dylib"])
+        self.assertEqual((issue.title, issue.evidence),
+                         ("Files of curl cannot load a library they need",
+                          [f"{binary} needs /opt/local/lib/libgone.dylib, which is missing"]))
         self.assertEqual(self.argvs(issue), [port_argv(s.prefix, "-n", "upgrade", "--force", "--no-replace",
                                                        "--no-rev-upgrade", "curl")])
         self.assertEqual(issue.remedies[0].retry_argv,
@@ -563,7 +709,7 @@ class LinkageTest(HealthTest):
         refs = [{"name": lib, "class": "own", "resolved": lib}, {"name": good, "class": "own", "resolved": good}]
         linkage = {"binaries": {binary: {"package": f"{s.prefix}|port|curl", "references": refs}}}
         issue = self.one(self.detect(s.bundle(linkage=linkage)), "ports-broken-binaries")
-        self.assertEqual(issue.evidence, [f"{binary}: {lib} lacks arm64"])
+        self.assertEqual(issue.evidence, [f"{binary} loads {lib}, which has no arm64 code"])
 
     def test_broken_binaries_negative(self):
         _, _, bundle = self.build([{"name": "/usr/lib/libSystem.B.dylib", "class": "system", "resolved": "/usr/lib"},
@@ -571,11 +717,11 @@ class LinkageTest(HealthTest):
         self.assertEqual(self.only(self.detect(bundle), "ports-broken-binaries"), [])
 
     def test_macho_archs(self):
-        self.assertEqual(health.macho_archs(macho(self.path("a"), ARM64)), frozenset(["arm64"]))
-        self.assertEqual(health.macho_archs(macho(self.path("b"), ARM64, X86_64, fat=True)),
+        self.assertEqual(macho_header.macho_archs(macho(self.path("a"), ARM64)), frozenset(["arm64"]))
+        self.assertEqual(macho_header.macho_archs(macho(self.path("b"), ARM64, X86_64, fat=True)),
                          frozenset(["arm64", "x86_64"]))
-        self.assertIsNone(health.macho_archs(write(self.path("c"), "#!/bin/sh\n")))
-        self.assertIsNone(health.macho_archs(self.path("missing")))
+        self.assertIsNone(macho_header.macho_archs(write(self.path("c"), "#!/bin/sh\n")))
+        self.assertIsNone(macho_header.macho_archs(self.path("missing")))
 
 
 class PlatformTest(HealthTest):
@@ -585,9 +731,12 @@ class PlatformTest(HealthTest):
         s = self.site([port(1, "curl", "8.9.1", os_major=24), port(2, "fonts", "1.0", os_major="any"),
                        port(3, "zlib", "1.3", state="imaged", os_major=24), port(4, "vim", "9.1", os_major=25)])
         issue = self.one(self.detect(s.bundle()), "ports-built-for-other-os")
-        self.assertEqual(issue.evidence[1:], ["curl @8.9.1_0: darwin 24"])
+        self.assertEqual((issue.title, issue.evidence),
+                         ("1 port was built for another version of macOS",
+                          ["this Mac runs macOS 26 (Darwin 25)", "built for macOS 15 (Darwin 24): curl"]))
         self.assertEqual(self.argvs(issue), [port_argv(s.prefix, "migrate", "--all"), port_argv(s.prefix, "sync")])
         self.assertEqual((issue.confirm_each, issue.blocks), (True, (Blocks.TARGET,)))
+        self.assertEqual(self.fixes(issue)[-1], "A move out of this MacPorts does not need this repair.")
 
     def test_other_os_negative(self):
         s = self.site([port(1, "curl", "8.9.1", os_major=24)])
@@ -599,7 +748,10 @@ class PlatformTest(HealthTest):
     def test_other_os_without_migrate_is_manual(self):
         s = self.site([port(1, "curl", "8.9.1", os_major=24)], version="2.9.3")
         issue = self.one(self.detect(s.bundle()), "ports-built-for-other-os")
-        self.assertEqual(([a.manual for a in issue.remedies], issue.confirm_each), ([True], False))
+        self.assertEqual((all(a.manual for a in issue.remedies), issue.confirm_each), (True, False))
+        port_bin = os.path.join(s.prefix, "bin", "port")
+        self.assertEqual(self.fixes(issue)[0], f"Fix: MacPorts 2.9.3 is too old for `port migrate`. Run `sudo "
+                                               f"{port_bin} selfupdate`, then `sudo {port_bin} -N migrate --all`.")
 
 
 class ConfigTest(HealthTest):
@@ -610,13 +762,23 @@ class ConfigTest(HealthTest):
         tree = self.path("ports")
         write_sources_conf(s.prefix, f"file://{tree} [default]\n")
         issue = self.one(self.detect(s.bundle()), "ports-stale-portindex")
-        self.assertEqual(issue.evidence, [f"{tree}/PortIndex does not exist"])
-        self.assertTrue(issue.remedies[0].manual)
+        self.assertEqual((issue.title, issue.evidence),
+                         ("MacPorts' package list is missing", [f"there is no {tree}/PortIndex"]))
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: sudo {s.prefix}/bin/port -N sync",
+            "`brew-ports plan --target ports --refresh` runs it too, for the MacPorts that packages move into."])
+        self.assertFalse(issue.confirm_each)
+        # Without a source of ports there is nothing for `port sync` to download.
+        bare = self.one(self.detect(self.site().bundle()), "ports-stale-portindex")
+        self.assertEqual((bare.evidence, self.fixes(bare)), (
+            ["MacPorts' sources.conf names no source of ports"],
+            ["brew-ports offers no fix: MacPorts' sources.conf has to name a source of ports before `port sync` can "
+             "download the list."]))
         index = write(os.path.join(tree, "PortIndex"))
         old = time.time() - 40 * 86400
         os.utime(index, (old, old))
-        self.assertEqual(self.one(self.detect(s.bundle()), "ports-stale-portindex").evidence,
-                         [f"{index} is 40 days old"])
+        stale = self.one(self.detect(s.bundle()), "ports-stale-portindex")
+        self.assertEqual((stale.title, stale.evidence), ("MacPorts' package list is 40 days old", []))
         self.assertEqual(self.only(self.detect(s.bundle(), now=old + 86400), "ports-stale-portindex"), [])
 
     def test_macports_user_dscl_fields(self):
@@ -628,12 +790,25 @@ class ConfigTest(HealthTest):
                          [])
         odd = good.replace("UniqueID: 502", "UniqueID: 499").replace("/usr/bin/false", "/bin/sh")
         issue = self.one(self.detect(s.bundle(), {key: FakeResponse(stdout=odd)}), "ports-macports-user")
-        self.assertEqual(issue.evidence, ["UniqueID is 499, not a number above 500",
-                                          "UserShell is /bin/sh, not /usr/bin/false"])
-        missing = self.one(self.detect(s.bundle(), {key: FakeResponse(
-            exit=56, stderr="<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n")}), "ports-macports-user")
-        self.assertIn("does not exist", missing.evidence[0])
-        self.assertTrue(missing.remedies[0].manual)
+        self.assertEqual(issue.title, "The system account `macports`, under which MacPorts builds ports, is not as "
+                                      "MacPorts made it")
+        self.assertEqual(issue.evidence, ["its shell is /bin/sh; MacPorts gives it /usr/bin/false",
+                                          "its user id is 499; MacPorts gives it one above 500"])
+        # The installer makes a missing account; a field of one that exists is set with dscl.
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: sudo {system.DSCL} . -create /Users/macports UserShell /usr/bin/false",
+            "brew-ports offers no fix that changes the user id."])
+        self.assertFalse(issue.confirm_each)
+        gone = {key: FakeResponse(exit=56, stderr="<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n")}
+        missing = self.one(self.detect(s.bundle(), gone), "ports-macports-user")
+        self.assertEqual((missing.title, missing.evidence),
+                         ("The system account `macports`, under which MacPorts builds ports, is missing", []))
+        self.assertEqual(self.fixes(missing), ["Fix: run the MacPorts installer again "
+                                               "(https://www.macports.org/install.php), which makes the account. "
+                                               "Your ports stay."])
+        elsewhere = self.one(self.detect(s.bundle(), gone, default_prefix=self.path("other")), "ports-macports-user")
+        self.assertEqual(self.fixes(elsewhere), ["brew-ports offers no fix: MacPorts' installer makes that account, "
+                                                 "but it installs to /opt/local only."])
         self.assertEqual(system.parse_dscl("RecordName:\n macports\n mp\nUniqueID: 502\n"),
                          {"RecordName": "macports mp", "UniqueID": "502"})
 
@@ -645,8 +820,19 @@ class ConfigTest(HealthTest):
         key = (health.DU, "-sk", build, distfiles)
         issue = self.one(self.detect(s.bundle(), {key: FakeResponse(stdout=f"1024\t{build}\n2048\t{distfiles}\n")}),
                          "ports-disk-usage")
-        self.assertEqual(issue.evidence, [f"{build}: 1.0 MiB", f"{distfiles}: 2.0 MiB"])
-        self.assertTrue(issue.remedies[0].manual)
+        # The title names what was measured: the installed files of the ports are not part of it.
+        self.assertEqual((issue.title, issue.evidence),
+                         ("MacPorts' stored copies of ports, build leftovers and downloads take 3.0 MiB of disk space",
+                          ["1.0 MiB for build leftovers", "2.0 MiB for downloaded sources"]))
+        self.assertEqual(self.fixes(issue), ["Nothing to do. To free space and keep MacPorts, run `sudo "
+                                             f"{s.prefix}/bin/port reclaim`; it asks before each removal."])
+        empty = self.one(self.detect(s.bundle(), {key: FakeResponse(stdout=f"0\t{build}\n2048\t{distfiles}\n")}),
+                         "ports-disk-usage")
+        self.assertEqual(empty.evidence, ["2.0 MiB for downloaded sources"])
+        # A `du` that gives no size is a check that could not run, not a finding of nothing.
+        bundle = s.bundle()
+        self.assertEqual(self.only(self.detect(bundle, {key: FakeResponse(exit=1)}), "ports-disk-usage"), [])
+        self.assertEqual(bundle.notes, [f"How much disk space MacPorts at {s.prefix} uses: `du` gave no sizes"])
         self.assertEqual(self.only(self.detect(self.site().bundle()), "ports-disk-usage"), [])
 
     def test_settings_against_archive_defaults(self):
@@ -654,10 +840,17 @@ class ConfigTest(HealthTest):
                             "applications_dir": "/Applications/MacPorts-Test", "buildfromsource": "always",
                             "delete_la_files": "no"})
         issue = self.one(self.detect(s.bundle()), "ports-no-binary-archives")
-        self.assertEqual(issue.evidence[:3], ["applications_dir /Applications/MacPorts-Test (binary archives are "
-                                              "built for /Applications/MacPorts)",
-                                              "delete_la_files no (binary archives use yes)", "buildfromsource always"])
-        self.assertEqual(issue.remedies, [])
+        self.assertEqual(issue.title, "MacPorts builds every port on this Mac, because its settings rule out "
+                                      "prebuilt packages")
+        self.assertEqual(issue.evidence, ["its setting applications_dir is /Applications/MacPorts-Test; prebuilt "
+                                          "packages are made for /Applications/MacPorts",
+                                          "its setting delete_la_files is no; prebuilt packages use yes",
+                                          "its setting buildfromsource is always"])
+        moved = self.one(self.detect(self.site(conf={"prefix": "/opt/mp"}).bundle()), "ports-no-binary-archives")
+        self.assertEqual(moved.evidence[0], "MacPorts is installed in /opt/mp; prebuilt packages are made for "
+                                            "/opt/local")
+        self.assertEqual(self.fixes(issue), ["Nothing to do. Installing into this MacPorts takes longer, because it "
+                                             "builds each port."])
         plain = self.site(conf={"prefix": "/opt/local", "frameworks_dir": "/opt/local/Library/Frameworks"})
         self.assertEqual(self.only(self.detect(plain.bundle()), "ports-no-binary-archives"), [])
 
@@ -668,8 +861,12 @@ class ConfigTest(HealthTest):
         self.assertEqual(self.only(self.detect(s.bundle(environment=with_bin)), "ports-not-on-path"), [])
         without = {"live": {"PATH": [{"text": "/usr/bin", "path": "/usr/bin"}]}}
         issue = self.one(self.detect(s.bundle(environment=without)), "ports-not-on-path")
-        self.assertEqual((issue.subject, issue.title), (bin_dir, f"PATH lacks {bin_dir}"))
-        self.assertTrue(issue.remedies[0].manual)
+        self.assertEqual((issue.subject, issue.title, issue.evidence),
+                         (bin_dir, f"{bin_dir} is not on your PATH, so `port` is not found by name", []))
+        # The fix by hand holds for every MacPorts; `doctor` names env-cleanup for the one that command keeps.
+        self.assertEqual(self.fixes(issue), [
+            f"Fix, if this is the MacPorts you keep: add {bin_dir} to the PATH in your shell's login file.",
+            "If you have only just installed MacPorts, a new Terminal window has it already."])
         self.assertEqual(self.only(self.detect(s.bundle(environment={})), "ports-not-on-path"), [])
 
     def test_usr_local_cellar(self):
@@ -677,6 +874,9 @@ class ConfigTest(HealthTest):
         os.makedirs(cellar)
         issue = self.one(self.detect(self.site().bundle(), cellar=cellar), "ports-usr-local-cellar")
         self.assertEqual((issue.subject, issue.instance_prefix, issue.severity), (cellar, None, Severity.INFO))
+        self.assertEqual((issue.title, self.fixes(issue)),
+                         (f"{cellar} exists, and a port that MacPorts builds can pick up Homebrew's files from "
+                          f"{os.path.dirname(cellar)}", ["Nothing to do while you keep that Homebrew."]))
         self.assertEqual(self.only(self.detect(self.site().bundle()), "ports-usr-local-cellar"), [])
 
 
@@ -705,6 +905,10 @@ class StartupItemsTest(HealthTest):
                          [([env_services.LAUNCHCTL, "bootout", "gui/501/org.macports.bar"], False),
                           ([RM, agent], True)])
         self.assertEqual((dangling_link.confirm_each, dangling_link.severity), (True, Severity.LOW))
+        self.assertEqual((dangling_link.title, dangling_link.evidence),
+                         ("The service org.macports.foo is left over from a port whose program is gone",
+                          [f"its file, {link}, is a link to a file that is gone"]))
+        self.assertEqual(gone_program.evidence, [f"its file, {agent}, runs {s.path('bin', 'gone')}, which is gone"])
         self.assertEqual(self.only(self.detect(s.bundle(services=services[2:])), "ports-dangling-plist"), [])
 
     def test_selected_option_not_installed(self):
@@ -723,10 +927,12 @@ class StartupItemsTest(HealthTest):
         sql(s.portdb, "INSERT INTO files (id, path, actual_path, active, binary) VALUES (1, ?, NULL, 1, 0)",
             os.path.join(gcc, "mp-gcc14"))
         issue = self.one(self.detect(s.bundle()), "ports-missing-selection")
-        self.assertEqual(issue.subject, "python3")
-        self.assertIn("python311, whose option file is gone", issue.evidence[0])
+        self.assertEqual((issue.subject, issue.title, issue.evidence),
+                         ("python3", "`port select` points python3 at python311, which no port in use provides",
+                          ["the file of that choice is gone"]))
         self.assertEqual(self.argvs(issue), [port_argv(p, "select", "--set", "python3", "none")])
         self.assertEqual((issue.remedies[0].manual, issue.confirm_each), (True, False))
+        self.assertEqual(self.fixes(issue), [f"Fix: sudo {p}/bin/port -N select --set python3 none"])
 
 
 class InterfaceTest(unittest.TestCase):

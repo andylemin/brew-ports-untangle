@@ -1521,6 +1521,24 @@ def _target_prefix(bundle, plan: Plan | None, wanted: str, host_arch: str,
     return inst.prefix if inst is not None else None
 
 
+def kept_prefix(state_dir: state.StateDir, bundle, wanted: str, host_arch: str,
+                environ: Mapping[str, str]) -> str | None:
+    """Return the installation whose PATH line `env-cleanup --target <wanted>` keeps
+
+    @param state_dir  the state directory, whose latest completed run names the target of its plan
+    @param bundle     the fresh scan
+    @param wanted     the manager asked for: brew or ports
+    @param host_arch  the host's architecture
+    @param environ    the environment the tool runs with
+    @returns          that installation's prefix; None when the command finds none, or cannot read that plan
+    """
+    try:
+        latest = latest_completed(state_dir)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    return _target_prefix(bundle, latest[1] if latest else None, wanted, host_arch, environ)
+
+
 def cmd_env_cleanup(ctx: Context, make_runner: Callable[[Context, state.RunDir], BaseRunner] | None = None) -> int:
     """Run `brew-ports env-cleanup [--target brew|ports] [--apply] [--yes] [--dry-run]`
 

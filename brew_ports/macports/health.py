@@ -7,16 +7,13 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import glob
 import hashlib
 import os
 import re
-import shlex
 import sqlite3
 import stat
-import struct
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,10 +21,11 @@ from .. import progress, snapshot, system
 from ..env import linkage as env_linkage, services as env_services
 from ..homebrew import locate as brew_locate
 from ..model import Action, Blocks, Instance, Issue, OnFailure, Package, Service, Severity, Usability
-from ..report import limited
+from ..report import MOVE_OUT, NAMES_SHOWN, at, counted, limited, offered, some, tilde, typed
 from ..runner import RM, ActionFailed
 from ..state import RunDir, slug
-from . import actions, bootstrap, inventory as mp_inventory, locate, portindex as mp_portindex, registry
+from . import (actions, bootstrap, inventory as mp_inventory, locate, macho, portindex as mp_portindex, registry,
+               strays)
 
 TAR = system.TAR
 DU = system.DU
@@ -53,40 +51,22 @@ SEVERITY = {
     "ports-cannot-run": Severity.HIGH, "ports-no-registry": Severity.HIGH,
 }
 
-TITLES = {
-    "ports-diagnose-warning": "port diagnose warning",
-    "ports-platform-mismatch": "Base compiled for another Darwin major or for Rosetta",
-    "ports-damaged-registry": "Registry damaged or unreadable",
-    "ports-missing-file": "Active file missing on disk",
-    "ports-missing-image": "Image archive or directory missing",
-    "ports-inactive-versions": "Inactive versions beside an active one",
-    "ports-unrequested-leaf": "Unrequested leaf",
-    "ports-obsolete-port": "Obsolete port",
-    "ports-built-for-other-os": "Ports built for another Darwin major while base matches",
-    "ports-broken-binaries": "Broken binaries",
-    "ports-unregistered-file": "Unregistered file in the prefix",
-    "ports-stale-portindex": "PortIndex missing or older than 30 days",
-    "ports-macports-user": "macports user or group missing or odd",
-    "ports-registry-busy": "Another port process holds the registry",
-    "ports-disk-usage": "Build, distfile and image directories size",
-    "ports-dangling-plist": "Dangling owned MacPorts launchd plist",
-    "ports-missing-selection": "Selected port select option not installed",
-    "ports-no-binary-archives": "Configuration that disables binary archives",
-    "ports-not-on-path": "PATH lacks the prefix's bin",
-    "ports-usr-local-cellar": "/usr/local/Cellar present",
-    "ports-registry-schema-update": "Registry awaiting its root-only schema update",
-    "ports-replaced-port": "Installed port replaced by another",
-    "ports-cannot-run": "port missing or unable to run while the registry holds ports",
-    "ports-no-registry": "MacPorts prefix without a registry",
-}
+MIGRATE_TAKES_LONG = ("`port migrate` builds MacPorts itself again for this Mac, switches every port off, builds again "
+                      "the ports made for another macOS or processor, and switches the others back on. That can "
+                      "take a long time.")
 
-# Unregistered files: the directories walked, the ones whose regular files may be removed, and
-# the generated files every prefix accumulates.
+# Unregistered files: the directories walked, and the ones whose regular files may be removed.
 STRAY_TOPS = ("bin", "sbin", "lib", "include", "libexec", "Library/Frameworks",
               "share/man", "share/info", "share/doc", "share/aclocal", "share/pkgconfig")
 REMOVABLE_TOPS = ("bin", "sbin", "lib", "include")
-GENERATED_NAMES = frozenset(("gschemas.compiled", "mimeinfo.cache", "fonts.dir", "fonts.scale", "whatis"))
-GENERATED_SUFFIXES = (".pyc", ".cache")
+LEFT_ALONE = {      # why an unregistered file is not offered for removal -> what one such file is, what several are
+    "link": ("is a link", "are links"),
+    "special": ("is no ordinary file", "are no ordinary files"),
+    "outside": ("lies outside bin, sbin, lib and include", "lie outside bin, sbin, lib and include"),
+    "select": ("is where `port select` puts a link", "are where `port select` puts links"),
+    "extras": ("belongs to a package that pip, gem, cpan or npm installed",
+               "belong to packages that pip, gem, cpan or npm installed"),
+}
 
 # The settings packages.macports.org builds its archives with.
 ARCHIVE_DEFAULTS = (("prefix", "/opt/local"), ("applications_dir", "/Applications/MacPorts"),
@@ -114,6 +94,14 @@ class _Site:
         @returns  the prefix as located
         """
         return self.instance.prefix
+
+    @property
+    def at(self) -> str:
+        """Return the installation as the report names it
+
+        @returns  such as `MacPorts at /opt/local`
+        """
+        return at(self.instance)
 
     @property
     def drivable(self) -> bool:
@@ -159,25 +147,25 @@ def _qualified(code: str, prefix: str | None, remedies: Sequence[Action]) -> lis
 
 
 def _issue(code: str, subject: str | None, prefix: str | None, evidence: Sequence[str],
-           remedies: Sequence[Action] = (), *, confirm_each: bool = False, repairs_install: bool = False,
-           blocks: Sequence[Blocks] = (), title: str | None = None) -> Issue:
+           remedies: Sequence[Action] = (), *, title: str, confirm_each: bool = False,
+           repairs_install: bool = False, blocks: Sequence[Blocks] = ()) -> Issue:
     """Build a `ports-` finding at its `SEVERITY`
 
     A flag holds only when the issue has a remedy the tool runs: a manual one is printed, never applied.
 
-    @param code             the finding's code, which gives its severity and its default title
+    @param code             the finding's code, which gives its severity
     @param subject          the port, path, label or group the finding is about, or None
     @param prefix           the instance's prefix, or None
     @param evidence         the evidence lines
     @param remedies         the remedies, in the order they are applied
+    @param title            a sentence that names what the finding is about
     @param confirm_each     `doctor --fix` applies the remedies after a per-item prompt
     @param repairs_install  apply phase 2 applies them when the subject is a plan target or its dependency
     @param blocks           the plan contexts the finding blocks
-    @param title            the title; None for the code's
     @returns                the finding
     """
     runs = any(not a.manual for a in remedies)
-    return Issue(code=code, severity=SEVERITY[code], title=title or TITLES[code], subject=subject,
+    return Issue(code=code, severity=SEVERITY[code], title=title, subject=subject,
                  instance_prefix=prefix, evidence=list(evidence), remedies=_qualified(code, prefix, remedies),
                  auto_fix=False,
                  confirm_each=confirm_each and runs, repairs_install=repairs_install and runs,
@@ -197,30 +185,35 @@ def _note(code: str, subject: str, step: str, text: str) -> Action:
                   manual=True)
 
 
-def _built(build: Callable[[], list[Action]]) -> tuple[list[Action], list[str]]:
-    """Return the remedies of `build`, or none and the reason when it refuses a name or variant
+def _built(code: str, subject: str, build: Callable[[], list[Action]]) -> list[Action]:
+    """Return the remedies of `build`, or a note of why there are none when it refuses a name or variant
 
-    @param build  builds the remedies; ValueError for a registry name or variant `actions.py` refuses
-    @returns      the remedies and no reason, or no remedies and the reason
+    @param code     the finding's code
+    @param subject  the port, path, label or group the remedies act on
+    @param build    builds the remedies; ValueError for a registry name or variant `actions.py` refuses
+    @returns        the remedies, or the note
     """
     try:
-        return build(), []
+        return build()
     except ValueError as exc:
-        return [], [f"no remedy: {exc}"]
+        return [_note(code, subject, "refused", "brew-ports offers no fix: MacPorts' record holds a name or variant "
+                      f"that brew-ports does not pass to `port` ({exc}).")]
 
 
-def _port_remedies(site: _Site, build: Callable[[], list[Action]]) -> tuple[list[Action], list[str]]:
+def _port_remedies(site: _Site, code: str, subject: str, build: Callable[[], list[Action]]) -> list[Action]:
     """Return the remedies of `build` for a drivable instance only
 
     On an undrivable one, `port` runs only for the manager repairs and the creation of a missing registry.
 
-    @param site   the instance's site
-    @param build  builds the remedies
-    @returns      the remedies and the reasons there are none, as `_built` gives them
+    @param site     the instance's site
+    @param code     the finding's code
+    @param subject  the port, path, label or group the remedies act on
+    @param build    builds the remedies
+    @returns        the remedies, or a note of why there are none
     """
     if not site.drivable:
-        return [], [f"no remedy while MacPorts at {site.prefix} is {site.instance.usability.value}"]
-    return _built(build)
+        return [_note(code, subject, "no-port", f"No fix until the `port` command of {site.at} runs.")]
+    return _built(code, subject, build)
 
 
 def _digest(text: str) -> str:
@@ -284,30 +277,65 @@ def _loaded_items(services: Sequence[Service], prefix: str) -> set[str]:
             and svc.loaded}
 
 
-def _procedure_note(code: str, inst: Instance) -> Action:
-    """Build the note offering the signed base package over the instance
+def _port(inst: Instance, *args: str) -> str:
+    """Return a `port` command of an installation as the user would type it, under sudo
+
+    @param inst  the MacPorts instance
+    @param args  the arguments after `port`
+    @returns     the command, by the bare name `port` only where typing that name runs this installation's
+    """
+    return typed([inst.binary or os.path.join(inst.prefix, "bin", "port"), *args], True)
+
+
+def _procedure_notes(code: str, inst: Instance, then: str = "") -> list[Action]:
+    """Build the notes that offer the signed MacPorts installer over the instance
 
     @param code  the finding's code
     @param inst  the MacPorts instance at `/opt/local`
-    @returns     the note
+    @param then  what `doctor --fix` does after the installer, such as `, then runs ...`; with it, the ports are
+                 built again
+    @returns     what `doctor --fix` does, and what that takes
     """
-    return _note(code, inst.prefix, "base-package",
-                 f"install the signed MacPorts base package over {inst.prefix}: the latest macports-base release for "
-                 "this macOS, downloaded, staged, signature-checked against the pinned signer and installed with sudo "
-                 "installer (uses the network; the registry stays)")
+    ports = ("The installer keeps your ports; `port migrate` then builds them again." if then
+             else "Your installed ports stay.")
+    return [_note(code, inst.prefix, "base-package",
+                  offered(f"installs MacPorts over {inst.prefix} again from its official signed installer{then}")),
+            _note(code, inst.prefix, "base-package-needs",
+                  "It downloads the installer from MacPorts' releases, checks its signature and runs it with your "
+                  f"password (sudo). The installer adds MacPorts to the PATH in your shell's login files. {ports}")]
 
 
-def _source_build_note(code: str, inst: Instance, then: str = "") -> Action:
+def _release_of(inst: Instance) -> str:
+    """Return an instance's version as the words that follow `MacPorts` in a sentence
+
+    @param inst  the MacPorts instance
+    @returns     such as ` 2.9.3`; empty for an instance whose version is not known
+    """
+    return f" {inst.version}" if inst.version else ""
+
+
+def _too_old(inst: Instance) -> str:
+    """Return what to do about a MacPorts that has no `port migrate`
+
+    @param inst  the MacPorts instance
+    @returns     the fix line, with the two commands for the user
+    """
+    return (f"Fix: MacPorts{_release_of(inst)} is too old for `port migrate`. Run `{_port(inst, 'selfupdate')}`, "
+            f"then `{_port(inst, '-N', 'migrate', '--all')}`.")
+
+
+def _source_build_note(code: str, inst: Instance, migrate: bool = False) -> Action:
     """Build the note telling the user to build base from source, the only way for a prefix other than `/opt/local`
 
-    @param code  the finding's code
-    @param inst  the MacPorts instance
-    @param then  the text after the `./configure` command, such as a migrate step
-    @returns     the note
+    @param code     the finding's code
+    @param inst     the MacPorts instance
+    @param migrate  whether `port migrate` is to follow, which only a current MacPorts has
+    @returns        the note
     """
+    then = f", then run `{_port(inst, '-N', 'migrate', '--all')}`" if migrate else ""
     return _note(code, inst.prefix, "source-build",
-                 f"the MacPorts installer package installs to /opt/local only: build base {inst.version or ''} from "
-                 f"source with ./configure --prefix={inst.prefix}{then}")
+                 "Fix: MacPorts' installer installs to /opt/local only, so build the current MacPorts from source "
+                 f"with `./configure --prefix={inst.prefix}`{then}.")
 
 
 # Diagnose warnings -------------------------------------------------------------------
@@ -339,24 +367,26 @@ def parse_diagnose(text: str) -> list[str]:
     return [" ".join(parts) for parts in entries]
 
 
-def _diagnose_issue(site: _Site, subject: str, text: str, evidence: Sequence[str]) -> Issue:
-    """Build a `ports-diagnose-warning` finding whose remedy is the warning's text, as a note
+def _diagnose_issue(site: _Site, subject: str, text: str, evidence: Sequence[str], *, title: str, fix: str) -> Issue:
+    """Build a `ports-diagnose-warning` finding
 
     @param site      the instance's site
     @param subject   the port the warning names, or the prefix
-    @param text      the warning
+    @param text      the warning, which tells the ids of two findings about one subject apart
     @param evidence  the evidence lines
+    @param title     the finding's title
+    @param fix       what to do about it
     @returns         the finding
     """
     return _issue("ports-diagnose-warning", subject, site.prefix, evidence,
-                  [_note("ports-diagnose-warning", subject, "warning-" + _digest(text), text)])
+                  [_note("ports-diagnose-warning", subject, "warning-" + _digest(text), fix)], title=title)
 
 
 def _diagnose_warnings(site: _Site, runner, notes: list[str]) -> list[Issue]:
-    """Report each warning of `port -N diagnose --quiet` (drivable instances only), its text as the remedy
+    """Report each warning of `port -N diagnose --quiet` (drivable instances only)
 
-    Base warns once per missing file; those warnings fold into one issue per port, and the missing-file
-    finding has the detail.
+    Base warns once per missing file; those warnings fold into one issue per port, which `detect` drops
+    when the missing-file finding of that port has the detail and the fix.
 
     @param site    the instance's site
     @param runner  the runner that runs `port diagnose`
@@ -364,11 +394,11 @@ def _diagnose_warnings(site: _Site, runner, notes: list[str]) -> list[Issue]:
     @returns       one finding per warning, or per port for the missing-file warnings
     """
     if not site.drivable:
-        notes.append(f"{site.prefix}: port diagnose skipped: MacPorts there is {site.instance.usability.value}")
+        notes.append(f"What `port diagnose` reports about {site.at}: its `port` command cannot run")
         return []
     result = runner.run(actions.diagnose(site.instance, site.host_arch, f"0.ports.{slug(site.prefix)}.diagnose"))
     if result.timed_out:
-        notes.append(f"{site.prefix}: port diagnose timed out; its warnings may be incomplete")
+        notes.append(f"`port diagnose` of {site.at} ran out of time, so some of its warnings may be missing")
     warnings: list[str] = []
     for text in parse_diagnose(result.stderr()) + parse_diagnose(result.stdout()):
         if text not in warnings:
@@ -388,12 +418,16 @@ def _diagnose_warnings(site: _Site, runner, notes: list[str]) -> list[Issue]:
     out = []
     for kind, value in order:
         if kind == "text":
-            out.append(_diagnose_issue(site, site.prefix, value, ["port diagnose: " + value]))
+            out.append(_diagnose_issue(site, site.prefix, value, [value],
+                                       title="MacPorts' own check, `port diagnose`, reports a problem",
+                                       fix="brew-ports offers no fix: what to do about it, if anything, is in "
+                                           "MacPorts' message."))
             continue
         items = folded[value]
-        text = items[0][1] if len(items) == 1 else f"{items[0][1]} (and {len(items) - 1} more files of {value})"
-        missing = [f"port diagnose: missing {f}" for f, _ in items]
-        out.append(_diagnose_issue(site, value, text, limited(missing, EVIDENCE_LIMIT)))
+        out.append(_diagnose_issue(site, value, items[0][1], limited([f for f, _ in items], EVIDENCE_LIMIT),
+                                   title=f"`port diagnose` cannot find {counted(len(items), 'file')} of {value}",
+                                   fix=f"Fix: `{_port(site.instance, '-f', 'deactivate', value)}`, then "
+                                       f"`{_port(site.instance, '-f', 'activate', value)}`, as MacPorts advises."))
     return out
 
 
@@ -405,10 +439,11 @@ def _migrate_remedies(site: _Site, code: str, inst: Instance) -> list[Action]:
     @param site  the instance's site
     @param code  the finding's code
     @param inst  the MacPorts instance
-    @returns     the two remedies
+    @returns     the two remedies, and the note on how long the first one takes
     """
     return [actions.migrate_all(inst, site.host_arch, action_id(code, site.prefix, "migrate")),
-            actions.sync(inst, site.host_arch, action_id(code, site.prefix, "sync"))]
+            actions.sync(inst, site.host_arch, action_id(code, site.prefix, "sync")),
+            _note(code, site.prefix, "long", MIGRATE_TAKES_LONG)]
 
 
 def _platform_mismatch(site: _Site) -> list[Issue]:
@@ -422,24 +457,36 @@ def _platform_mismatch(site: _Site) -> list[Issue]:
     """
     code, inst = "ports-platform-mismatch", site.instance
     built = site.inv.autoconf.get("os_major") or ""
-    if inst.usability is Usability.PLATFORM_MISMATCH:
-        reason = inst.usability_detail or "base does not match this host"
-    elif built.isdigit() and int(built) != site.running[1]:
-        reason = f"base is built for Darwin {built}; this host runs Darwin {site.running[1]}"
-    else:
+    other_os = built.isdigit() and int(built) != site.running[1]
+    if inst.usability is not Usability.PLATFORM_MISMATCH and not other_os:
         return []
+    mismatch = inst.usability is Usability.PLATFORM_MISMATCH
+    evidence = [inst.usability_detail] if mismatch and inst.usability_detail else []
+    if other_os:
+        title = "MacPorts itself was built for another version of macOS"
+        evidence = evidence or [f"MacPorts was built for {system.macos_name(int(built))}; this Mac runs "
+                                f"{system.macos_name(site.running[1])}"]
+    elif site.host_arch == "arm64" and inst.arch == "x86_64":
+        title = "MacPorts itself is an Intel build, and this Mac is Apple Silicon"
+        evidence = [line for line in evidence if line != locate.INTEL_ON_ARM]
+    else:
+        title = "MacPorts itself does not match this Mac"
     if "migrate" in inst.features and inst.binary:
-        remedies, extra = _built(lambda: _migrate_remedies(site, code, inst))
+        remedies = _built(code, site.prefix, lambda: _migrate_remedies(site, code, inst))
     elif _at_default(inst, site.default_prefix):
         shown = _display_instance(inst, site.host_arch)
-        remedies, extra = _built(lambda: [_procedure_note(code, inst),
-                                          actions.sync(shown, site.host_arch, action_id(code, site.prefix, "sync")),
-                                          actions.migrate_all(shown, site.host_arch,
-                                                              action_id(code, site.prefix, "migrate"))])
+
+        def reinstall() -> list[Action]:
+            migrate = actions.migrate_all(shown, site.host_arch, action_id(code, site.prefix, "migrate"))
+            return (_procedure_notes(code, inst, f", then runs `{typed(migrate.argv, migrate.sudo)}`")
+                    + [actions.sync(shown, site.host_arch, action_id(code, site.prefix, "sync")), migrate,
+                       _note(code, site.prefix, "long", MIGRATE_TAKES_LONG)])
+        remedies = _built(code, site.prefix, reinstall)
     else:
-        remedies, extra = [_source_build_note(code, inst, ", then run sudo port -N migrate --all")], []
-    return [_issue(code, site.prefix, site.prefix, [reason] + extra, remedies, confirm_each=True,
-                   blocks=(Blocks.TARGET,))]
+        remedies = [_source_build_note(code, inst, migrate=True)]
+    remedies.append(_note(code, site.prefix, "leaving", MOVE_OUT % site.prefix))
+    return [_issue(code, site.prefix, site.prefix, evidence, remedies, confirm_each=True, blocks=(Blocks.TARGET,),
+                   title=title)]
 
 
 def _damaged_registry(site: _Site) -> list[Issue]:
@@ -450,16 +497,45 @@ def _damaged_registry(site: _Site) -> list[Issue]:
     @param site  the instance's site
     @returns     the finding, or none
     """
-    inst = site.instance
+    code, inst = "ports-damaged-registry", site.instance
     if inst.inventory_known or locate.registry_busy(inst):
         return []
-    evidence = [inst.inventory_error or "the registry cannot be read"]
+    evidence = [_plain(inst.inventory_error)] if inst.inventory_error else []
     archives = site.inv.image_archives
-    evidence += [f"image archive: {name}: {', '.join(entries)}" for name, entries in sorted(archives.items())]
-    if not archives:
-        evidence.append(f"no image archive under {os.path.join(inst.portdbpath or '', 'software')}")
-    return [_issue("ports-damaged-registry", site.prefix, site.prefix, evidence,
-                   blocks=(Blocks.TARGET, Blocks.REMOVE))]
+    software = os.path.join(inst.portdbpath or "", "software")
+    evidence.append(f"{counted(len(archives), 'port')} left files in {software}: {some(sorted(archives))}"
+                    if archives else f"no port left files in {software}")
+    record = registry.registry_path(inst.portdbpath or "")
+    note = _note(code, site.prefix, "restore", "brew-ports offers no fix: without that record it can tell neither "
+                 f"which ports are installed nor how to uninstall them. Restore {record} from a backup, or install "
+                 "what you need with Homebrew yourself.")
+    return [_issue(code, site.prefix, site.prefix, evidence, [note], blocks=(Blocks.TARGET, Blocks.REMOVE),
+                   title="MacPorts' record of installed ports cannot be read")]
+
+
+_WAITED = re.compile(r"^no progress for (\d+) s\b")
+_PYTHON_ERROR = re.compile(r"^\w+Error: (?:\[Errno \d+\] )?")
+
+
+def _plain(error: str | None) -> str:
+    """Return an inventory error in the reader's words
+
+    @param error  the instance's `inventory_error`, or None
+    @returns      what happened to MacPorts' record, without the name of the check's outcome or of a Python error
+    """
+    head, sep, rest = (error or "").partition(": ")
+    labels = registry.STATUS_LABELS
+    if not sep or head not in labels.values():
+        return error or ""
+    if head == labels["missing"]:
+        return f"{rest.partition('; ')[0]} is missing, but files of ports are still installed"
+    if head == labels["busy"]:
+        waited = _WAITED.match(rest)
+        return (f"brew-ports waited {waited.group(1)} seconds for it to let go of the record" if waited
+                else "the record kept changing while brew-ports read it")
+    if head == labels["unreadable"]:
+        return "the record cannot be read: " + _PYTHON_ERROR.sub("", rest)
+    return f"the record's file is damaged: {rest}"
 
 
 def _registry_busy(site: _Site) -> list[Issue]:
@@ -471,10 +547,11 @@ def _registry_busy(site: _Site) -> list[Issue]:
     if not locate.registry_busy(site.instance):
         return []
     code = "ports-registry-busy"
-    return [_issue(code, site.prefix, site.prefix, [site.instance.inventory_error or ""],
-                   [_note(code, site.prefix, "wait", "wait for the other port process to finish, then run "
-                                                     "brew-ports again")],
-                   blocks=(Blocks.ANY,))]
+    return [_issue(code, site.prefix, site.prefix, [_plain(site.instance.inventory_error)],
+                   [_note(code, site.prefix, "wait", "Fix: wait until that command ends, then run `brew-ports "
+                                                     "doctor` again.")],
+                   blocks=(Blocks.ANY,), title="Another `port` command is running, so MacPorts' record of installed "
+                                               "ports cannot be read")]
 
 
 def _registry_schema_update(site: _Site) -> list[Issue]:
@@ -486,10 +563,12 @@ def _registry_schema_update(site: _Site) -> list[Issue]:
     code, inst = "ports-registry-schema-update", site.instance
     if inst.usability is not Usability.READONLY_REGISTRY:
         return []
-    remedies, extra = _built(lambda: [actions.version(inst, site.host_arch, action_id(code, site.prefix, "version"),
-                                                      sudo=True)])
-    return [_issue(code, site.prefix, site.prefix, [inst.usability_detail or "the registry is read-only"] + extra,
-                   remedies, confirm_each=True, blocks=(Blocks.TARGET,))]
+    remedies = _built(code, site.prefix, lambda: [
+        actions.version(inst, site.host_arch, action_id(code, site.prefix, "version"), sudo=True)])
+    return [_issue(code, site.prefix, site.prefix, [inst.usability_detail] if inst.usability_detail else [],
+                   remedies, confirm_each=True, blocks=(Blocks.TARGET,),
+                   title="MacPorts was updated and needs one run as root to bring its record of installed ports "
+                         "up to date")]
 
 
 def _cannot_run(site: _Site) -> list[Issue]:
@@ -504,16 +583,17 @@ def _cannot_run(site: _Site) -> list[Issue]:
     code, inst = "ports-cannot-run", site.instance
     if inst.usability not in (Usability.MISSING_BINARY, Usability.CANNOT_RUN) or not site.inv.rows:
         return []
-    evidence = [inst.usability_detail or inst.usability.value,
-                f"the registry holds {len(site.inv.rows)} port row(s)"]
+    evidence = ([inst.usability_detail] if inst.usability_detail else []) + [
+        f"MacPorts' record lists {counted(len({row.name.lower() for row in site.inv.rows}), 'installed port')}"]
     if _at_default(inst, site.default_prefix):
         shown = _display_instance(inst, site.host_arch)
-        remedies, extra = _built(lambda: [_procedure_note(code, inst),
-                                          actions.sync(shown, site.host_arch, action_id(code, site.prefix, "sync"))])
+        remedies = _built(code, site.prefix, lambda: _procedure_notes(code, inst) + [
+            actions.sync(shown, site.host_arch, action_id(code, site.prefix, "sync"))])
     else:
-        remedies, extra = [_source_build_note(code, inst)], []
-    return [_issue(code, site.prefix, site.prefix, evidence + extra, remedies, confirm_each=True,
-                   blocks=(Blocks.TARGET,))]
+        remedies = [_source_build_note(code, inst)]
+    remedies.append(_note(code, site.prefix, "leaving", MOVE_OUT % site.prefix))
+    return [_issue(code, site.prefix, site.prefix, evidence, remedies, confirm_each=True, blocks=(Blocks.TARGET,),
+                   title=f"The `port` command of {site.at} is missing or does not start")]
 
 
 def _no_registry(site: _Site) -> list[Issue]:
@@ -527,29 +607,40 @@ def _no_registry(site: _Site) -> list[Issue]:
     code, inst = "ports-no-registry", site.instance
     if inst.usability is not Usability.NO_REGISTRY or not inst.inventory_known:
         return []
-    remedies, extra = _built(lambda: [actions.version(inst, site.host_arch, action_id(code, site.prefix, "version"),
-                                                      sudo=True)])
-    return [_issue(code, site.prefix, site.prefix, [inst.usability_detail or "registry.db does not exist"] + extra,
-                   remedies, confirm_each=True, blocks=(Blocks.TARGET,))]
+    remedies = _built(code, site.prefix, lambda: [
+        actions.version(inst, site.host_arch, action_id(code, site.prefix, "version"), sudo=True)])
+    return [_issue(code, site.prefix, site.prefix, [inst.usability_detail] if inst.usability_detail else [],
+                   remedies, confirm_each=True, blocks=(Blocks.TARGET,),
+                   title="MacPorts is installed but has never run as root, so it has no record of installed ports "
+                         "yet")]
 
 
 # Registry rows ---------------------------------------------------------------------------
 
-def _rebuild(site: _Site, code: str, pkg: Package) -> tuple[list[Action], list[str]]:
+def _version(pkg: Package) -> str:
+    """Return the version of a registry row as the report writes it
+
+    @param pkg  the row's package
+    @returns    the version, revision and variants, such as `1.7.1_0+universal`
+    """
+    return pkg.spec_args[1].lstrip("@")
+
+
+def _rebuild(site: _Site, code: str, pkg: Package) -> list[Action]:
     """Return the missing-image remedy of an active row
 
-    None for a `replaced_by` port, `upgrade -n` for an outdated one (its description naming the version
+    A note for a `replaced_by` port, `upgrade -n` for an outdated one (its description naming the version
     change), else `upgrade_forced`.
 
     @param site  the instance's site
     @param code  the finding's code
     @param pkg   the active row's package
-    @returns     the remedies, and the reasons there are none
+    @returns     the remedies, or a note of why there are none
     """
     name = pkg.name
     if pkg.renamed_to:
-        return [], [f"{name} is replaced by {pkg.renamed_to}: reported only "
-                    "(the replaced-port finding offers the replacement)"]
+        return [_note(code, name, "replaced", f"The fix is with the finding that MacPorts replaced {name} with "
+                      f"{pkg.renamed_to}.")]
     entry = site.index.get(name) if site.index is not None else None
     if pkg.outdated and entry is not None:
         new = f"{entry.version}_{entry.revision}"
@@ -559,21 +650,21 @@ def _rebuild(site: _Site, code: str, pkg: Package) -> tuple[list[Action], list[s
                                   homebrew_present=site.homebrew_present, no_deps=True)
             return [dataclasses.replace(act,
                                         description=f"upgrade {name} from {pkg.version} to {new} in {site.prefix}")]
-        return _port_remedies(site, upgrade)
-    return _port_remedies(site, lambda: [actions.upgrade_forced(
+        return _port_remedies(site, code, name, upgrade)
+    return _port_remedies(site, code, name, lambda: [actions.upgrade_forced(
         site.instance, site.host_arch, action_id(code, name, "rebuild"), name, pkg.requested_variants,
         homebrew_present=site.homebrew_present)])
 
 
-def _uninstall_row(site: _Site, code: str, pkg: Package) -> tuple[list[Action], list[str]]:
+def _uninstall_row(site: _Site, code: str, pkg: Package) -> list[Action]:
     """Return the `sudo port -N uninstall <spec_args>` of one row
 
     @param site  the instance's site
     @param code  the finding's code
     @param pkg   the row's package
-    @returns     the remedy, and the reasons there is none
+    @returns     the remedy, or a note of why there is none
     """
-    return _port_remedies(site, lambda: [actions.uninstall(
+    return _port_remedies(site, code, pkg.name, lambda: [actions.uninstall(
         site.instance, site.host_arch, action_id(code, pkg.name, "uninstall" + pkg.spec_args[1]), [pkg.spec_args],
         on_failure=OnFailure.STOP)])
 
@@ -622,17 +713,17 @@ def _missing_file(site: _Site, loaded: set[str]) -> list[Issue]:
         missing, unchecked = _stat_active_files(site.inv.files(pkg))
         if not missing:
             continue
-        evidence = [f"{len(missing)} registered file(s) of {pkg.name} {pkg.spec_args[1]} are missing on disk"]
-        evidence += limited(missing, EVIDENCE_LIMIT)
+        evidence = limited(missing, EVIDENCE_LIMIT)
         if unchecked:
-            evidence.append(f"{unchecked} file(s) could not be checked (counted as unchecked, not missing)")
+            evidence.append(f"{counted(unchecked, 'more file')} could not be looked at")
         if not pkg.receipt_ok:
-            remedies, extra = _rebuild(site, code, pkg)
-            extra = ["its image is missing too: the missing-image remedy applies"] + extra
+            evidence.append("MacPorts' stored copy of this version is missing too")
+            remedies = _rebuild(site, code, pkg)
         else:
-            remedies, extra = _port_remedies(site, functools.partial(_reactivate, site, pkg, loaded))
-        out.append(_issue(code, pkg.name, site.prefix, evidence + extra, remedies, confirm_each=True,
-                          repairs_install=True))
+            remedies = _port_remedies(site, code, pkg.name, functools.partial(_reactivate, site, pkg, loaded))
+        out.append(_issue(code, pkg.name, site.prefix, evidence, remedies, confirm_each=True, repairs_install=True,
+                          title=f"{counted(len(missing), 'file')} of {pkg.name} {_version(pkg)} "
+                                f"{'is' if len(missing) == 1 else 'are'} missing"))
     return out
 
 
@@ -666,18 +757,28 @@ def _missing_image(site: _Site) -> list[Issue]:
         if pkg.receipt_ok:
             continue
         row = site.inv.row_for(pkg)
-        location = row.location if row is not None and row.location else "(none recorded)"
+        evidence = [f"it should be {row.location}" if row is not None and row.location
+                    else "MacPorts recorded no place for it"]
         if pkg.active:
-            evidence = [f"the image of the active {pkg.name} {pkg.spec_args[1]} is missing: {location}"]
-            remedies, extra = _rebuild(site, code, pkg)
-            out.append(_issue(code, pkg.name, site.prefix, evidence + extra, remedies, confirm_each=True,
-                              repairs_install=True))
+            out.append(_issue(code, pkg.name, site.prefix, evidence, _rebuild(site, code, pkg), confirm_each=True,
+                              repairs_install=True,
+                              title=f"MacPorts' stored copy of {pkg.name} {_version(pkg)} is missing"))
         else:
-            evidence = [f"the image of the inactive {pkg.name} {pkg.spec_args[1]} is missing: {location}; "
-                        "it can never be activated again"]
-            remedies, extra = _uninstall_row(site, code, pkg)
-            out.append(_issue(code, pkg.name, site.prefix, evidence + extra, remedies, confirm_each=True))
+            evidence.append("without it, MacPorts can never switch that version on again")
+            out.append(_issue(code, pkg.name, site.prefix, evidence, _uninstall_row(site, code, pkg),
+                              confirm_each=True, title=f"MacPorts' stored copy of the unused version "
+                                                       f"{_version(pkg)} of {pkg.name} is missing"))
     return out
+
+
+def _by_version(one: Package, other: Package) -> int:
+    """Compare two rows of a port by version, as MacPorts orders versions
+
+    @param one    a row's package
+    @param other  another row's package
+    @returns      a negative number when the first is the older, a positive one when it is the newer, else 0
+    """
+    return registry.vercmp(one.version or "", other.version or "")
 
 
 def _inactive_versions(site: _Site) -> list[Issue]:
@@ -697,18 +798,19 @@ def _inactive_versions(site: _Site) -> list[Issue]:
             continue
         active = next((p for p in pkgs if p.active), None)
         if active is None:
-            versions = ", ".join(p.spec_args[1] for p in inactive)
-            out.append(_issue(code, inactive[0].name, site.prefix,
-                              [f"{inactive[0].name} has no active version ({versions}): deactivated on purpose, "
-                               "not offered for removal"],
-                              title="Inactive port without an active version"))
+            name = inactive[0].name
+            # With several stored versions, `port activate` takes the version too.
+            newest = sorted(inactive, key=functools.cmp_to_key(_by_version))[-1]
+            note = _note(code, name, "activate", "Nothing to do. To use it again: "
+                         f"{_port(site.instance, 'activate', *newest.spec_args)}" if site.drivable
+                         else "Nothing to do.")
+            out.append(_issue(code, name, site.prefix, [f"stored: {', '.join(_version(p) for p in inactive)}"],
+                              [note], title=f"{name} is installed but switched off"))
             continue
         for pkg in inactive:
-            remedies, extra = _uninstall_row(site, code, pkg)
-            out.append(_issue(code, pkg.name, site.prefix,
-                              [f"{pkg.name} {pkg.spec_args[1]} is inactive beside the active {active.spec_args[1]}"]
-                              + extra,
-                              remedies, confirm_each=True))
+            out.append(_issue(code, pkg.name, site.prefix, [f"in use: {_version(active)}"],
+                              _uninstall_row(site, code, pkg), confirm_each=True,
+                              title=f"Version {_version(pkg)} of {pkg.name} is stored but not in use"))
     return out
 
 
@@ -725,10 +827,9 @@ def _unrequested_leaf(site: _Site) -> list[Issue]:
     for pkg in site.inv.leaves():
         if not pkg.active:
             continue
-        remedies, extra = _uninstall_row(site, code, pkg)
-        out.append(_issue(code, pkg.name, site.prefix,
-                          [f"{pkg.name} {pkg.spec_args[1]} is not requested and no installed port depends on it"]
-                          + extra, remedies, confirm_each=True))
+        out.append(_issue(code, pkg.name, site.prefix, [f"installed: {_version(pkg)}"],
+                          _uninstall_row(site, code, pkg), confirm_each=True,
+                          title=f"{pkg.name} came in as a dependency, and no installed port needs it"))
     return out
 
 
@@ -744,9 +845,11 @@ def _obsolete_port(site: _Site) -> list[Issue]:
     for _, pkgs in _by_name(site.inv.packages):
         if pkgs[0].catalogue_present:
             continue
-        out.append(_issue("ports-obsolete-port", pkgs[0].name, site.prefix,
-                          [f"{pkgs[0].name} is not in the PortIndex {site.index.path}: mapped at plan time through the "
-                           "static map and, with plan --repology, Repology"]))
+        name = pkgs[0].name
+        note = _note("ports-obsolete-port", name, "note", "Nothing to do. A move out of this MacPorts still looks "
+                     "for a replacement.")
+        out.append(_issue("ports-obsolete-port", name, site.prefix, [], [note],
+                          title=f"{name} is installed, but MacPorts' package list does not have it"))
     return out
 
 
@@ -768,9 +871,8 @@ def _replaced_port(site: _Site) -> list[Issue]:
             act = actions.upgrade(site.instance, site.host_arch, action_id(code, pkg.name, "upgrade"), pkg.name,
                                   homebrew_present=site.homebrew_present)
             return [dataclasses.replace(act, description=f"replace {pkg.name} with {pkg.renamed_to} in {site.prefix}")]
-        remedies, extra = _port_remedies(site, build)
-        out.append(_issue(code, pkg.name, site.prefix, [f"{pkg.name} is replaced by {pkg.renamed_to}"] + extra,
-                          remedies, confirm_each=True))
+        out.append(_issue(code, pkg.name, site.prefix, [], _port_remedies(site, code, pkg.name, build),
+                          confirm_each=True, title=f"MacPorts replaced {pkg.name} with {pkg.renamed_to}"))
     return out
 
 
@@ -800,105 +902,26 @@ def _built_for_other_os(site: _Site) -> list[Issue]:
     code, inst = "ports-built-for-other-os", site.instance
     if inst.usability is not Usability.USABLE:
         return []
-    odd = [f"{pkg.name} {pkg.spec_args[1]}: {row.os_platform or ''} {row.os_major}"
-           for pkg, row in zip(site.inv.packages, site.inv.rows)
-           if pkg.active and _other_major(row.os_major, site.running[1])]
+    odd: dict[str, list[str]] = {}
+    for pkg, row in zip(site.inv.packages, site.inv.rows):
+        if pkg.active and _other_major(row.os_major, site.running[1]):
+            odd.setdefault(locate.release(row.os_platform or "", row.os_major or ""), []).append(pkg.name)
     if not odd:
         return []
-    evidence = [f"{len(odd)} active port(s) were built for another Darwin major than {site.running[1]}"]
-    evidence += limited(odd, EVIDENCE_LIMIT)
+    count = sum(len(names) for names in odd.values())
+    evidence = [f"this Mac runs {system.macos_name(site.running[1])}"]
+    evidence += [f"built for {release}: {some(names)}" for release, names in odd.items()]
     if "migrate" in inst.features:
-        remedies, extra = _built(lambda: _migrate_remedies(site, code, inst))
+        remedies = _built(code, site.prefix, lambda: _migrate_remedies(site, code, inst))
     else:
-        remedies, extra = [_note(code, site.prefix, "manual",
-                                 f"base {inst.version or ''} has no port migrate: run sudo port selfupdate "
-                                 "(base 2.10.0 and newer have it), then sudo port -N migrate --all")], []
-    return [_issue(code, site.prefix, site.prefix, evidence + extra, remedies, confirm_each=True,
-                   blocks=(Blocks.TARGET,))]
+        remedies = [_note(code, site.prefix, "manual", _too_old(inst))]
+    remedies.append(_note(code, site.prefix, "leaving", "A move out of this MacPorts does not need this repair."))
+    return [_issue(code, site.prefix, site.prefix, evidence, remedies, confirm_each=True, blocks=(Blocks.TARGET,),
+                   title=f"{counted(count, 'port')} {'was' if count == 1 else 'were'} built for another version of "
+                         "macOS")]
 
 
 # Broken binaries -----------------------------------------------------------------------
-
-_CPU_TYPES = {7: "i386", 0x01000007: "x86_64", 12: "arm", 0x0100000C: "arm64", 0x0200000C: "arm64_32",
-              18: "ppc", 0x01000012: "ppc64"}
-_THIN_BE = (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf")
-_THIN_LE = (b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe")
-_FAT_ENTRY_SIZE = {b"\xca\xfe\xba\xbe": 20, b"\xca\xfe\xba\xbf": 32}
-_MAX_FAT_ARCHS = 30
-
-
-def macho_archs(path: str) -> frozenset[str] | None:
-    """Return the architectures in a Mach-O header
-
-    A thin file has one cputype and a fat one several; more than 30 entries is a Java class file.
-
-    @param path  the file
-    @returns     the architecture names; None for a file that is no Mach-O or cannot be read
-    """
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(8)
-            if len(head) < 8:
-                return None
-            magic = head[:4]
-            if magic in _THIN_BE:
-                cpus = [struct.unpack(">i", head[4:8])[0]]
-            elif magic in _THIN_LE:
-                cpus = [struct.unpack("<i", head[4:8])[0]]
-            elif magic in _FAT_ENTRY_SIZE:
-                count = struct.unpack(">I", head[4:8])[0]
-                size = _FAT_ENTRY_SIZE[magic]
-                if count > _MAX_FAT_ARCHS:
-                    return None
-                table = fh.read(count * size)
-                if len(table) < count * size:
-                    return None
-                cpus = [struct.unpack(">i", table[i * size:i * size + 4])[0] for i in range(count)]
-            else:
-                return None
-    except OSError:
-        return None
-    return frozenset(_CPU_TYPES.get(cpu, f"cpu{cpu}") for cpu in cpus)
-
-
-def arch_gaps(binary: str, references: Sequence[Mapping[str, Any]], wanted: set[str],
-              cache: dict[str, frozenset[str] | None] | None = None) -> list[str]:
-    """Return each "missing arch inside the prefix", as `rev-upgrade` decides it
-
-    A library the binary loads from its own prefix (an `own` reference) lacks one of the binary's
-    architectures. Only the architectures the host or the instance runs are checked.
-
-    @param binary      the binary
-    @param references  the binary's linkage references, with their `class` and `resolved` path
-    @param wanted      the architectures to check, the host's and the instance's
-    @param cache       the architectures of each path read so far, shared across calls; None for a fresh one
-    @returns           one `<library> lacks <archs>` line per gap
-    """
-    cache = {} if cache is None else cache
-
-    def archs(path: str) -> frozenset[str] | None:
-        if path not in cache:
-            cache[path] = macho_archs(path)
-        return cache[path]
-
-    have = archs(binary)
-    need = set(have or ()) & wanted
-    if not need:
-        return []
-    out: list[str] = []
-    for ref in references:
-        lib = ref.get("resolved")
-        if ref.get("class") != "own" or not lib:
-            continue
-        lib_archs = archs(lib)
-        if lib_archs is None:
-            continue
-        lacking = sorted(need - lib_archs)
-        gap = f"{lib} lacks {', '.join(lacking)}"
-        if lacking and gap not in out:
-            out.append(gap)
-    return out
-
 
 def _wanted_archs(host_arch: str, inst: Instance) -> set[str]:
     """Return the architectures a binary of the instance must have: the host's and the instance's
@@ -938,55 +961,31 @@ def _broken_binaries(site: _Site, linkage: Mapping[str, Any]) -> list[Issue]:
         if prefix != site.prefix or kind != "port" or not name:
             continue
         refs = item.get("references") or []
-        lines = [f"{path}: missing {ref.get('name')}" for ref in refs if ref.get("class") == "missing"]
-        lines += [f"{path}: {gap}" for gap in arch_gaps(path, refs, wanted, cache)]
+        lines = [f"{path} needs {ref.get('name')}, which is missing" for ref in refs if ref.get("class") == "missing"]
+        lines += [f"{path} loads {gap}" for gap in macho.arch_gaps(path, refs, wanted, cache)]
         if lines:
             found.setdefault(name.lower(), []).extend(lines)
             names.setdefault(name.lower(), name)
+    code = "ports-broken-binaries"
     out = []
     for key, lines in found.items():
         active = next((p for p in site.inv.packages if p.active and p.name.lower() == key), None)
-        remedies: list[Action]
+        name = active.name if active else names[key]
         if active is None:
-            remedies, extra = [], [f"no active row of {names[key]} in the registry"]
+            remedies = [_note(code, name, "unused", f"brew-ports offers no fix: MacPorts' record has no version of "
+                              f"{name} in use.")]
         else:
             def rebuild(pkg: Package = active) -> list[Action]:
-                return [actions.upgrade_forced(
-                    site.instance, site.host_arch, action_id("ports-broken-binaries", pkg.name, "rebuild"),
-                    pkg.name, pkg.requested_variants, homebrew_present=site.homebrew_present)]
-            remedies, extra = _port_remedies(site, rebuild)
-        out.append(_issue("ports-broken-binaries", active.name if active else names[key], site.prefix,
-                          limited(lines, EVIDENCE_LIMIT) + extra, remedies, confirm_each=True, repairs_install=True))
+                return [actions.upgrade_forced(site.instance, site.host_arch, action_id(code, pkg.name, "rebuild"),
+                                               pkg.name, pkg.requested_variants,
+                                               homebrew_present=site.homebrew_present)]
+            remedies = _port_remedies(site, code, name, rebuild)
+        out.append(_issue(code, name, site.prefix, limited(lines, EVIDENCE_LIMIT), remedies, confirm_each=True,
+                          repairs_install=True, title=f"Files of {name} cannot load a library they need"))
     return out
 
 
 # Unregistered files ---------------------------------------------------------------------
-
-def _walk(top: str) -> Iterator[tuple[str, os.stat_result]]:
-    """Yield every entry below `top` that is not a real directory, symlinks included, with its `lstat`
-
-    `__pycache__` directories are skipped, and an unreadable directory holds nothing.
-
-    @param top  the directory to walk
-    @returns    an iterator over the paths and their `lstat`, in name order
-    """
-    try:
-        with os.scandir(top) as it:
-            entries = sorted(it, key=lambda e: e.name)
-    except OSError:
-        return
-    progress.count(len(entries))
-    for entry in entries:
-        try:
-            st = entry.stat(follow_symlinks=False)
-        except OSError:
-            continue
-        if stat.S_ISDIR(st.st_mode):
-            if entry.name != "__pycache__":
-                yield from _walk(entry.path)
-        else:
-            yield entry.path, st
-
 
 def _select_targets(site: _Site) -> dict[str, str]:
     """Map each path `port select` links (a line of `etc/select/<group>/base`) to its group
@@ -999,93 +998,6 @@ def _select_targets(site: _Site) -> dict[str, str]:
         for line in group.base:
             out.setdefault(os.path.normpath(os.path.join(site.inv.registry_prefix, line)), group.name)
     return out
-
-
-def _gem_entries(gem_dir: str, name: str | None) -> tuple[list[str], list[str]]:
-    """Return the files and directories RubyGems keeps for one installed gem in its gem home
-
-    They are `specifications/<gem>.gemspec`, `cache/<gem>.gem`, `build_info/<gem>.info` and `plugins/<name>_plugin.rb`,
-    then the gem directory, `doc/<gem>/` and each `extensions/<platform>/<api version>/<gem>/`; `<gem>` is the gem
-    directory's name, and the gem home holds its `gems/`.
-
-    @param gem_dir  the gem's directory, `<gem home>/gems/<name>-<version>[-<platform>]`
-    @param name     the gem's name; None when its directory's name gives none
-    @returns        the files, then the directories
-    """
-    home, gem = os.path.dirname(os.path.dirname(gem_dir)), os.path.basename(gem_dir)
-    files = [os.path.join(home, sub, gem + ext)
-             for sub, ext in (("specifications", ".gemspec"), ("cache", ".gem"), ("build_info", ".info"))]
-    if name:
-        files.append(os.path.join(home, "plugins", name + "_plugin.rb"))
-    dirs = [gem_dir, os.path.join(home, "doc", gem)]
-    dirs += glob.glob(os.path.join(glob.escape(home), "extensions", "*", "*", glob.escape(gem)))
-    return files, dirs
-
-
-def _auto_trees(path: str, module: str | None) -> list[str]:
-    """Return the `auto/<Module>/` directories of a cpan module, which hold its XS parts and its `.packlist`
-
-    They lie in the directory its module path starts in, or in an architecture directory below that one, where a
-    pure-Perl module's `.packlist` goes.
-
-    @param path    the module's `.pm` file
-    @param module  the module, such as `JSON::XS`
-    @returns       the directories; none when the path does not end in the module's own path
-    """
-    rel = (module or "").replace("::", "/")
-    if not rel or not path.endswith("/" + rel + ".pm"):
-        return []
-    top = path[:-len(rel + ".pm")]
-    return [os.path.join(top, "auto", rel)] + glob.glob(os.path.join(glob.escape(top), "*", "auto", glob.escape(rel)))
-
-
-class _Extras:
-    """What the interpreter-extras scan attributes inside one prefix, which the stray-file removal leaves alone
-
-    They are its `attributed` entry points; each gem with what RubyGems keeps for it; each cpan module with its
-    `auto/` trees; the npm directories; and the prefix's site-packages.
-    """
-
-    def __init__(self, extras: Mapping[str, Any], prefix: str) -> None:
-        """Collect the exact paths and the directory roots the extras of one prefix own
-
-        @param extras  the interpreter-extras scan
-        @param prefix  the instance's prefix
-        """
-        mine = {key: [item for item in extras.get(key) or [] if item.get("instance_prefix") == prefix
-                      and item.get("path")] for key in ("npm", "gems", "cpan")}
-        exact = list(extras.get("attributed") or []) + [item["path"] for item in mine["cpan"]]
-        roots = [item["path"] for item in mine["npm"]]
-        for item in mine["gems"]:
-            files, dirs = _gem_entries(item["path"], item.get("name"))
-            exact += files
-            roots += dirs
-        for item in mine["cpan"]:
-            roots += _auto_trees(item["path"], item.get("module"))
-        roots += [item["site_packages"] for item in extras.get("python") or []
-                  if item.get("instance_prefix") == prefix and item.get("site_packages")]
-        self.exact: set[str] = {os.path.realpath(p) for p in exact}
-        self.roots = [os.path.realpath(r).rstrip("/") + "/" for r in roots]
-
-    def owns(self, path: str) -> bool:
-        """Return whether an interpreter extra owns a path, compared after symlinks are resolved
-
-        @param path  an absolute path
-        @returns     True for an attributed path or one below an owned directory
-        """
-        real = os.path.realpath(path)
-        return real in self.exact or any(real.startswith(root) for root in self.roots)
-
-
-def _generated(path: str, info_dir: str) -> bool:
-    """Return whether a file is one that every prefix generates, such as a cache or the info `dir`
-
-    @param path      the file
-    @param info_dir  the prefix's `share/info/dir`
-    @returns         True for a generated file
-    """
-    name = os.path.basename(path)
-    return path == info_dir or name in GENERATED_NAMES or name.endswith(GENERATED_SUFFIXES)
 
 
 def _unregistered_file(site: _Site, extras: Mapping[str, Any]) -> list[Issue]:
@@ -1106,12 +1018,12 @@ def _unregistered_file(site: _Site, extras: Mapping[str, Any]) -> list[Issue]:
     root = inv.registry_prefix
     info_dir = os.path.join(root, "share", "info", "dir")
     links = _select_targets(site)
-    owned = _Extras(extras, site.prefix)
+    owned = strays.Extras(extras, site.prefix)
     removable: list[str] = []
-    listed: list[str] = []
+    listed: dict[str, list[str]] = {}
     for top in STRAY_TOPS:
-        for path, st in _walk(os.path.join(root, top)):
-            if _generated(path, info_dir) or inv.is_base_file(path):
+        for path, st in strays.walk(os.path.join(root, top)):
+            if strays.generated(path, info_dir) or inv.is_base_file(path):
                 continue
             if stat.S_ISLNK(st.st_mode) and path in links:
                 continue
@@ -1122,15 +1034,35 @@ def _unregistered_file(site: _Site, extras: Mapping[str, Any]) -> list[Issue]:
             if reason is None:
                 removable.append(path)
             else:
-                listed.append(f"{path} ({reason})")
+                listed.setdefault(reason, []).append(path)
     out = [_stray(site, path) for path in removable]
     if listed:
-        out.append(_issue("ports-unregistered-file", site.prefix, site.prefix, listed,
-                          title="Unregistered files in the prefix (listed)"))
+        out.append(_left_alone(site, listed))
     return out
 
 
-def _listed_reason(path: str, st: os.stat_result, top: str, links: Mapping[str, str], owned: _Extras) -> str | None:
+def _left_alone(site: _Site, listed: Mapping[str, Sequence[str]]) -> Issue:
+    """Build the one finding of the unregistered files that are not offered for removal
+
+    @param site    the instance's site
+    @param listed  the files by the reason of `LEFT_ALONE` that keeps each
+    @returns       the finding: how many files each reason keeps, then the files
+    """
+    code = "ports-unregistered-file"
+    count = sum(len(paths) for paths in listed.values())
+    kinds = sorted(listed, key=lambda reason: -len(listed[reason]))
+    evidence = [", ".join(f"{len(listed[reason]):,} {LEFT_ALONE[reason][len(listed[reason]) != 1]}"
+                          for reason in kinds)]
+    evidence += limited([f"{path} ({LEFT_ALONE[reason][0]})" for reason in kinds for path in listed[reason]],
+                        EVIDENCE_LIMIT)
+    note = _note(code, site.prefix, "left", "Nothing to do. Uninstalling this MacPorts deletes them with it.")
+    return _issue(code, site.prefix, site.prefix, evidence, [note],
+                  title=f"{counted(count, 'file')} in {site.prefix} {'was' if count == 1 else 'were'} not installed "
+                        f"by any port, and brew-ports leaves {'it' if count == 1 else 'them'} alone")
+
+
+def _listed_reason(path: str, st: os.stat_result, top: str, links: Mapping[str, str],
+                   owned: strays.Extras) -> str | None:
     """Return why an unregistered file is listed and not offered for removal
 
     @param path   the file
@@ -1138,18 +1070,18 @@ def _listed_reason(path: str, st: os.stat_result, top: str, links: Mapping[str, 
     @param top    the walked directory it lies under, relative to the prefix
     @param links  the group of each path `port select` links
     @param owned  what the interpreter extras own
-    @returns      the reason; None for a file offered for removal
+    @returns      the reason, a key of `LEFT_ALONE`; None for a file offered for removal
     """
     if stat.S_ISLNK(st.st_mode):
-        return "symlink"
+        return "link"
     if not stat.S_ISREG(st.st_mode):
-        return "not a regular file"
+        return "special"
     if top not in REMOVABLE_TOPS:
-        return "outside bin, sbin, lib and include"
+        return "outside"
     if path in links:
-        return f"linked by the port select group {links[path]}"
+        return "select"
     if owned.owns(path):
-        return "interpreter extras"
+        return "extras"
     return None
 
 
@@ -1161,16 +1093,18 @@ def _stray(site: _Site, path: str) -> Issue:
     @returns     the finding; listed only without a run directory
     """
     code = "ports-unregistered-file"
-    evidence = [f"{path} is not registered to any port"]
+    title = f"No port installed {path}"
+    remove = Action(action_id=action_id(code, path, "rm"), kind="command", argv=[RM, path], sudo=True,
+                    description=f"delete {path}, which no port installed")
     if site.run_path is None:
-        return _issue(code, path, site.prefix, evidence + ["no run directory to archive it into: listed only"])
+        by_hand = dataclasses.replace(remove, manual=True, description="Fix, if you do not need it")
+        return _issue(code, path, site.prefix, [], [by_hand], title=title)
     dst = os.path.join(site.run_path, "backup", "strays", slug(path) + ".tar")
     archive = Action(action_id=action_id(code, path, "tar"), kind="command",
                      argv=[TAR, "-cf", "-", "-C", "/", path.lstrip("/")], sudo=True,
-                     description=f"archive {path} into {dst}", dst=dst)
-    remove = Action(action_id=action_id(code, path, "rm"), kind="command", argv=[RM, path], sudo=True,
-                    description=f"remove the unregistered file {path}")
-    return _issue(code, path, site.prefix, evidence, [archive, remove], confirm_each=True)
+                     description=f"save {path} as {dst}", dst=dst)
+    offer = _note(code, path, "offer", offered("saves the file in the run folder, then deletes it"))
+    return _issue(code, path, site.prefix, [], [offer, archive, remove], confirm_each=True, title=title)
 
 
 # Configuration and environment ----------------------------------------------------------------
@@ -1183,21 +1117,29 @@ def _stale_portindex(site: _Site, environ: Mapping[str, str], clock: float) -> l
     @param clock    the clock's time, in seconds since the epoch
     @returns        the finding, or none
     """
-    path = mp_portindex.index_path(site.instance, environ)
-    if path is None:
-        evidence = ["sources.conf names no default source"]
-    else:
-        try:
-            age = clock - os.stat(path).st_mtime
-        except OSError:
-            evidence = [f"{path} does not exist"]
-        else:
-            if age <= PORTINDEX_MAX_AGE_S:
-                return []
-            evidence = [f"{path} is {int(age // 86400)} days old"]
     code = "ports-stale-portindex"
-    return [_issue(code, site.prefix, site.prefix, evidence,
-                   [_note(code, site.prefix, "refresh", "brew-ports plan --refresh (runs sudo port -N sync)")])]
+    path = mp_portindex.index_path(site.instance, environ)
+    title, evidence = "MacPorts' package list is missing", []
+    if path is None:
+        note = _note(code, site.prefix, "sources", "brew-ports offers no fix: MacPorts' sources.conf has to name a "
+                     "source of ports before `port sync` can download the list.")
+        return [_issue(code, site.prefix, site.prefix, ["MacPorts' sources.conf names no source of ports"], [note],
+                       title=title)]
+    try:
+        age = clock - os.stat(path).st_mtime
+    except OSError:
+        evidence = [f"there is no {path}"]
+    else:
+        if age <= PORTINDEX_MAX_AGE_S:
+            return []
+        title = f"MacPorts' package list is {int(age // 86400)} days old"
+    remedies = _port_remedies(site, code, site.prefix, lambda: [dataclasses.replace(
+        actions.sync(site.instance, site.host_arch, action_id(code, site.prefix, "sync")), manual=True,
+        description="")])
+    if site.drivable:
+        remedies.append(_note(code, site.prefix, "refresh", "`brew-ports plan --target ports --refresh` runs it "
+                              "too, for the MacPorts that packages move into."))
+    return [_issue(code, site.prefix, site.prefix, evidence, remedies, title=title)]
 
 
 def _macports_user(site: _Site, runner, cache: dict[str, Any]) -> list[Issue]:
@@ -1217,55 +1159,89 @@ def _macports_user(site: _Site, runner, cache: dict[str, Any]) -> list[Issue]:
                                                 [system.DSCL, ".", "-read", "/Users/macports"],
                                                 "the macports user"))
     result = cache["dscl"]
+    code = "ports-macports-user"
+    account = "The system account `macports`, under which MacPorts builds ports,"
     if result.exit != 0:
-        detail = (result.stderr().strip() or f"dscl exited {result.exit}").splitlines()[0]
-        problems = [f"the macports user does not exist ({detail})"]
-    else:
-        fields = system.parse_dscl(result.stdout())
-        uid, shell, home = fields.get("UniqueID", ""), fields.get("UserShell", ""), fields.get("NFSHomeDirectory", "")
-        expected_home = os.path.join(site.instance.portdbpath or "", "home")
-        problems = []
-        if not uid.isdigit() or int(uid) <= 500:
-            problems.append(f"UniqueID is {uid or 'missing'}, not a number above 500")
-        if shell != "/usr/bin/false":
-            problems.append(f"UserShell is {shell or 'missing'}, not /usr/bin/false")
-        if os.path.normpath(home or "/") != os.path.normpath(expected_home):
-            problems.append(f"NFSHomeDirectory is {home or 'missing'}, not {expected_home}")
+        fix = ("Fix: run the MacPorts installer again (https://www.macports.org/install.php), which makes the "
+               "account. Your ports stay." if _at_default(site.instance, site.default_prefix)
+               else "brew-ports offers no fix: MacPorts' installer makes that account, but it installs to "
+                    "/opt/local only.")
+        return [_issue(code, "macports", site.prefix, [], [_note(code, site.prefix, "manual", fix)],
+                       title=f"{account} is missing")]
+    fields = system.parse_dscl(result.stdout())
+    uid, shell, home = fields.get("UniqueID", ""), fields.get("UserShell", ""), fields.get("NFSHomeDirectory", "")
+    expected_home = os.path.join(site.instance.portdbpath or "", "home")
+    problems, remedies = [], []
+    if shell != "/usr/bin/false":
+        problems.append(f"its shell is {shell or 'missing'}; MacPorts gives it /usr/bin/false")
+        remedies.append(_account_field(code, "UserShell", "/usr/bin/false"))
+    if os.path.normpath(home or "/") != os.path.normpath(expected_home):
+        problems.append(f"its home folder is {home or 'missing'}; MacPorts gives it {expected_home}")
+        remedies.append(_account_field(code, "NFSHomeDirectory", expected_home))
+    if not uid.isdigit() or int(uid) <= 500:
+        problems.append(f"its user id is {uid or 'missing'}; MacPorts gives it one above 500")
+        remedies.append(_note(code, site.prefix, "uid", "brew-ports offers no fix that changes the user id."))
     if not problems:
         return []
-    code = "ports-macports-user"
-    return [_issue(code, "macports", site.prefix, problems,
-                   [_note(code, site.prefix, "manual", "reinstall the MacPorts base package, whose installer "
-                                                       "creates the macports user and group")])]
+    return [_issue(code, "macports", site.prefix, problems, remedies, title=f"{account} is not as MacPorts made it")]
 
 
-def _disk_usage(site: _Site, runner) -> list[Issue]:
-    """Report the `du -sk` sizes of the existing `build`, `distfiles` and `software` directories
+def _account_field(code: str, field: str, value: str) -> Action:
+    """Build the command, for the user to run, that sets one field of the `macports` account as MacPorts does
+
+    @param code   the finding's code
+    @param field  the field's name in the directory service, such as `UserShell`
+    @param value  the value MacPorts gives it
+    @returns      the command, printed and never run
+    """
+    return Action(action_id=action_id(code, "macports", field.lower()), kind="command",
+                  argv=[system.DSCL, ".", "-create", "/Users/macports", field, value], sudo=True, description="",
+                  manual=True)
+
+
+def _size(kib: int) -> str:
+    """Return a size as the report writes it
+
+    @param kib  the size in KiB, as `du -sk` gives it
+    @returns    the size in MiB, or in GiB from 1024 MiB on, with one decimal
+    """
+    mib = kib / 1024.0
+    return f"{mib / 1024.0:,.1f} GiB" if mib >= 1024 else f"{mib:,.1f} MiB"
+
+
+def _disk_usage(site: _Site, runner, notes: list[str]) -> list[Issue]:
+    """Report the `du -sk` sizes of the existing `software`, `build` and `distfiles` directories
 
     @param site    the instance's site
     @param runner  the runner that runs `du`
-    @returns       the finding; none without those directories
+    @param notes   receives a line when `du` gives no size
+    @returns       the finding; none without those directories or their sizes
     """
     base = site.instance.portdbpath
-    if not base:
-        return []
-    dirs = [d for d in (os.path.join(base, sub) for sub in ("build", "distfiles", "software")) if os.path.isdir(d)]
+    uses = {"software": "the stored copies of its ports", "build": "build leftovers",
+            "distfiles": "downloaded sources"}
+    dirs = [d for d in (os.path.join(base or "", sub) for sub in uses) if base and os.path.isdir(d)]
     if not dirs:
         return []
     result = runner.run(system.probe(f"0.ports.{slug(site.prefix)}.du", [DU, "-sk"] + dirs,
                                      f"size of the build, distfile and image directories of {site.prefix}"))
-    evidence = []
+    sizes: dict[str, int] = {}
     for line in result.stdout().splitlines():
         size, _, path = line.partition("\t")
-        if size.strip().isdigit() and path:
-            evidence.append(f"{path.strip()}: {int(size) / 1024.0:.1f} MiB")
-    if not evidence:
-        evidence = [f"du could not size {', '.join(dirs)}"]
+        if size.strip().isdigit() and os.path.basename(path.strip()) in uses:
+            sizes[os.path.basename(path.strip())] = int(size)
+    if not sizes:
+        notes.append(f"How much disk space {site.at} uses: `du` gave no sizes")
+        return []
     code = "ports-disk-usage"
-    return [_issue(code, site.prefix, site.prefix, evidence,
-                   [_note(code, site.prefix, "manual",
-                          "sudo port -N clean --all <name> per port, or sudo port reclaim run by you on a terminal "
-                          "(without -N it asks before each removal)")])]
+    spare = sizes.get("build", 0) + sizes.get("distfiles", 0)
+    note = (f"Nothing to do. To free space and keep MacPorts, run `{_port(site.instance, 'reclaim')}`; it asks "
+            "before each removal." if spare >= 1024 else "Nothing to do.")
+    return [_issue(code, site.prefix, site.prefix,
+                   [f"{_size(kib)} for {uses[sub]}" for sub, kib in sizes.items() if kib],
+                   [_note(code, site.prefix, "manual", note)],
+                   title=f"MacPorts' stored copies of ports, build leftovers and downloads take "
+                         f"{_size(sum(sizes.values()))} of disk space")]
 
 
 def _tcl_true(value: str) -> bool:
@@ -1291,22 +1267,26 @@ def _no_binary_archives(site: _Site) -> list[Issue]:
     for key, default in ARCHIVE_DEFAULTS:
         value = config.get(key)
         if value and os.path.normpath(value) != default:
-            found.append(f"{key} {value} (binary archives are built for {default})")
+            found.append(f"{'MacPorts is installed in' if key == 'prefix' else f'its setting {key} is'} {value}; "
+                         f"prebuilt packages are made for {default}")
     platform = site.running
     cxx = config.get("cxx_stdlib")
     default_cxx = mp_inventory.configured_cxx_stdlib({}, platform)
     if cxx and cxx != default_cxx:
-        found.append(f"cxx_stdlib {cxx} (binary archives use {default_cxx or 'none'})")
+        found.append(f"its setting cxx_stdlib is {cxx}; prebuilt packages use {default_cxx or 'none'}")
     la = config.get("delete_la_files")
     default_la = platform[0] == "darwin" and platform[1] >= 13
     if la is not None and la.strip() and _tcl_true(la) != default_la:
-        found.append(f"delete_la_files {la} (binary archives use {'yes' if default_la else 'no'})")
+        found.append(f"its setting delete_la_files is {la}; prebuilt packages use {'yes' if default_la else 'no'}")
     if (config.get("buildfromsource") or "").strip() == "always":
-        found.append("buildfromsource always")
+        found.append("its setting buildfromsource is always")
     if not found:
         return []
-    return [_issue("ports-no-binary-archives", site.prefix, site.prefix,
-                   found + [f"ports of {site.prefix} are built from source"])]
+    code = "ports-no-binary-archives"
+    note = _note(code, site.prefix, "note", "Nothing to do. Installing into this MacPorts takes longer, because it "
+                 "builds each port.")
+    return [_issue(code, site.prefix, site.prefix, found, [note],
+                   title="MacPorts builds every port on this Mac, because its settings rule out prebuilt packages")]
 
 
 def _same_dir(text: str | None, directory: str) -> bool:
@@ -1322,7 +1302,10 @@ def _same_dir(text: str | None, directory: str) -> bool:
 
 
 def _not_on_path(site: _Site, environment: Mapping[str, Any]) -> list[Issue]:
-    """Report a live PATH without `<prefix>/bin`; `env-cleanup` adds its PATH line
+    """Report a live PATH without `<prefix>/bin`
+
+    The fix named here is the one by hand, which holds for every installation; `doctor` names `env-cleanup` in
+    its place for the installation that command keeps.
 
     @param site         the instance's site
     @param environment  the environment analysis, whose `live` PATH entries are read
@@ -1335,10 +1318,12 @@ def _not_on_path(site: _Site, environment: Mapping[str, Any]) -> list[Issue]:
     if any(_same_dir(entry.get("path") or entry.get("text"), bin_dir) for entry in live):
         return []
     code = "ports-not-on-path"
-    return [_issue(code, bin_dir, site.prefix, [f"{bin_dir} is not on the live PATH"],
-                   [_note(code, bin_dir, "env-cleanup",
-                          "brew-ports env-cleanup (it adds the PATH line to the login file of your shell)")],
-                   title=f"PATH lacks {bin_dir}")]
+    return [_issue(code, bin_dir, site.prefix, [],
+                   [_note(code, bin_dir, "path", f"Fix, if this is the MacPorts you keep: add {bin_dir} to the PATH "
+                          "in your shell's login file."),
+                    _note(code, bin_dir, "new-window", "If you have only just installed MacPorts, a new Terminal "
+                          "window has it already.")],
+                   title=f"{bin_dir} is not on your PATH, so `port` is not found by name")]
 
 
 def _usr_local_cellar(bundle, usr_local_cellar: str) -> list[Issue]:
@@ -1352,8 +1337,11 @@ def _usr_local_cellar(bundle, usr_local_cellar: str) -> list[Issue]:
     """
     if not bundle.ports or not os.path.isdir(usr_local_cellar):
         return []
-    return [_issue("ports-usr-local-cellar", usr_local_cellar, None,
-                   [f"{usr_local_cellar} exists: Homebrew in /usr/local (brew-several-prefixes has the detail)"])]
+    code = "ports-usr-local-cellar"
+    return [_issue(code, usr_local_cellar, None, [],
+                   [_note(code, usr_local_cellar, "note", "Nothing to do while you keep that Homebrew.")],
+                   title=f"{usr_local_cellar} exists, and a port that MacPorts builds can pick up Homebrew's files "
+                         f"from {os.path.dirname(usr_local_cellar)}")]
 
 
 # Startup items and select groups -------------------------------------------------------------
@@ -1377,8 +1365,8 @@ def _dangling_plist(site: _Site, services: Sequence[Service], uid: int) -> list[
         gone = bool(svc.program and not os.path.exists(svc.program))
         if not (dangling or gone):
             continue
-        why = "is a symlink whose target is gone" if dangling else f"runs {svc.program}, which is gone"
-        evidence = [f"{svc.plist} {why}"]
+        evidence = [f"its file, {svc.plist}, " + ("is a link to a file that is gone" if dangling
+                                                  else f"runs {svc.program}, which is gone")]
         if svc.scope == "system":
             target, sudo = f"system/{svc.label}", True
         else:
@@ -1386,10 +1374,11 @@ def _dangling_plist(site: _Site, services: Sequence[Service], uid: int) -> list[
             target, sudo = f"{domain}/{svc.label}", False
         bootout = Action(action_id=action_id(code, svc.label, "bootout"), kind="command",
                          argv=[env_services.LAUNCHCTL, "bootout", target], sudo=sudo,
-                         description=f"unload {target} (exit 3: it was not loaded)", on_failure=OnFailure.PROBE)
+                         description=f"unload the service {svc.label}", on_failure=OnFailure.PROBE)
         remove = Action(action_id=action_id(code, svc.label, "rm"), kind="command", argv=[RM, svc.plist], sudo=True,
-                        description=f"remove the dangling plist {svc.plist}")
-        out.append(_issue(code, svc.label, site.prefix, evidence, [bootout, remove], confirm_each=True))
+                        description=f"delete the service file {svc.plist}")
+        out.append(_issue(code, svc.label, site.prefix, evidence, [bootout, remove], confirm_each=True,
+                          title=f"The service {svc.label} is left over from a port whose program is gone"))
     return out
 
 
@@ -1416,15 +1405,17 @@ def _missing_selection(site: _Site) -> list[Issue]:
         owner = None if gone else inv.owner_of(option)
         if owner is not None and owner.lower() in active:
             continue
-        why = "whose option file is gone" if gone else "which no active port provides"
-        evidence = [f"the {group.name} group selects {current}, {why}"]
+        evidence = ["the file of that choice is gone" if gone
+                    else f"{owner}, which provides that choice, is switched off" if owner is not None
+                    else "no installed port provides that choice"]
 
         def clear(group: mp_inventory.SelectGroup = group) -> list[Action]:
             return [dataclasses.replace(actions.select_set(
                 shown, site.host_arch, action_id("ports-missing-selection", group.name, "select"), group.name,
-                "none"), manual=True)]
-        remedies, extra = _built(clear)
-        out.append(_issue("ports-missing-selection", group.name, site.prefix, evidence + extra, remedies))
+                "none"), manual=True, description="")]
+        out.append(_issue("ports-missing-selection", group.name, site.prefix, evidence,
+                          _built("ports-missing-selection", group.name, clear),
+                          title=f"`port select` points {group.name} at {current}, which no port in use provides"))
     return out
 
 
@@ -1483,7 +1474,7 @@ def detect(bundle, runner, *, platform: locate.Platform | None = None, default_p
         lambda s: _stale_portindex(s, runner.environ, clock),
         lambda s: _macports_user(s, runner, cache),
         _registry_busy,
-        lambda s: _disk_usage(s, runner),
+        lambda s: _disk_usage(s, runner, bundle.notes),
         lambda s: _dangling_plist(s, services, uid),
         _missing_selection, _no_binary_archives,
         lambda s: _not_on_path(s, environment),
@@ -1497,7 +1488,29 @@ def detect(bundle, runner, *, platform: locate.Platform | None = None, default_p
     for detector in (_registry_schema_update, _replaced_port, _cannot_run, _no_registry):
         for site in sites:
             issues += detector(site)
-    return issues
+    return _once(issues)
+
+
+def _once(issues: Sequence[Issue]) -> list[Issue]:
+    """Drop the `port diagnose` findings that another finding says more about
+
+    They are the missing files of a port that has a missing-file finding, and a warning that names the Cellar
+    folder which the finding about Homebrew in `/usr/local` is about.
+
+    @param issues  the findings
+    @returns       the findings, each of those facts reported once
+    """
+    missing = {(i.instance_prefix, i.subject) for i in issues if i.code == "ports-missing-file"}
+    cellars = [i.subject for i in issues if i.code == "ports-usr-local-cellar" and i.subject]
+
+    def told(issue: Issue) -> bool:
+        if issue.code != "ports-diagnose-warning":
+            return False
+        if issue.subject != issue.instance_prefix:
+            return (issue.instance_prefix, issue.subject) in missing
+        return any(cellar in line for cellar in cellars for line in issue.evidence)
+
+    return [i for i in issues if not told(i)]
 
 
 def recompute_leaves(prefix: str, runner, bundle) -> list[Issue]:
@@ -1553,7 +1566,7 @@ def needs_terminal_answer(issue: Issue) -> bool:
     @param issue  the finding
     @returns      True when the user answers its prompt on a terminal
     """
-    if not issue.remedies:
+    if all(a.manual for a in issue.remedies):
         return False
     if issue.code in ("ports-inactive-versions", "ports-unrequested-leaf", "ports-unregistered-file"):
         return True
@@ -1628,7 +1641,7 @@ def _linkage_clean(runner, bundle, inst: Instance, name: str, binaries: list[str
     wanted = _wanted_archs(runner.host_arch, inst)
     for path, item in (report.get("binaries") or {}).items():
         refs = item.get("references") or []
-        if any(ref.get("class") == "missing" for ref in refs) or arch_gaps(path, refs, wanted):
+        if any(ref.get("class") == "missing" for ref in refs) or macho.arch_gaps(path, refs, wanted):
             return False
     return True
 
@@ -1677,27 +1690,37 @@ def verify(issue: Issue, runner, bundle) -> bool | None:
 # Manager repairs ------------------------------------------------------------------------------
 
 class _Report:
-    """The report lines of one manager repair, also shown on the console as they come"""
+    """The report lines of one manager repair, shown as they come"""
 
-    def __init__(self, code: str, prefix: str, console) -> None:
+    def __init__(self, show: Callable[[str], None] | None) -> None:
         """Start an empty report
 
-        @param code     the repair's finding code, which starts every line
-        @param prefix   the instance's prefix, after the code
-        @param console  where each line is shown as it comes; None shows nothing
+        @param show  prints each line as it comes; None shows nothing
         """
-        self.code, self.prefix, self.console = code, prefix, console
+        self.show = show
         self.lines: list[str] = []
 
     def __call__(self, text: str) -> None:
-        """Add a line to the report and show it
+        """Add a line to the report and show it, indented under the finding it belongs to
 
-        @param text  the line, without the code and the prefix
+        @param text  the line
         """
-        line = f"{self.code} {self.prefix}: {text}"
-        self.lines.append(line)
-        if self.console is not None:
-            self.console.info(line)
+        self.lines.append(text)
+        if self.show is not None:
+            self.show("  " + text)
+
+    def ran(self, result) -> bool:
+        """Add a command with its result: `ok`, or `failed` with the exit status and the error line
+
+        @param result  the command's result
+        @returns       whether the command worked
+        """
+        if result.exit == 0 and not result.timed_out:
+            self(f"{result.typed} ... ok")
+            return True
+        line = result.error_line()
+        self(f"{result.typed} ... failed (exit {result.exit})" + (f": {line}" if line else ""))
+        return False
 
 
 def _relocate(runner, environ: Mapping[str, str], prefix: str, default_prefix: str,
@@ -1726,7 +1749,8 @@ def _still_holds(code: str, inst: Instance, running: locate.Platform) -> bool:
     taken, that condition holds.
 
     @param code     the repair's finding code
-    @param inst     the MacPorts instance, located again
+    @param inst     the MacPorts instance, located again; for the ports built for another Darwin major, one whose
+                    `port` runs
     @param running  the running platform and its Darwin major
     @returns        True when the repair still has something to do
     """
@@ -1737,10 +1761,8 @@ def _still_holds(code: str, inst: Instance, running: locate.Platform) -> bool:
     if code == "ports-platform-mismatch":
         built = locate.read_autoconf(inst.prefix).get("os_major") or ""
         return inst.usability is Usability.PLATFORM_MISMATCH or (built.isdigit() and int(built) != running[1])
-    if code == "ports-built-for-other-os" and inst.usability is Usability.USABLE:
-        rows = _fresh_rows(inst.portdbpath)
-        return rows is None or any(row.active and _other_major(row.os_major, running[1]) for row in rows)
-    return inst.usability is Usability.USABLE
+    rows = _fresh_rows(inst.portdbpath)
+    return rows is None or any(row.active and _other_major(row.os_major, running[1]) for row in rows)
 
 
 def _probe_run(runner, action: Action):
@@ -1761,9 +1783,8 @@ def _sync(runner, inst: Instance, code: str, say: _Report) -> None:
     @param code    the repair's finding code, for the action id
     @param say     the repair's report
     """
-    result = _probe_run(runner, actions.sync(inst, runner.host_arch, action_id(code, inst.prefix, "sync")))
-    outcome = "done" if result.exit == 0 else f"exited {result.exit}; run brew-ports plan --refresh later"
-    say(f"sudo port -N sync {outcome}")
+    if not say.ran(_probe_run(runner, actions.sync(inst, runner.host_arch, action_id(code, inst.prefix, "sync")))):
+        say(f"MacPorts' package list was not updated. Run `{_port(inst, 'sync')}` later.")
 
 
 def _confirm_procedure(runner, confirm: Callable[[str], bool], say: _Report) -> str | None:
@@ -1778,7 +1799,7 @@ def _confirm_procedure(runner, confirm: Callable[[str], bool], say: _Report) -> 
     steps = bootstrap.describe(bootstrap.macos_major(version))
     if not confirm("\n".join(["The MacPorts base package procedure:"] + ["  " + s for s in steps]
                              + ["Run it now?"])):
-        say("the base package procedure was declined; nothing changed")
+        say("Nothing changed.")
         return None
     return version
 
@@ -1881,101 +1902,202 @@ def _migrate(runner, run_dir: RunDir, environ: Mapping[str, str], inst: Instance
     try:
         rows, services, directory = _migrate_records(runner, run_dir, environ, inst)
     except (registry.RegistryBusy, sqlite3.DatabaseError, OSError, _NoBackup) as exc:
-        say(f"the registry backup failed ({type(exc).__name__}: {exc}); migrate --all was not run")
+        say(f"MacPorts' record of installed ports could not be saved first ({exc}), so `port migrate` was not run.")
         return
-    say(f"registry backup, installed.txt and services.json written to {directory}")
+    say(f"Saved MacPorts' record of installed ports in {tilde(directory)}.")
     loaded: dict[str, str] = {}
     for svc in services:
         if svc.owned and svc.package and svc.package_kind == "port" and svc.loaded:
             loaded.setdefault(svc.package.lower(), svc.package)
     result = _probe_run(runner, actions.migrate_all(inst, host, action_id(code, inst.prefix, "migrate")))
-    say(f"sudo port -N migrate --all exited {result.exit}")
+    say.ran(result)
     after = _fresh_rows(inst.portdbpath)
+    before = os.path.join(directory, "installed.txt")
     if after is None:
-        say(f"the registry cannot be read after migrate; compare with {os.path.join(directory, 'installed.txt')}")
+        say(f"MacPorts' record cannot be read after `port migrate`. {tilde(before)} lists what was installed.")
     else:
         active_after = {r.name.lower() for r in after if r.active}
         trace = bool(brew_locate.candidate_prefixes(environ))
-        for row in rows:
-            if row.active and row.name.lower() not in active_after:
-                line = actions.install(inst, host, action_id(code, os.path.join(inst.prefix, row.name), "reinstall"),
-                                       row.name,
-                                       row.requested_variant_tokens, homebrew_present=trace, binary_first=False)
-                say(f"{row.name} {row.spec_args[1]} was active before migrate and is inactive after it: "
-                    f"sudo {shlex.join(line.argv)}")
+
+        def install(row: registry.PortRow) -> str:
+            line = actions.install(inst, host, action_id(code, os.path.join(inst.prefix, row.name), "reinstall"),
+                                   row.name, row.requested_variant_tokens, homebrew_present=trace, binary_first=False)
+            return typed(line.argv, True)
+        _not_back(say, [r for r in rows if r.active and r.name.lower() not in active_after],
+                  sum(1 for r in rows if r.active), before, install)
         for key, name in sorted(loaded.items()):
             if key not in active_after:
                 continue
             load = _probe_run(runner, actions.load(inst, host, action_id(code, os.path.join(inst.prefix, name), "load"),
                                                    name))
-            outcome = "loaded again" if load.exit == 0 else f"not loaded: sudo port -N load {name} exited {load.exit}"
-            say(f"startup item of {name} {outcome}")
+            say(f"The service of {name} runs again." if load.exit == 0
+                else f"The service of {name} did not start: `{load.typed}` failed (exit {load.exit}).")
     if then_sync:
         _sync(runner, _relocate(runner, environ, inst.prefix, default_prefix, platform) or inst, code, say)
     if result.exit != 0:
         raise ActionFailed(result)
 
 
-def manager_repair(issue: Issue, runner, run_dir: RunDir, environ: Mapping[str, str], console, *,
-                   confirm: Callable[[str], bool], default_prefix: str = locate.DEFAULT_PREFIX,
-                   platform: locate.Platform | None = None) -> list[str]:
+def _not_back(say: _Report, lost: Sequence[registry.PortRow], used: int, before: str,
+              install: Callable[[registry.PortRow], str]) -> None:
+    """Report the ports that were in use before `port migrate` and are not in use after it
+
+    @param say      the repair's report
+    @param lost     the rows that were active before and are not after
+    @param used     how many rows were active before
+    @param before   the file that lists what was installed before
+    @param install  returns the command that installs a row's port again, as the user would type it
+    """
+    if not lost:
+        say(f"All {counted(used, 'port')} that were in use are in use again." if used else "No port was in use.")
+        return
+    one = len(lost) == 1
+    say(f"{counted(len(lost), 'port')} that {'was' if one else 'were'} in use {'is' if one else 'are'} not in use "
+        f"again: {some(row.name for row in lost)}")
+    for row in lost[:NAMES_SHOWN]:
+        say(f"  To bring {row.name} back: {install(row)}")
+    if len(lost) > NAMES_SHOWN:
+        say(f"  {tilde(before)} lists them all, with their versions.")
+
+
+@dataclass
+class _Repair:
+    """What one manager repair works with: the finding, the runner, the run directory and where the instance lies"""
+
+    issue: Issue
+    runner: Any
+    run_dir: RunDir
+    environ: Mapping[str, str]
+    default_prefix: str
+    platform: locate.Platform | None
+    say: _Report
+
+    def relocate(self) -> Instance | None:
+        """Locate the finding's instance again
+
+        @returns  the instance; None when it is gone
+        """
+        return _relocate(self.runner, self.environ, self.issue.instance_prefix or "", self.default_prefix,
+                         self.platform)
+
+    def migrate(self, inst: Instance, then_sync: bool) -> None:
+        """Run `migrate --all` on an instance, with its records and its report
+
+        @param inst           the MacPorts instance
+        @param then_sync      run `port sync` after the migration
+        @throws ActionFailed  `migrate --all` exited non-zero
+        """
+        _migrate(self.runner, self.run_dir, self.environ, inst, self.issue.code, say=self.say,
+                 default_prefix=self.default_prefix, platform=self.platform, then_sync=then_sync)
+
+    def verdict(self) -> bool:
+        """Say whether the repair worked, read from the instance located again
+
+        @returns  True when the finding's condition is gone and `port` runs
+        """
+        running = self.platform or locate.running_platform()
+        inst = self.relocate()
+        if inst is None:
+            self.say(f"No MacPorts is found at {self.issue.instance_prefix} any more.")
+            return False
+        if self.issue.code == "ports-built-for-other-os" and inst.drivable:
+            fixed = not _still_holds(self.issue.code, inst, running)
+            self.say("Every port in use is built for this version of macOS." if fixed
+                     else "Some ports in use are still built for another version of macOS.")
+            return fixed
+        self.say(f"The `port` command of {at(inst)} works." if inst.drivable else _port_fails(inst, "still "))
+        return inst.drivable
+
+
+def _port_fails(inst: Instance, still: str = "") -> str:
+    """Return the sentence that says an installation's `port` command cannot run, with what the probe found
+
+    @param inst   the MacPorts instance
+    @param still  `still ` after a repair that was to make it run
+    @returns      the sentence
+    """
+    detail = (inst.usability_detail or "").strip().splitlines()[:1]
+    return f"The `port` command of {at(inst)} {still}cannot run" + (f": {detail[0]}" if detail else ".")
+
+
+def manager_repair(issue: Issue, runner, run_dir: RunDir, environ: Mapping[str, str],
+                   show: Callable[[str], None] | None, *, confirm: Callable[[str], bool],
+                   default_prefix: str = locate.DEFAULT_PREFIX,
+                   platform: locate.Platform | None = None) -> tuple[list[str], bool | None]:
     """Run one of the `MANAGER_REPAIRS`, confirmed by the caller
 
     The instance is located again first and a cleared condition is skipped; `confirm(text)` is asked
     before a base package procedure, and a failed step raises, `migrate --all` only after its report.
+    Ports are built again only by a `port` that runs.
 
     @param issue            the finding, whose code names the repair
     @param runner           the runner that runs the repair
     @param run_dir          the run directory that keeps the records and the downloads
     @param environ          the environment the instances are located with
-    @param console          where each report line is shown as it comes; None shows nothing
+    @param show             prints each report line as it comes; None shows nothing
     @param confirm          asks the user a question and returns the answer
     @param default_prefix   the default MacPorts prefix
     @param platform         the running platform; None reads it from the host
-    @returns                the report lines
+    @returns                the report lines, and whether the repair cleared the finding's condition; None when
+                            that condition was gone before any step ran
     @throws ActionFailed    a `port` step or the installer failed; `migrate --all` raises after its report
     @throws BootstrapError  the base package cannot be had, is not signed by a pinned signer, or leaves no instance
     """
     if issue.code not in MANAGER_REPAIRS or not issue.instance_prefix:
         raise ValueError(f"{issue.code} is not a MacPorts manager repair")
-    say = _Report(issue.code, issue.instance_prefix, console)
-    running = platform or locate.running_platform()
-    inst = _relocate(runner, environ, issue.instance_prefix, default_prefix, platform)
+    say = _Report(show)
+    repair = _Repair(issue, runner, run_dir, environ, default_prefix, platform, say)
+    inst = repair.relocate()
     if inst is None:
-        say("no MacPorts instance is found there any more")
-        return say.lines
-    if not _still_holds(issue.code, inst, running):
-        say(f"the condition has cleared (MacPorts there is {inst.usability.value}); nothing to do")
-        return say.lines
-    host = runner.host_arch
-    mismatch = issue.code == "ports-platform-mismatch"
-    if issue.code == "ports-registry-schema-update":
-        runner.run(actions.version(inst, host, action_id(issue.code, inst.prefix, "version"), sudo=True))
-        relocated = _relocate(runner, environ, inst.prefix, default_prefix, platform)
-        say(f"sudo port -N version done; MacPorts there is {relocated.usability.value if relocated else 'not found'}")
-        return say.lines
+        say(f"No MacPorts is found at {issue.instance_prefix} any more.")
+        return say.lines, False
+    if issue.code == "ports-built-for-other-os" and not inst.drivable:
+        say(_port_fails(inst))
+        say("Its ports were not built again.")
+        return say.lines, False
+    if not _still_holds(issue.code, inst, platform or locate.running_platform()):
+        say("Nothing to do: this is in order already.")
+        return say.lines, None
+    return say.lines, _repair(repair, inst, confirm) and repair.verdict()
+
+
+def _repair(repair: _Repair, inst: Instance, confirm: Callable[[str], bool]) -> bool:
+    """Run the steps of a manager repair on the instance located again
+
+    @param repair           the repair
+    @param inst             the instance, on which the finding's condition holds
+    @param confirm          asks the user a question and returns the answer
+    @returns                whether the steps ran; False when the repair is the user's to make, or was declined
+    @throws ActionFailed    a `port` step or the installer failed; `migrate --all` raises after its report
+    @throws BootstrapError  the base package cannot be had, is not signed by a pinned signer, or leaves no instance
+    """
+    code, runner, say = repair.issue.code, repair.runner, repair.say
+    mismatch = code == "ports-platform-mismatch"
+    if code == "ports-registry-schema-update":
+        say.ran(runner.run(actions.version(inst, runner.host_arch, action_id(code, inst.prefix, "version"),
+                                           sudo=True)))
+        return True
     migrate_ready = "migrate" in inst.features and bool(inst.binary)
-    if issue.code == "ports-built-for-other-os" or (mismatch and migrate_ready):
+    if code == "ports-built-for-other-os" or (mismatch and migrate_ready):
         if not migrate_ready:
-            say(f"base {inst.version or ''} has no port migrate: "
-                "run sudo port selfupdate, then sudo port -N migrate --all")
-            return say.lines
-        _migrate(runner, run_dir, environ, inst, issue.code, say=say, default_prefix=default_prefix, platform=platform,
-                 then_sync=True)
-        return say.lines
-    if not _at_default(inst, default_prefix):
-        say(_source_build_note(issue.code, inst, ", then run sudo port -N migrate --all"
-                               if mismatch else "").description)
-        return say.lines
+            say(_too_old(inst))
+            return False
+        repair.migrate(inst, then_sync=True)
+        return True
+    if not _at_default(inst, repair.default_prefix):
+        say(_source_build_note(code, inst, mismatch).description)
+        return False
     version = _confirm_procedure(runner, confirm, say)
     if version is None:
-        return say.lines
-    new = bootstrap.bootstrap(runner, run_dir, environ, host, macos_version=version, default_prefix=default_prefix)
-    say(f"MacPorts base {new.version or ''} installed and synced; MacPorts there is {new.usability.value}")
+        return False
+    say("Downloading MacPorts' installer, checking its signature and running it. This can take a few minutes.")
+    new = bootstrap.bootstrap(runner, repair.run_dir, repair.environ, runner.host_arch, macos_version=version,
+                              default_prefix=repair.default_prefix)
+    say(f"MacPorts{_release_of(new)} is installed at {new.prefix}, with its package list.")
     if mismatch:
         if "migrate" not in new.features:
-            say(f"the new base {new.version or ''} has no port migrate")
-            return say.lines
-        _migrate(runner, run_dir, environ, new, issue.code, say=say, default_prefix=default_prefix, platform=platform,
-                 then_sync=False)
-    return say.lines
+            say(f"MacPorts{_release_of(new)} has no `port migrate`, so the ports were not built again for this "
+                "version of macOS.")
+            return True
+        repair.migrate(new, then_sync=False)
+    return True

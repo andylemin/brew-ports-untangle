@@ -16,7 +16,7 @@ from .context import Context
 from .exec_run import (DECLINED, EXIT_ACTION, EXIT_OK, EXIT_PREFLIGHT, EXIT_USAGE, EXIT_VERIFY, PLAN_FILE, SOURCE_BIN,
                        START, Run, Stop, module, phase6_prefixes)
 from .model import Instance, Manager, Plan, is_recorded_as
-from .report import COMMAND_OF, at, counted, some, tilde, typed
+from .report import COMMAND_OF, at, counted, series, some, tilde, typed
 from .runner import ActionFailed, BaseRunner, EscalationFailed, Interrupted, PreflightError, command_runner
 
 # Phase 0 -------------------------------------------------------------------------------------
@@ -52,9 +52,9 @@ def blocking_lines(run: Run) -> list[str]:
     found = doctor.blocking(run.issues, plan_context(run))
     if run.resumed and run.past(3):
         found = [i for i in found if i.code != "system-low-disk-space"]
-    lines = doctor.blocked_by_lines(found)
+    lines = doctor.blocked_by_lines(found, run.bundle.result.instances if run.bundle is not None else run.instances)
     if any((i.auto_fix or i.confirm_each) and any(not a.manual for a in i.remedies) for i in found):
-        lines.append(f"  `brew-ports doctor --fix` runs the fixes it can; {NEW_PLAN} afterwards.")
+        lines.append(f"  After `brew-ports doctor --fix`, {NEW_PLAN}.")
     return lines
 
 
@@ -243,21 +243,6 @@ def rc_files(bundle) -> list[str]:
     return [f["path"] for f in files if isinstance(f, dict) and f.get("exists") and f.get("path")]
 
 
-def unsaved_parts(path: str | None) -> set[str]:
-    """Return the parts of the undo record that its notes file says could not be saved
-
-    @param path  the notes file, or None when the record has none
-    @returns     the different notes; none when there is no file or it cannot be read
-    """
-    if path is None:
-        return set()
-    try:
-        with open(path, encoding="utf-8") as fh:
-            return {line.strip() for line in fh if line.strip()}
-    except OSError:
-        return set()
-
-
 def snapshot_phase(run: Run) -> None:
     """Run phase 1, skipped as a whole once its completion marker exists
 
@@ -275,11 +260,8 @@ def snapshot_phase(run: Run) -> None:
         written = snapshot.write(run.runner, run.run_dir, run.bundle, snapshot_instances(run),
                                  rc_files=rc_files(run.bundle), id_prefix="1", uid=run.uid)
     run.say("  " + apply_report.record(False))
-    missing = unsaved_parts(written.get(snapshot.NOTES))
-    no_disk = {note for note in missing if note.startswith(snapshot.DISK_NOTE)}
-    if len(missing) > len(no_disk):
-        run.say("  " + apply_report.unsaved(len(missing) - len(no_disk)))
-    run.say("  " + (apply_report.NO_DISK_SNAPSHOT if no_disk else apply_report.DISK_SNAPSHOT))
+    for line in snapshot.outcome(written):
+        run.say("  " + line)
 
 
 # Phase 4 -------------------------------------------------------------------------------------
@@ -351,7 +333,7 @@ def remove_managers(run: Run) -> None:
     if not named:
         return
     several = len(named) > 1
-    names = apply_report.series(at(inst) if (inst := run.instance(p)) is not None else p for p in named)
+    names = series(at(inst) if (inst := run.instance(p)) is not None else p for p in named)
     stays = f"  {names} {'stay' if several else 'stays'} installed, as you answered"
     if run.managers_stay:
         run.say(stays + ".")

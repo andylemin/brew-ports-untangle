@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import glob
 import os
+import shlex
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -16,7 +17,8 @@ from typing import TYPE_CHECKING, Any
 from .. import env, model, system
 from ..env import linkage as env_linkage, services as env_services, shell as env_shell
 from ..model import Action, Blocks, Issue, OnFailure, Package, Severity
-from ..report import limited
+from ..report import (MOVE_OUT, NAMES_SHOWN, NOT_CHECKED, at, by_kind, counted, limited, offered, series, some,
+                      tilde)
 from ..runner import BREW_DENY, BREW_DENY_PREFIXES, BREW_SET, RM
 from ..state import slug
 from . import actions, inventory, locate
@@ -65,33 +67,6 @@ SEVERITY = {
     "brew-root-owned-keg": Severity.HIGH,
     "brew-env-override": Severity.HIGH,
 }
-TITLES = {
-    "brew-several-prefixes": "More than one Homebrew prefix",
-    "brew-unusable-or-dirty": "brew cannot run or repository dirty",
-    "brew-stale-catalogue": "Offline catalogue missing or older than 7 days",
-    "brew-keg-without-receipt": "Keg without receipt",
-    "brew-deleted-formula": "Keg of a deleted formula",
-    "brew-deprecated-formula": "Deprecated or disabled formula installed",
-    "brew-unlinked-keg": "Non-keg-only formula unlinked",
-    "brew-broken-symlink": "Broken symlink in the prefix",
-    "brew-several-versions": "Several versions of one formula",
-    "brew-missing-dependency": "Missing dependency",
-    "brew-broken-linkage": "Broken linkage",
-    "brew-outdated-keg": "Outdated keg",
-    "brew-pinned-formula": "Pinned formula",
-    "brew-dirty-tap": "Tap with local changes",
-    "brew-unwritable-prefix": "Prefix directories not writable by the user",
-    "brew-orphan-service": "Owned service plist for a formula that is gone",
-    "brew-missing-app": "Cask app bundle missing",
-    "brew-orphan-caskroom": "Caskroom directory without a cask",
-    "brew-strays-in-usr-local": "Stray files in /usr/local",
-    "brew-path-order": "PATH order wrong for Homebrew",
-    "brew-renamed-keg": "Keg under a renamed formula name",
-    "brew-degraded-inventory": "Homebrew inventory degraded to the disk walk",
-    "brew-failed-probe": "A brew inventory probe failed after brew info",
-    "brew-root-owned-keg": "Keg paths owned by root after sudo brew services start",
-    "brew-env-override": "A brew.env file changes what the brew profile sets",
-}
 BLOCKS = {
     "brew-unusable-or-dirty": (Blocks.TARGET,),
     "brew-unwritable-prefix": (Blocks.TARGET, Blocks.UNINSTALL),
@@ -112,12 +87,18 @@ DOCTOR_HEADLINES = {
     "check_for_stray_las": "Unbrewed '.la' files were found in /usr/local/lib.",
     "check_for_stray_headers": "Unbrewed header files were found in /usr/local/include.",
 }
-STRAY = {   # stray-file check -> (directory, title)
-    "check_for_stray_dylibs": ("/usr/local/lib", "Stray dylibs in /usr/local/lib"),
-    "check_for_stray_static_libs": ("/usr/local/lib", "Stray static libraries in /usr/local/lib"),
-    "check_for_stray_pcs": ("/usr/local/lib/pkgconfig", "Stray .pc files in /usr/local/lib/pkgconfig"),
-    "check_for_stray_las": ("/usr/local/lib", "Stray .la files in /usr/local/lib"),
-    "check_for_stray_headers": ("/usr/local/include", "Stray headers in /usr/local/include"),
+STRAY = {   # stray-file check -> (directory, what the files are)
+    "check_for_stray_dylibs": ("/usr/local/lib", "libraries"),
+    "check_for_stray_static_libs": ("/usr/local/lib", "static libraries"),
+    "check_for_stray_pcs": ("/usr/local/lib/pkgconfig", ".pc files"),
+    "check_for_stray_las": ("/usr/local/lib", ".la files"),
+    "check_for_stray_headers": ("/usr/local/include", "header files"),
+}
+MOVE_FINDS_IT = "A move out of this Homebrew looks up the replacement itself."
+LOADS = {   # the class of a library reference that the linkage scan calls broken -> what the binary does with it
+    "missing": "needs %s, which is missing",
+    "other": "loads %s from another installation",
+    "usrlocal": "loads %s from /usr/local",
 }
 
 _now: Callable[[], float] = time.time
@@ -215,6 +196,14 @@ class _Brew:
         """
         return self.inst.prefix
 
+    @property
+    def at(self) -> str:
+        """Return the installation as the report names it
+
+        @returns  such as `Homebrew at /opt/homebrew`
+        """
+        return at(self.inst)
+
     def packages(self, kind: str) -> list[Package]:
         """Return the instance's packages of one kind, sorted by name
 
@@ -247,30 +236,32 @@ class _Brew:
         return out
 
     def quote(self, check: str, items: Sequence[str]) -> list[str]:
-        """Quote Homebrew's own headline when its check lists one of `items`
+        """Say that Homebrew's own check lists one of `items`
 
         @param check  the `brew doctor` check
         @param items  the paths or names the finding is about
-        @returns      `brew doctor: <headline>` as a one-item list, or an empty list
+        @returns      the sentence as a one-item list, or an empty list
         """
         if self.doctor is not None and any(self.doctor.lists(check, item) for item in items):
-            return [f"brew doctor: {self.doctor.warnings[check][0]}"]
+            return ["`brew doctor` reports it too"]
         return []
 
     def cannot_run(self) -> str:
-        """Return the evidence line of an instance that `brew` cannot drive
+        """Return why nothing can be asked of the installation's `brew`
 
-        @returns  `brew cannot run on <prefix>`, with the usability and the first line of its detail
+        @returns  `its `brew` command cannot run`, with the first line of what the probes found
         """
         detail = (self.inst.usability_detail or "").strip().splitlines()
-        return f"brew cannot run on {self.prefix} ({self.inst.usability.value}{': ' + detail[0] if detail else ''})"
+        return "its `brew` command cannot run" + (f": {detail[0]}" if detail else "")
 
-    def undrivable(self) -> str:
-        """Return the evidence line of a finding on an undrivable instance, which gets no `brew` remedy
+    def no_fix(self, code: str, item: str) -> Action:
+        """Return the note of a finding whose fix is a `brew` command, on an installation whose `brew` cannot run
 
-        @returns  the `cannot_run` text, then that no brew remedy is offered
+        @param code  the finding's code
+        @param item  the path the fix would act on, for the action id
+        @returns     the note
         """
-        return self.cannot_run() + ": no brew remedy is offered"
+        return _note(code, item, f"No fix until the `brew` command of {self.at} runs.", "no-brew")
 
 
 @dataclass
@@ -354,6 +345,24 @@ def _steps(issue: Issue) -> set[str]:
     return {_step(a) for a in issue.remedies if not a.manual}
 
 
+def _runs(remedies: Sequence[Action]) -> bool:
+    """Return whether one of the remedies is a command that the tool runs
+
+    @param remedies  the remedies of a finding
+    @returns         False when every one of them is a note or a command for the user
+    """
+    return any(not a.manual for a in remedies)
+
+
+def _each(paths: Sequence[str]) -> list[str]:
+    """Return paths as evidence lines, for a finding whose first evidence line names only the first of them
+
+    @param paths  the paths
+    @returns      one line per path, cut at the evidence limit; none when that first line names them all
+    """
+    return limited(list(paths)) if len(paths) > NAMES_SHOWN else []
+
+
 def _note(code: str, item: str, text: str, step: str = "note") -> Action:
     """Build a manual remedy, printed verbatim and never run
 
@@ -385,38 +394,40 @@ def _command(code: str, item: str, step: str, argv: list[str], description: str,
 
 
 def _issue(code: str, subject: str | None, brew: _Brew | None, evidence: Sequence[str],
-           remedies: Sequence[Action] = (), *, title: str | None = None, auto_fix: bool = False,
+           remedies: Sequence[Action] = (), *, title: str, auto_fix: bool = False,
            confirm_each: bool = False, repairs_install: bool = False) -> Issue:
-    """Build a finding with its code's severity, title and blocked plan contexts
+    """Build a finding with its code's severity and blocked plan contexts
 
     @param code             the finding's code
     @param subject          the package, path or service it is about, or None
     @param brew             the instance it is about, or None for a host-wide finding
     @param evidence         the lines that show it
     @param remedies         the actions that fix it, in order
-    @param title            a title other than the code's own in `TITLES`, or None
+    @param title            a sentence that names what the finding is about
     @param auto_fix         `doctor --fix` applies it without a per-item prompt
     @param confirm_each     `doctor --fix` applies it after a per-item prompt
     @param repairs_install  apply phase 2 applies it when the subject is a plan target or its dependency
     @returns                the finding
     """
-    return Issue(code=code, severity=SEVERITY[code], title=title or TITLES[code], subject=subject,
+    return Issue(code=code, severity=SEVERITY[code], title=title, subject=subject,
                  instance_prefix=brew.prefix if brew else None, evidence=list(evidence), remedies=list(remedies),
                  auto_fix=auto_fix, confirm_each=confirm_each, repairs_install=repairs_install,
                  blocks=BLOCKS.get(code, ()))
 
 
-def _skipped(code: str, brew: _Brew | None, text: str, subject: str | None = None) -> Issue:
+def _skipped(code: str, brew: _Brew | None, what: str, why: str, subject: str | None = None) -> Issue:
     """Return an INFO finding for a check that did not run, so its silence never reads as a pass
 
     @param code     the code of the check
     @param brew     the instance the check could not judge, or None
-    @param text     why the check did not run
+    @param what     what the check would have told, as the words that follow `Not checked: `
+    @param why      why the check did not run; each line of the text is one evidence line
     @param subject  what the check is about, or None
     @returns        the finding
     """
-    return Issue(code=code, severity=Severity.INFO, title=f"{TITLES[code]}: not evaluated", subject=subject,
-                 instance_prefix=brew.prefix if brew else None, evidence=[text], remedies=[], auto_fix=False,
+    return Issue(code=code, severity=Severity.INFO, title=NOT_CHECKED + what, subject=subject,
+                 instance_prefix=brew.prefix if brew else None,
+                 evidence=[line.strip() for line in why.splitlines() if line.strip()], remedies=[], auto_fix=False,
                  confirm_each=False, repairs_install=False, blocks=())
 
 
@@ -428,24 +439,26 @@ def _stash_actions(code: str, directory: str, run_dir) -> list[Action]:
 
     @param code       the finding's code
     @param directory  the repository or tap
-    @param run_dir    the run directory, or None to print the commands with `<run>` placeholders
-    @returns          the stash, the patch and the recovery note
+    @param run_dir    the run directory; None gives the two commands for the user to run, with no patch file
+    @returns          the stash, the patch and the command that brings the changes back
     """
     manual = run_dir is None
-    run_id = "<run-id>" if manual else run_dir.run_id
-    patch = os.path.join("<run>" if manual else run_dir.path, "data-archive", slug(directory) + ".stash.patch")
     identity = [arg for pair in STASH_IDENTITY for arg in ("-c", pair)]
     stash = Action(action_id=action_id(code, directory, "stash"), kind="command",
-                   argv=[GIT] + identity + ["-C", directory, "stash", "push", "--include-untracked",
-                                            "-m", "brew-ports " + run_id],
-                   sudo=False, description=f"stash the local changes of {directory}", manual=manual)
+                   argv=[GIT] + identity + ["-C", directory, "stash", "push", "--include-untracked", "-m",
+                                            "brew-ports" if manual else "brew-ports " + run_dir.run_id],
+                   sudo=False, description="Set the changes aside", manual=manual)
     show = Action(action_id=action_id(code, directory, "patch"), kind="command",
                   argv=[GIT, "-C", directory, "stash", "show", "-p", "--include-untracked", "stash@{0}"],
-                  sudo=False, description=f"keep the stashed changes as {patch}", read_only=True, dst=patch,
-                  manual=manual)
-    recover = _note(code, directory, f"to restore the changes: git -C {directory} stash pop (or apply {patch})",
-                    "recover")
-    return [stash, show, recover]
+                  sudo=False, description="Look at them", read_only=True, manual=manual,
+                  dst=None if manual else os.path.join(run_dir.path, "data-archive", slug(directory) + ".stash.patch"))
+    recover = Action(action_id=action_id(code, directory, "recover"), kind="command",
+                     argv=[GIT, "-C", directory, "stash", "pop"], sudo=False,
+                     description="To get the changes back afterwards", manual=True)
+    if manual:
+        return [stash, show, recover]
+    return [_note(code, directory, offered("sets the changes aside with `git stash` and saves a copy of them in the "
+                                           "run folder"), "offer"), stash, show, recover]
 
 
 # Prefixes, repositories and the catalogue ---------------------------------------------
@@ -458,35 +471,57 @@ def _several_prefixes(ctx: _Scan) -> list[Issue]:
     """
     if len(ctx.brews) < 2:
         return []
-    evidence = [f"{b.prefix}: {b.inst.usability.value}" + (f", Homebrew {b.inst.version}" if b.inst.version else "")
-                for b in ctx.brews]
-    evidence.append("every instance other than a plan's target is a source of that plan")
-    return [_issue("brew-several-prefixes", None, None, evidence)]
+    evidence = [f"{b.at}: {by_kind(p.kind for p in b.inv.packages) or 'no packages'}" for b in ctx.brews]
+    target = locate.choose_target(ctx.bundle.result.instances, ctx.host_arch, None, ctx.environ)
+    into = (f"`brew-ports plan --target brew` plans a move of every package of the other installations into "
+            f"{at(target)}; `--target-prefix` names another Homebrew" if target is not None
+            else "`brew-ports plan --target brew --target-prefix` with the folder of the Homebrew you keep plans a "
+                 "move of every package of the other installations into it")
+    note = _note("brew-several-prefixes", "host", f"Nothing to do. To merge them, {into}.")
+    return [_issue("brew-several-prefixes", None, None, evidence, [note],
+                   title=f"This Mac has {len(ctx.brews)} Homebrew installations")]
+
+
+def _cannot_run(brew: _Brew, host_arch: str) -> Issue:
+    """Report an installation whose `brew` is missing or fails, which stops a move into it
+
+    @param brew       the installation
+    @param host_arch  the host's architecture
+    @returns          the finding, with the command that shows the user what Homebrew itself says
+    """
+    code = "brew-unusable-or-dirty"
+    binary = brew.inst.binary or os.path.join(brew.prefix, "bin", "brew")
+    detail = (brew.inst.usability_detail or "").strip().splitlines()
+    if brew.inst.binary is None:
+        fix = _note(code, binary, "Fix: install Homebrew there again, or leave it as it is and let a move delete it.")
+    else:
+        fix = actions.manual(brew.inst, action_id(code, binary, "manual"), ["config"],
+                             "Fix: run it yourself and do what Homebrew asks for", host_arch)
+    return _issue(code, binary, brew, detail[:1] or [f"`{binary} config` fails"],
+                  [fix, _note(code, binary, MOVE_OUT % brew.prefix, "leaving")],
+                  title=f"The `brew` command of {brew.at} cannot run")
 
 
 def _unusable_or_dirty(ctx: _Scan) -> list[Issue]:
     """Report a `brew` that cannot run, or a repository whose lock-free `git status` is not empty
 
     @param ctx  the scan
-    @returns    the findings, with a not-evaluated one for each repository whose `git status` failed
+    @returns    the findings, with a not-checked one for each repository whose `git status` failed
     """
     out: list[Issue] = []
     for b in ctx.brews:
-        if b.inst.usability is model.Usability.CANNOT_RUN:
-            out.append(_issue("brew-unusable-or-dirty", b.inst.binary or os.path.join(b.prefix, "bin", "brew"), b,
-                              [b.inst.usability_detail or "brew cannot run",
-                               "the instance is undrivable: no plan targets it or uninstalls its packages with brew"],
-                              title="brew cannot run"))
+        if not b.inst.drivable:
+            out.append(_cannot_run(b, ctx.host_arch))
         repo = b.inst.repository or locate.repository_of(b.prefix)
         if not os.path.lexists(os.path.join(repo, ".git")):
             continue
         res = ctx.runner.run(inventory.git_status_probe(repo, f"0.brew.{slug(b.prefix)}.repository"))
         if res.exit != 0 or res.timed_out:
-            out.append(_skipped("brew-unusable-or-dirty", b,
-                                f"local changes in {repo}: {locate.failure_text(res, 'git status')}", repo))
+            out.append(_skipped("brew-unusable-or-dirty", b, f"whether Homebrew's own files in {repo} were changed",
+                                locate.failure_text(res, "`git status`"), repo))
         elif res.stdout().strip():
             out.append(_dirty(ctx, "brew-unusable-or-dirty", b, repo, repo, status=res.stdout(),
-                              title="Homebrew repository has local changes"))
+                              title=f"Homebrew's own files in {repo} were changed"))
     return out
 
 
@@ -502,10 +537,11 @@ def _dirty(ctx: _Scan, code: str, brew: _Brew, subject: str, directory: str, *, 
     @param title      the finding's title
     @returns          the finding
     """
-    lines = [line for line in status.splitlines() if line.strip()]
-    evidence = [f"git status --porcelain in {directory}:"] + ["  " + line for line in limited(lines)]
+    files = [line.split(None, 1)[-1] for line in status.splitlines() if line.strip()]
+    evidence = [f"`git status` lists {counted(len(files), 'changed file')}: {some(files)}",
+                "`brew update` can fail over such changes"]
     remedies = _stash_actions(code, directory, ctx.runner.run_dir)
-    return _issue(code, subject, brew, evidence, remedies, title=title, confirm_each=not remedies[0].manual)
+    return _issue(code, subject, brew, evidence, remedies, title=title, confirm_each=_runs(remedies))
 
 
 def _stale_catalogue(ctx: _Scan) -> list[Issue]:
@@ -518,33 +554,56 @@ def _stale_catalogue(ctx: _Scan) -> list[Issue]:
     for b in ctx.brews:
         cat = b.cat
         api = os.path.join(b.inst.cache_dir or locate.default_cache_dir(ctx.environ), "api")
+        evidence: list[str] = []
         if cat is None or cat.source in ("none", "names"):
+            title = "Homebrew's package list is missing"
             if cat is not None and cat.load_error:
-                evidence = [f"the API file could not be read: {cat.load_error}"]
+                evidence = [f"its file cannot be read: {cat.load_error}"]
             else:
-                evidence = [f"no {os.path.join(api, 'internal', 'packages.*.jws.json')} for this architecture"]
+                evidence = [f"there is no {os.path.join(api, 'internal', 'packages.*.jws.json')} for this Mac"]
             if cat is None or cat.source == "none":
-                evidence.append("deleted formulae and orphan Caskroom directories are not checked without a catalogue")
+                evidence.append("without it, brew-ports cannot tell which installed formulae and casks Homebrew has "
+                                "stopped offering")
         elif cat.source == "taps":
-            frozen = " (HOMEBREW_NO_INSTALL_FROM_API)" if cat.frozen else ""
-            evidence = [f"the homebrew/core tap checkout stands in for the API files{frozen}: homepages, executables, "
-                        "renames and bottle data are unavailable"]
+            title = "Homebrew's package list is read from the homebrew/core tap, which says less about each package"
+            evidence = ["it lacks web pages, the commands each formula provides, new names of renamed formulae and "
+                        "which packages are prebuilt"]
+            if cat.frozen:
+                evidence.append("HOMEBREW_NO_INSTALL_FROM_API is set, so Homebrew does not download the full list")
         elif cat.api_mtime is not None and ctx.now - cat.api_mtime > STALE_S:
-            evidence = [f"{cat.api_file} is {int((ctx.now - cat.api_mtime) // 86400)} days old"]
+            title = f"Homebrew's package list is {int((ctx.now - cat.api_mtime) // 86400)} days old"
         else:
             continue
-        note = _note("brew-stale-catalogue", api, "brew-ports plan --refresh runs brew update for the target instance")
+        if not b.inst.drivable:
+            remedies = [b.no_fix("brew-stale-catalogue", api)]
+        elif cat is not None and cat.source == "taps" and cat.frozen:
+            remedies = [_note("brew-stale-catalogue", api, "Nothing to do if you set that variable on purpose.")]
+        else:
+            remedies = [actions.manual(b.inst, action_id("brew-stale-catalogue", api, "manual"), ["update"], "",
+                                       ctx.host_arch),
+                        _note("brew-stale-catalogue", api, "`brew-ports plan --target brew --refresh` runs it too, "
+                              "for the Homebrew that packages move into.")]
         out.append(_issue("brew-stale-catalogue", (cat.api_file if cat is not None else None) or api, b, evidence,
-                          [note]))
+                          remedies, title=title))
     return out
 
 
 # Receipts and deleted formulae ---------------------------------------------------------
 
+def _words(reason: Any) -> str:
+    """Return Homebrew's reason for a deprecation as words: `repo_archived` reads `repo archived`
+
+    @param reason  the `because` of a formula's `deprecate_args` or `disable_args`, a symbol or a sentence
+    @returns       the reason with its underscores as spaces
+    """
+    return str(reason).replace("_", " ")
+
+
 def _gone(brew: _Brew, pkg: Package) -> tuple[str, str | None] | None:
     """Return `(reason, replacement note or None)` when the catalogue does not know a core or tapless formula
 
-    A formula that migrated to another tap counts as deleted, with that tap in the note.
+    A formula that migrated to another tap counts as deleted, with that tap in the note. The reason is a clause
+    about `it`, which ends a title or stands as an evidence line.
 
     @param brew  the formula's instance
     @param pkg   the installed formula
@@ -559,10 +618,9 @@ def _gone(brew: _Brew, pkg: Package) -> tuple[str, str | None] | None:
     for name in names:
         home = cat.tap_migration(name)
         if home:
-            return (f"{name} moved to {home}",
-                    f"{name} comes from {home}: install it from there before removing this keg; a migration plan "
-                    "maps it")
-    return f"{pkg.name} is in no catalogue name, alias, rename or tap migration", None
+            return (f"Homebrew moved it to the tap {home}",
+                    f"Fix: install {name} from the tap {home}, then uninstall this copy. {MOVE_FINDS_IT}")
+    return "Homebrew's package list does not have it under any name", None
 
 
 def _trusted(brew: _Brew, pkg: Package) -> bool:
@@ -595,10 +653,11 @@ def _unavailable(brew: _Brew, pkg: Package) -> tuple[str, str | None] | None:
     if not refused:
         return None
     replacement = refused.get("replacement_formula") or refused.get("replacement_cask")
-    note = (f"Homebrew names {replacement} as the replacement of {pkg.name}: install it before removing {pkg.name}; "
-            "a migration plan maps it") if replacement else None
-    return (f"Homebrew refuses to reinstall {pkg.name}: disabled since {refused.get('date')} "
-            f"({refused.get('because')})", note)
+    note = (f"Fix: install {replacement}, which Homebrew names as its replacement, then uninstall {pkg.name}. "
+            f"{MOVE_FINDS_IT}") if replacement else None
+    since = f" on {refused['date']}" if refused.get("date") else ""
+    why = f" ({_words(refused['because'])})" if refused.get("because") else ""
+    return f"Homebrew stopped installing it{since}{why}", note
 
 
 def _data_ties(ctx: _Scan, brew: _Brew, pkg: Package) -> str:
@@ -619,12 +678,11 @@ def _data_ties(ctx: _Scan, brew: _Brew, pkg: Package) -> str:
             dirs.extend(d for d in svc.data_dirs if d not in dirs)
     for name in names:
         dirs.extend(d for d in env_services.data_dirs(brew.prefix, name, ()) if d not in dirs)
-    return ", ".join([f"the service {label}" for label in labels] + [f"the data directory {d}" for d in dirs])
+    return series([f"the service {label}" for label in labels] + [f"the data folder {d}" for d in dirs])
 
 
-def _removal_rule(ctx: _Scan, brew: _Brew, pkg: Package, code: str,
-                  replacement: str | None) -> tuple[list[Action], list[str], bool]:
-    """Return the remedy of a deleted or refused formula as `(remedies, extra evidence, whether a removal is offered)`
+def _removal_rule(ctx: _Scan, brew: _Brew, pkg: Package, code: str, replacement: str | None) -> list[Action]:
+    """Return the remedies of a deleted or refused formula: its uninstall, or a note of why there is none
 
     A known replacement gets a note; a formula that owns a service or a data directory is not removed, because
     only its binaries can read that data and no catalogue reinstalls them.
@@ -634,20 +692,19 @@ def _removal_rule(ctx: _Scan, brew: _Brew, pkg: Package, code: str,
     @param pkg          the deleted formula, or one Homebrew refuses to install
     @param code         the finding's code
     @param replacement  the text of the replacement note, or None
-    @returns            the remedies, the extra evidence lines, and whether the remedies remove the formula
+    @returns            the remedies; only an uninstall is a command that runs
     """
     rack = brew.racks(pkg)[0]
     if replacement:
-        return [_note(code, rack, replacement)], [], False
+        return [_note(code, rack, replacement)]
     ties = _data_ties(ctx, brew, pkg)
     if ties:
-        return [], [f"{pkg.name} owns {ties}: only its binaries can read that data and no catalogue reinstalls them, "
-                    "so no removal is offered"], False
+        return [_note(code, rack, f"brew-ports offers no fix: {pkg.name} owns {ties}. Only its own programs can "
+                      "read that data, and Homebrew cannot install them again.")]
     if not brew.inst.drivable:
-        return [], [brew.undrivable()], False
-    uninstall = actions.uninstall_formulae(brew.inst, ctx.host_arch, action_id(code, rack, "uninstall"), [pkg.name],
-                                           on_failure=OnFailure.STOP)
-    return [uninstall], [], True
+        return [brew.no_fix(code, rack)]
+    return [actions.uninstall_formulae(brew.inst, ctx.host_arch, action_id(code, rack, "uninstall"), [pkg.name],
+                                       on_failure=OnFailure.STOP)]
 
 
 def _receiptless(brew: _Brew, pkg: Package) -> list[str]:
@@ -689,20 +746,22 @@ def _receiptless_issue(ctx: _Scan, brew: _Brew, pkg: Package, kegs: list[str]) -
     @returns     the finding
     """
     code = "brew-keg-without-receipt"
-    evidence = [f"no INSTALL_RECEIPT.json in {keg}" for keg in kegs]
+    title = f"{pkg.name} has no install record"
+    evidence = [f"INSTALL_RECEIPT.json, where Homebrew records how it installed a version, is missing from "
+                f"{series(kegs)}", "without it, brew-ports cannot tell whether you installed it yourself"]
     rack = brew.racks(pkg)[0]
     gone = _unavailable(brew, pkg)
     if gone is not None:
         reason, replacement = gone
-        remedies, extra, removal = _removal_rule(ctx, brew, pkg, code, replacement)
-        return _issue(code, pkg.name, brew, evidence + [reason] + extra, remedies, confirm_each=removal)
+        remedies = _removal_rule(ctx, brew, pkg, code, replacement)
+        return _issue(code, pkg.name, brew, evidence + [reason], remedies, title=title, confirm_each=_runs(remedies))
     if not brew.inst.drivable:
-        return _issue(code, pkg.name, brew, evidence + [brew.undrivable()])
+        return _issue(code, pkg.name, brew, evidence, [brew.no_fix(code, rack)], title=title)
     remedies = [actions.reinstall(brew.inst, ctx.host_arch, action_id(code, rack, "reinstall"), [pkg.name])]
     if pkg.requested is not False:
         remedies.append(actions.tab_installed_on_request(brew.inst, ctx.host_arch, action_id(code, rack, "tab"),
                                                          [pkg.name]))
-    return _issue(code, pkg.name, brew, evidence, remedies, confirm_each=True, repairs_install=True)
+    return _issue(code, pkg.name, brew, evidence, remedies, title=title, confirm_each=True, repairs_install=True)
 
 
 def _deleted_formula(ctx: _Scan) -> list[Issue]:
@@ -720,38 +779,45 @@ def _deleted_formula(ctx: _Scan) -> list[Issue]:
             if gone is None or (_receiptless(b, pkg) and _unavailable(b, pkg) is not None):
                 continue
             reason, replacement = gone
-            evidence = [reason] + b.quote("check_deleted_formula", b.names(pkg))
+            evidence = b.quote("check_deleted_formula", b.names(pkg))
             if _trusted(b, pkg):
-                remedies, extra, removal = _removal_rule(ctx, b, pkg, "brew-deleted-formula", replacement)
+                remedies = _removal_rule(ctx, b, pkg, "brew-deleted-formula", replacement)
+                if replacement is None:
+                    evidence.insert(0, "Homebrew can neither upgrade it nor install it again")
+                if _runs(remedies):
+                    remedies.append(_note("brew-deleted-formula", b.racks(pkg)[0], "Leave it if you still use it.",
+                                          "keep"))
             else:
-                remedies, removal = [], False
-                extra = [f"the {b.cat.source} catalogue knows no renames and brew doctor does not list {pkg.name}: "
-                         "no removal is offered"]
-            out.append(_issue("brew-deleted-formula", pkg.name, b, evidence + extra, remedies, confirm_each=removal))
+                remedies = [_note("brew-deleted-formula", b.racks(pkg)[0], "brew-ports offers no fix: the package "
+                                  f"list read here does not record new names, so {pkg.name} may only have been "
+                                  "renamed, and `brew doctor` does not report it.")]
+            out.append(_issue("brew-deleted-formula", pkg.name, b, evidence, remedies,
+                              title=f"{pkg.name} is installed, but {reason}", confirm_each=_runs(remedies)))
     return out
 
 
 # Formula states and kegs -----------------------------------------------------------------
 
-def _lifecycle(cat: Catalogue | None, name: str) -> list[str]:
+def _lifecycle(cat: Catalogue | None, pkg: Package) -> list[str]:
     """Describe the dates, reasons and replacements of a formula's `deprecate_args` and `disable_args`
 
-    @param cat   the instance's catalogue, or None
-    @param name  the formula
-    @returns     one line for each of the two that the entry has
+    @param cat  the instance's catalogue, or None
+    @param pkg  the installed formula
+    @returns    one line for each of the two that the entry has
     """
-    entry = cat.formula(name) if cat is not None else None
+    entry = cat.formula(pkg.name) if cat is not None else None
     out: list[str] = []
-    for key, word in (("deprecate_args", "deprecation"), ("disable_args", "disable")):
+    words = {"deprecate_args": "deprecated", "disable_args": "disabled" if pkg.disabled else "to be disabled"}
+    for key, word in words.items():
         args = plain_keys(entry.get(key)) if entry and isinstance(entry.get(key), dict) else None
         if not args:
             continue
-        text = f"{word} date {args.get('date') or 'unknown'}"
+        text = word + (f" on {args['date']}" if args.get("date") else "")
         if args.get("because"):
-            text += f" ({plain_symbol(args['because'])})"
+            text += f" ({_words(plain_symbol(args['because']))})"
         replacement = args.get("replacement_formula") or args.get("replacement_cask")
         if replacement:
-            text += f"; replacement: {replacement}"
+            text += f"; Homebrew suggests {replacement} instead"
         out.append(text)
     return out
 
@@ -762,14 +828,16 @@ def _deprecated_formula(ctx: _Scan) -> list[Issue]:
     @param ctx  the scan
     @returns    the findings
     """
+    code = "brew-deprecated-formula"
     out: list[Issue] = []
     for b in ctx.brews:
         for pkg in b.packages("formula"):
             if pkg.deprecated or pkg.disabled:
-                state = "disabled" if pkg.disabled else "deprecated"
-                evidence = [f"{pkg.name} is {state}"] + _lifecycle(b.cat, pkg.name)
-                evidence += b.quote("check_deprecated_disabled", b.names(pkg))
-                out.append(_issue("brew-deprecated-formula", pkg.name, b, evidence))
+                title = (f"{pkg.name} is disabled: Homebrew does not install it any more" if pkg.disabled
+                         else f"{pkg.name} is deprecated: Homebrew plans to stop offering it")
+                evidence = _lifecycle(b.cat, pkg) + b.quote("check_deprecated_disabled", b.names(pkg))
+                note = _note(code, b.racks(pkg)[0], "Nothing to do for a formula that still works for you.")
+                out.append(_issue(code, pkg.name, b, evidence, [note], title=title))
     return out
 
 
@@ -779,22 +847,25 @@ def _unlinked_keg(ctx: _Scan) -> list[Issue]:
     @param ctx  the scan
     @returns    the findings
     """
+    code = "brew-unlinked-keg"
     out: list[Issue] = []
     for b in ctx.brews:
         for pkg in b.packages("formula"):
             if pkg.linked or pkg.keg_only:
                 continue
-            evidence = [f"{pkg.name} is neither linked nor keg-only"]
+            title = f"{pkg.name} is installed, but not linked into {b.prefix}"
+            evidence = [f"its commands are not in {b.prefix}/bin, and its libraries not in {b.prefix}/lib"]
             evidence += b.quote("check_for_unlinked_but_not_keg_only", b.names(pkg))
-            if not b.inst.drivable:
-                out.append(_issue("brew-unlinked-keg", pkg.name, b, evidence + [b.undrivable()]))
-                continue
             rack = b.racks(pkg)[0]
-            remedies = [actions.link(b.inst, ctx.host_arch, action_id("brew-unlinked-keg", rack, "link"), pkg.name),
-                        actions.manual(b.inst, action_id("brew-unlinked-keg", rack, "manual"),
+            if not b.inst.drivable:
+                out.append(_issue(code, pkg.name, b, evidence, [b.no_fix(code, rack)], title=title))
+                continue
+            remedies = [actions.link(b.inst, ctx.host_arch, action_id(code, rack, "link"), pkg.name),
+                        actions.manual(b.inst, action_id(code, rack, "manual"),
                                        ["link", "--overwrite", "--dry-run", pkg.name],
-                                       "when brew link reports conflicting files, this lists them")]
-            out.append(_issue("brew-unlinked-keg", pkg.name, b, evidence, remedies, repairs_install=True))
+                                       "If `brew link` reports conflicting files, list them", ctx.host_arch),
+                        _note(code, rack, "A move into this Homebrew links it when a replacement needs it.")]
+            out.append(_issue(code, pkg.name, b, evidence, remedies, title=title, repairs_install=True))
     return out
 
 
@@ -847,18 +918,19 @@ def _broken_symlink(ctx: _Scan) -> list[Issue]:
     @param ctx  the scan
     @returns    the findings
     """
+    code = "brew-broken-symlink"
     out: list[Issue] = []
     for b in ctx.brews:
         for link, target in _broken_links(b.prefix):
-            evidence = [f"{link} -> {target}, which does not exist"]
-            evidence += b.quote("check_for_broken_symlinks", [link])
+            title = f"The link {link} points at a file that is gone"
+            evidence = [f"it points at {target}"] + b.quote("check_for_broken_symlinks", [link])
             if not _homebrew_link(b.inst, link, target):
-                evidence.append(f"it lies outside Homebrew's own directories of {b.prefix}: it is left alone")
-                out.append(_issue("brew-broken-symlink", link, b, evidence))
+                note = _note(code, link, f"brew-ports leaves it alone: it lies outside Homebrew's own folders in "
+                             f"{b.prefix}, so something else may have put it there.")
+                out.append(_issue(code, link, b, evidence, [note], title=title))
                 continue
-            rm = _command("brew-broken-symlink", link, "rm", [RM, link], f"delete the broken symlink {link}",
-                          on_failure=OnFailure.PROBE)
-            out.append(_issue("brew-broken-symlink", link, b, evidence, [rm], confirm_each=True))
+            rm = _command(code, link, "rm", [RM, link], f"delete the broken link {link}", on_failure=OnFailure.PROBE)
+            out.append(_issue(code, link, b, evidence, [rm], title=title, confirm_each=True))
     return out
 
 
@@ -891,13 +963,13 @@ def _kept_kegs(brew: _Brew, pkg: Package, kegs: Sequence[str]) -> dict[str, str]
     real = {os.path.realpath(k): k for k in kegs}
     names = brew.names(pkg)
     kept: dict[str, str] = {}
-    for reason, parts in (("linked", ("var", "homebrew", "linked")), ("opt link", ("opt",))):
+    for reason, parts in (("linked", ("var", "homebrew", "linked")), ("the version other formulae use", ("opt",))):
         for target in _link_targets(brew, names, *parts):
             if target in real:
                 keg = real[target]
                 kept[keg] = kept[keg] + " and " + reason if keg in kept else reason
     if not kept and kegs:
-        kept[kegs[-1]] = "newest"
+        kept[kegs[-1]] = "the newest"
     return kept
 
 
@@ -914,11 +986,11 @@ def _keg_in_use(ctx: _Scan, brew: _Brew, keg: str) -> str | None:
     root = os.path.realpath(keg)
     for paths in brew.inv.root_owned.values():
         if any(p == keg or p.startswith(keg + os.sep) for p in paths):
-            return "it holds root-owned paths"
+            return "files in it belong to root"
     for svc in ctx.services:
         program = os.path.realpath(svc.program) if svc.program else None
         if svc.instance_prefix == brew.prefix and program and (program == root or program.startswith(root + os.sep)):
-            return f"the launchd job {svc.label} runs {svc.program} from it"
+            return f"the service {svc.label} runs {svc.program} from it"
     return None
 
 
@@ -930,47 +1002,52 @@ def _several_versions(ctx: _Scan) -> list[Issue]:
     @param ctx  the scan
     @returns    one finding per removable keg, else one per formula
     """
+    code = "brew-several-versions"
     out: list[Issue] = []
     for b in ctx.brews:
         for pkg in b.packages("formula"):
             kegs = list(b.inv.kegs.get(pkg.name) or [])
             if len(kegs) < 2:
                 continue
-            evidence = [f"{pkg.name} has {len(kegs)} kegs: {', '.join((os.path.basename(k) for k in kegs))}"]
+            title = f"{pkg.name} has {len(kegs)} versions installed: {', '.join(os.path.basename(k) for k in kegs)}"
+            rack = b.racks(pkg)[0]
             if pkg.pinned:
-                evidence.append(f"{pkg.name} is pinned: every keg stays")
-                out.append(_issue("brew-several-versions", pkg.name, b, evidence))
+                note = _note(code, rack, f"Nothing to do: {pkg.name} is pinned, so every version stays.")
+                out.append(_issue(code, pkg.name, b, [], [note], title=title))
                 continue
             kept = _kept_kegs(b, pkg, kegs)
-            evidence.append("keeps " + ", ".join(f"{k} ({why})" for k, why in kept.items()))
+            evidence = ["in use: " + ", ".join(f"{os.path.basename(k)} ({why})" for k, why in kept.items())]
             removable = []
             for keg in kegs:
                 why = None if keg in kept else _keg_in_use(ctx, b, keg)
                 if why:
-                    evidence.append(f"{keg} stays: {why}")
+                    evidence.append(f"{os.path.basename(keg)} stays too: {why}")
                 elif keg not in kept:
                     removable.append(keg)
             if not removable:
-                out.append(_issue("brew-several-versions", pkg.name, b, evidence))
+                note = _note(code, rack, "Nothing to do: every version stays.")
+                out.append(_issue(code, pkg.name, b, evidence, [note], title=title))
             for keg in removable:
-                rm = _command("brew-several-versions", keg, "rm", [RM, "-rf", keg], f"delete the keg {keg}")
-                out.append(_issue("brew-several-versions", keg, b, evidence, [rm], confirm_each=True))
+                rm = _command(code, keg, "rm", [RM, "-rf", keg], f"delete the unused version {keg}")
+                out.append(_issue(code, keg, b, evidence, [rm], confirm_each=True,
+                                  title=f"Version {os.path.basename(keg)} of {pkg.name} is installed but not in "
+                                        "use"))
     return out
 
 
 # Dependencies, linkage, outdated and pinned formulae ------------------------------------
 
-def _json_skipped(brew: _Brew, what: str) -> str | None:
+def _json_skipped(brew: _Brew, probe: str) -> str | None:
     """Say why a check fed by the inventory probes did not run, or None
 
-    @param brew  the instance
-    @param what  the check, as the text names it
-    @returns     the reason, or None when the probes ran
+    @param brew   the instance
+    @param probe  the `brew` command the check reads, such as `brew missing`
+    @returns      the reason, or None when the probes ran
     """
     if not brew.inst.drivable:
-        return f"{what}: {brew.cannot_run()}"
+        return brew.cannot_run()
     if not brew.inv.used_json:
-        return f"{what}: brew info failed on {brew.prefix}, so the other inventory probes did not run"
+        return f"`brew info` failed there, so `{probe}` was not run"
     return None
 
 
@@ -990,7 +1067,7 @@ def _install(ctx: _Scan, brew: _Brew, dep: str) -> Action:
         info = cat.cask(short)
         if info is not None and info.privileged_install:
             return actions.manual(brew.inst, action_id(code, room, "manual"), ["install", "--cask", dep],
-                                  "the cask needs sudo to install: run this on a terminal")
+                                  "Fix: this cask asks for your password, so run it yourself", ctx.host_arch)
         return actions.install_casks(brew.inst, ctx.host_arch, action_id(code, room, "install"), [dep],
                                      on_failure=OnFailure.STOP)
     # --as-dependency: a plain install would record the dependency as installed on
@@ -1004,26 +1081,29 @@ def _missing_dependency(ctx: _Scan) -> list[Issue]:
     """Report each dependency `brew missing` lists, with `brew install <dep>`
 
     @param ctx  the scan
-    @returns    the findings, or a not-evaluated one where `brew missing` did not run
+    @returns    the findings, or a not-checked one where `brew missing` did not run
     """
     out: list[Issue] = []
     for b in ctx.brews:
         skipped = _json_skipped(b, "brew missing")
         if skipped is None and "brew missing" in (b.inv.inventory_error or ""):
-            skipped = f"brew missing failed on {b.prefix}: {b.inv.inventory_error}"
+            skipped = b.inv.inventory_error
         if skipped:
-            out.append(_skipped("brew-missing-dependency", b, skipped))
+            out.append(_skipped("brew-missing-dependency", b, "whether an installed formula lacks a dependency",
+                                skipped))
             continue
         needed: dict[str, list[str]] = {}
         for name, deps in sorted(b.inv.missing.items()):
             for dep in deps:
                 needed.setdefault(dep, []).append(name)
         for dep, users in sorted(needed.items()):
-            evidence = ["brew missing: " + (f"{user}: " if user else "") + " ".join(b.inv.missing[user])
-                        for user in users]
+            named = [user for user in users if user]
+            who = series(named) if len(named) <= NAMES_SHOWN else some(named)
+            title = (f"{who} {'needs' if len(named) == 1 else 'need'} {dep}, which is not installed" if named
+                     else f"{dep} is a dependency that is not installed")
             remedy = _install(ctx, b, dep)
-            out.append(_issue("brew-missing-dependency", dep, b, evidence, [remedy], auto_fix=not remedy.manual,
-                              repairs_install=not remedy.manual))
+            out.append(_issue("brew-missing-dependency", dep, b, ["`brew missing` reports it"], [remedy],
+                              title=title, auto_fix=not remedy.manual, repairs_install=not remedy.manual))
     return out
 
 
@@ -1033,6 +1113,7 @@ def _broken_linkage(ctx: _Scan) -> list[Issue]:
     @param ctx  the scan
     @returns    the findings
     """
+    code = "brew-broken-linkage"
     linkage = ctx.bundle.result.linkage
     reports = linkage.get("packages") or {}
     binaries = linkage.get("binaries") or {}
@@ -1042,15 +1123,16 @@ def _broken_linkage(ctx: _Scan) -> list[Issue]:
             broken = (reports.get(env_linkage.package_key(pkg)) or {}).get("broken") or []
             if not broken:
                 continue
-            evidence = limited([f"{path}: {ref.get('class')} reference {ref.get('name')}"
-                                 for path in broken for ref in (binaries.get(path) or {}).get("references") or []
-                                 if ref.get("class") in env_linkage.BROKEN])
+            title = f"{pkg.name} loads libraries that are missing or lie outside this Homebrew"
+            evidence = limited([f"{path} {LOADS[ref['class']] % ref.get('name')}"
+                                for path in broken for ref in (binaries.get(path) or {}).get("references") or []
+                                if ref.get("class") in env_linkage.BROKEN])
+            rack = b.racks(pkg)[0]
             if not b.inst.drivable:
-                out.append(_issue("brew-broken-linkage", pkg.name, b, evidence + [b.undrivable()]))
+                out.append(_issue(code, pkg.name, b, evidence, [b.no_fix(code, rack)], title=title))
                 continue
-            reinstall = actions.reinstall(b.inst, ctx.host_arch,
-                                          action_id("brew-broken-linkage", b.racks(pkg)[0], "reinstall"), [pkg.name])
-            out.append(_issue("brew-broken-linkage", pkg.name, b, evidence, [reinstall], confirm_each=True,
+            reinstall = actions.reinstall(b.inst, ctx.host_arch, action_id(code, rack, "reinstall"), [pkg.name])
+            out.append(_issue(code, pkg.name, b, evidence, [reinstall], title=title, confirm_each=True,
                               repairs_install=True))
     return out
 
@@ -1059,26 +1141,29 @@ def _outdated_keg(ctx: _Scan) -> list[Issue]:
     """Report outdated formulae and casks; `brew upgrade` is only suggested, as a plan upgrades its targets itself
 
     @param ctx  the scan
-    @returns    the findings, or a not-evaluated one where the inventory probes did not run
+    @returns    the findings, or a not-checked one where the inventory probes did not run
     """
+    code = "brew-outdated-keg"
     out: list[Issue] = []
     for b in ctx.brews:
-        skipped = _json_skipped(b, "outdated packages")
+        skipped = _json_skipped(b, "brew outdated")
         if skipped:
-            out.append(_skipped("brew-outdated-keg", b, skipped))
+            out.append(_skipped(code, b, "which packages have a newer version", skipped))
             continue
         for kind, current in (("formula", b.inv.outdated_formulae), ("cask", b.inv.outdated_casks)):
             for pkg in b.packages(kind):
                 if not pkg.outdated:
                     continue
                 version = current.get(pkg.name)
-                evidence = [f"installed {pkg.version or '?'}" + (f", current {version}" if version else "")]
+                title = f"{pkg.name} has a newer version" + (f", {version}" if version else "")
                 item = os.path.join(b.prefix, "Cellar" if kind == "formula" else "Caskroom", pkg.name)
-                upgrade = actions.manual(b.inst, action_id("brew-outdated-keg", item, "manual"),
-                                         ["upgrade", "--" + kind, pkg.name],
-                                         "upgrade it; a plan upgrades the targets it maps on its own")
-                out.append(_issue("brew-outdated-keg", pkg.name, b, evidence, [upgrade],
-                                  title="Outdated keg" if kind == "formula" else "Outdated cask"))
+                remedies = [_note(code, item, "Nothing to do before a move: a move into this Homebrew upgrades what "
+                                  "it needs by itself."),
+                            actions.manual(b.inst, action_id(code, item, "manual"),
+                                           ["upgrade", "--" + kind, pkg.name], "To upgrade it yourself",
+                                           ctx.host_arch)]
+                out.append(_issue(code, pkg.name, b, [f"installed: {pkg.version}"] if pkg.version else [], remedies,
+                                  title=title))
     return out
 
 
@@ -1088,14 +1173,15 @@ def _pinned_formula(ctx: _Scan) -> list[Issue]:
     @param ctx  the scan
     @returns    the findings
     """
+    code = "brew-pinned-formula"
     out: list[Issue] = []
     for b in ctx.brews:
         for pkg in b.packages("formula"):
             if pkg.pinned:
-                evidence = [f"{pkg.name} is pinned{' and outdated' if pkg.outdated else ''}",
-                            "a pin blocks dependency upgrades; a pinned outdated dependency of a plan's target "
-                            "stops that plan"]
-                out.append(_issue("brew-pinned-formula", pkg.name, b, evidence))
+                note = _note(code, b.racks(pkg)[0], "Nothing to do. A move that needs a newer version of a pinned "
+                             "formula stops until you run `brew unpin` for it.")
+                out.append(_issue(code, pkg.name, b, ["a newer version exists"] if pkg.outdated else [], [note],
+                                  title=f"{pkg.name} is pinned: Homebrew does not upgrade it"))
     return out
 
 
@@ -1105,16 +1191,18 @@ def _dirty_tap(ctx: _Scan) -> list[Issue]:
     """Report a tap with its own `.git` whose `git status` is not empty, with the stash commands
 
     @param ctx  the scan
-    @returns    the findings, with a not-evaluated one for each tap whose `git status` failed
+    @returns    the findings, with a not-checked one for each tap whose `git status` failed
     """
     code = "brew-dirty-tap"
     out: list[Issue] = []
     for b in ctx.brews:
         for tap in b.inv.taps:
             if tap.dirty:
-                out.append(_dirty(ctx, code, b, tap.name, tap.path, status=tap.status, title=TITLES[code]))
+                out.append(_dirty(ctx, code, b, tap.name, tap.path, status=tap.status,
+                                  title=f"The files of the tap {tap.name} were changed"))
             elif tap.has_git and tap.dirty is None and tap.error:
-                out.append(_skipped(code, b, f"local changes in {tap.path}: {tap.error}", tap.name))
+                out.append(_skipped(code, b, f"whether the files of the tap {tap.name} were changed", tap.error,
+                                    tap.name))
     return out
 
 
@@ -1133,8 +1221,10 @@ def _unwritable_prefix(ctx: _Scan) -> list[Issue]:
                if os.path.isdir(d) and not os.access(d, os.W_OK)]
         if bad:
             note = _note("brew-unwritable-prefix", b.prefix,
-                         f"give the directories back to the user: sudo chown -R \"$(whoami)\" {' '.join(bad)}")
-            out.append(_issue("brew-unwritable-prefix", b.prefix, b, [f"{d} is not writable" for d in bad], [note]))
+                         f"Fix: sudo chown -R \"$(whoami)\" {' '.join(shlex.quote(d) for d in bad)}")
+            out.append(_issue("brew-unwritable-prefix", b.prefix, b, [f"not writable: {', '.join(bad)}"], [note],
+                              title=f"You cannot write to {counted(len(bad), 'folder')} of {b.at}, so `brew` can "
+                                    "neither install nor uninstall there"))
     return out
 
 
@@ -1168,17 +1258,19 @@ def _orphan_service(ctx: _Scan) -> list[Issue]:
             canon = b.cat.canonical(svc.package) if b.cat is not None else None
             if svc.package in installed or (canon and canon in installed):
                 continue
-            evidence = [f"{svc.plist} belongs to the formula {svc.package}, which is not installed in {b.prefix}"]
+            evidence = [f"its file is {tilde(svc.plist, ctx.home)}"]
             remedies = []
             if svc.loaded and svc.domain:
-                evidence.append(f"loaded in {svc.domain}" + (f", pid {svc.pid}" if svc.pid else ""))
+                evidence.append("it is still loaded" + (f", and runs as process {svc.pid}" if svc.pid else ""))
                 remedies.append(_command(code, svc.plist, "bootout",
                                          [LAUNCHCTL, "bootout", f"{svc.domain}/{svc.label}"],
-                                         f"unload the launchd job {svc.label}", sudo=svc.domain == "system",
+                                         f"unload the service {svc.label}", sudo=svc.domain == "system",
                                          on_failure=OnFailure.PROBE))
-            remedies.append(_command(code, svc.plist, "rm", [RM, svc.plist], f"delete the plist {svc.plist}",
+            remedies.append(_command(code, svc.plist, "rm", [RM, svc.plist], f"delete the service file {svc.plist}",
                                      sudo=svc.scope == "system", on_failure=OnFailure.PROBE))
-            out.append(_issue(code, svc.label, b, evidence, remedies, confirm_each=True))
+            out.append(_issue(code, svc.label, b, evidence, remedies, confirm_each=True,
+                              title=f"The service {svc.label} is left over from {svc.package}, which is not "
+                                    "installed"))
     return out
 
 
@@ -1227,7 +1319,7 @@ def _missing_app(ctx: _Scan) -> list[Issue]:
     """Report an installed cask whose `app` is absent, with `brew reinstall --cask <t>`
 
     The reinstall is only printed when the cask needs sudo to install or uninstall. A cask whose apps only the
-    catalogue names, for another version than the installed one, gets a not-evaluated finding.
+    catalogue names, for another version than the installed one, gets a not-checked finding.
 
     @param ctx  the scan
     @returns    the findings
@@ -1242,23 +1334,26 @@ def _missing_app(ctx: _Scan) -> list[Issue]:
             targets = _app_targets(ctx, b, pkg, room)
             if targets is None:
                 current = b.cat.version(pkg.name, "cask") if b.cat is not None else None
-                out.append(_skipped(code, b, f"no receipt or JSON caskfile of {pkg.name} {pkg.version or '?'} names "
-                                    f"its apps, and the catalogue describes {current or '?'}", pkg.name))
+                out.append(_skipped(code, b, f"whether the app of the cask {pkg.name} is in place",
+                                    f"Homebrew kept no record of what {pkg.name} {pkg.version or ''} installed, and "
+                                    f"its package list describes {'version ' + current if current else 'another one'}",
+                                    pkg.name))
                 continue
             missing = [t for t in targets if not os.path.lexists(t)]
             if not missing:
                 continue
-            evidence = [f"{target} is missing" for target in missing]
+            title = (f"The {'app' if len(missing) == 1 else 'apps'} of the cask {pkg.name} "
+                     f"{'is' if len(missing) == 1 else 'are'} missing: {', '.join(missing)}")
             if not b.inst.drivable:
-                out.append(_issue(code, pkg.name, b, evidence + [b.undrivable()]))
+                out.append(_issue(code, pkg.name, b, [], [b.no_fix(code, room)], title=title))
             elif pkg.privileged_install or pkg.privileged_uninstall:
                 manual = actions.manual(b.inst, action_id(code, room, "manual"), ["reinstall", "--cask", pkg.name],
-                                        "the cask needs sudo to reinstall: run this on a terminal")
-                out.append(_issue(code, pkg.name, b, evidence, [manual]))
+                                        "Fix: this cask asks for your password, so run it yourself", ctx.host_arch)
+                out.append(_issue(code, pkg.name, b, [], [manual], title=title))
             else:
                 reinstall = actions.reinstall(b.inst, ctx.host_arch, action_id(code, room, "reinstall"), [pkg.name],
                                               kind="cask")
-                out.append(_issue(code, pkg.name, b, evidence, [reinstall], confirm_each=True))
+                out.append(_issue(code, pkg.name, b, [], [reinstall], title=title, confirm_each=True))
     return out
 
 
@@ -1318,20 +1413,24 @@ def _drop_cask_record(ctx: _Scan, room: str) -> list[Action]:
 
     @param ctx   the scan
     @param room  the orphan Caskroom directory
-    @returns     the archive, the removal and the note
+    @returns     the archive, the removal and the note; without a run directory, the removal for the user to run
     """
     code = "brew-orphan-caskroom"
     run_dir = ctx.runner.run_dir
-    manual = run_dir is None
-    dst = os.path.join("<run>" if manual else run_dir.path, "backup", "caskroom", slug(room) + ".tar.gz")
+    note = _note(code, room, "The apps and files that the cask installed stay: move them to the Trash yourself if "
+                 "you do not want them.", "note")
+    if run_dir is None:
+        return [Action(action_id=action_id(code, room, "rm"), kind="command", argv=[RM, "-rf", room], sudo=False,
+                       description="", manual=True), note]
+    dst = os.path.join(run_dir.path, "backup", "caskroom", slug(room) + ".tar.gz")
     archive = Action(action_id=action_id(code, room, "tar"), kind="command",
                      argv=[TAR, "-czf", "-", "-C", os.path.dirname(room), os.path.basename(room)], sudo=False,
-                     description=f"archive the Caskroom record {room} into {dst}", dst=dst, manual=manual)
+                     description=f"save Homebrew's record of the cask as {dst}", dst=dst)
     remove = Action(action_id=action_id(code, room, "rm"), kind="command", argv=[RM, "-rf", room], sudo=False,
-                    description=f"remove the Caskroom record {room}", manual=manual)
-    note = _note(code, room, "the apps and files the cask installed are not removed; move them to the Trash "
-                 f"by hand if you do not want them (the archive {dst} keeps the record)", "note")
-    return [archive, remove, note]
+                    description=f"delete Homebrew's record of the cask, {room}")
+    offer = _note(code, room, offered("saves Homebrew's record of the cask in the run folder, then deletes it"),
+                  "offer")
+    return [offer, archive, remove, note]
 
 
 def _orphan_caskroom(ctx: _Scan) -> list[Issue]:
@@ -1353,11 +1452,14 @@ def _orphan_caskroom(ctx: _Scan) -> list[Issue]:
             if (room is None or cat.knows(token, "cask") or cat.renamed_to(token, "cask")
                     or _tap_provides_cask(b, token) or _installed_caskfile(room, token)):
                 continue
-            evidence = [f"no catalogue entry, tap or installed cask file defines {token}"]
+            evidence = ["neither a tap nor Homebrew's own copy of the cask says what it is, so `brew uninstall` "
+                        "does not work for it", f"its record is the folder {room}"]
             if pkg.caskroom_data:
-                evidence.append(f"it keeps data in its Caskroom: {', '.join(pkg.caskroom_data)}")
-            out.append(_issue("brew-orphan-caskroom", token, b, evidence, _drop_cask_record(ctx, room),
-                              confirm_each=True))
+                evidence.append(f"that folder also holds data: {some(pkg.caskroom_data)}")
+            remedies = _drop_cask_record(ctx, room)
+            out.append(_issue("brew-orphan-caskroom", token, b, evidence, remedies, confirm_each=_runs(remedies),
+                              title=f"The cask {token} is installed, but Homebrew's package list does not have it "
+                                    "under any name"))
     return out
 
 
@@ -1366,40 +1468,45 @@ def _orphan_caskroom(ctx: _Scan) -> list[Issue]:
 def _strays_in_usr_local(ctx: _Scan) -> list[Issue]:
     """Report the five `brew doctor check_for_stray_*` checks, which carry Homebrew's allow-lists, on arm64
 
-    There `/usr/local` is no native Homebrew prefix; the files are the host's, so a finding two instances report
-    is kept once.
+    There `/usr/local` is no native Homebrew prefix; the files are the host's, so a finding names no instance and
+    one that two instances report is kept once.
 
     @param ctx  the scan
-    @returns    the findings, with a not-evaluated one wherever `brew doctor` gave no usable report
+    @returns    the findings, with a not-checked one wherever `brew doctor` gave no usable report
     """
     code = "brew-strays-in-usr-local"
     if ctx.host_arch != "arm64" or not ctx.brews:
         return []
+    what = "whether /usr/local holds libraries or header files that Homebrew did not install"
     out: list[Issue] = []
     seen: set[tuple[str, tuple[str, ...]]] = set()
     ran = [(b, b.doctor) for b in ctx.brews if b.doctor is not None]
     if not ran:
-        out.append(_skipped(code, None, "no Homebrew instance can run brew doctor, whose stray-file checks this is"))
+        out.append(_skipped(code, None, what, "no Homebrew on this Mac can run `brew doctor`, which finds them"))
     for b, report in ran:
         if report.failure:
-            out.append(_skipped(code, b, report.failure))
+            out.append(_skipped(code, b, what, report.failure))
             continue
-        for check, (directory, title) in STRAY.items():
+        for check, (directory, what_files) in STRAY.items():
             block = report.warnings.get(check)
             if not block or (check, tuple(block)) in seen:
                 continue
             seen.add((check, tuple(block)))
             files = [line.strip() for line in block[1:] if line.startswith("  ") and line.strip()]
-            note = _note(code, directory, "remove or move these files if they were not put there on purpose "
-                         f"(both managers warn about them): {' '.join(files)}", check)
-            out.append(_issue(code, directory, b, [f"brew doctor {check}:"] + limited(block), [note], title=title))
+            note = _note(code, directory, "Fix: delete or move them, unless you put them there on purpose.", check)
+            evidence = [some(f[len(directory) + 1:] if f.startswith(directory + "/") else f for f in files),
+                        "software that Homebrew or MacPorts builds can pick them up by mistake"]
+            evidence += _each(files)
+            out.append(_issue(code, directory, None, evidence, [note],
+                              title=f"{directory} holds {what_files} that Homebrew did not install"))
     return out
 
 
 def _path_order(ctx: _Scan) -> list[Issue]:
     """Report `/usr/bin` before `<prefix>/bin` in the live PATH
 
-    env-cleanup fixes the PATH order, or adds the PATH line when no rc file contains a `brew shellenv` line.
+    The fix named here is the one by hand, which holds for every installation; `doctor` names `env-cleanup` in
+    its place for the installation that command keeps.
 
     @param ctx  the scan
     @returns    the findings
@@ -1412,21 +1519,18 @@ def _path_order(ctx: _Scan) -> list[Issue]:
     usr_bin = env_shell.path_index(entries, "/usr/bin")
     if usr_bin is None:
         return []
-    shellenv = any(isinstance(r, dict) and r.get("kind") == "shellenv" for r in environment.get("records") or [])
     out: list[Issue] = []
     for b in ctx.brews:
         bin_dir = os.path.join(b.prefix, "bin")
         own = env_shell.path_index(entries, bin_dir)
         if own is None or own < usr_bin:
             continue
-        if shellenv:
-            operation = (f"fixes the PATH order: the line for {b.prefix} becomes the last PATH prepend of the login "
-                         "shell's files")
-        else:
-            operation = f'adds the PATH line eval "$({b.prefix}/bin/brew shellenv)" to the login file of the shell'
-        note = _note("brew-path-order", bin_dir, f"brew-ports env-cleanup {operation}")
-        evidence = [f"live PATH entry {usr_bin + 1} is /usr/bin, entry {own + 1} is {bin_dir}"]
-        out.append(_issue("brew-path-order", bin_dir, b, evidence, [note]))
+        note = _note("brew-path-order", bin_dir, f"Fix, if this is the Homebrew you keep: put {bin_dir} in front of "
+                     "/usr/bin in your shell's login file.", "path")
+        evidence = [f"/usr/bin is entry {usr_bin + 1} of your PATH, and {bin_dir} is entry {own + 1}"]
+        out.append(_issue("brew-path-order", bin_dir, b, evidence, [note],
+                          title=f"/usr/bin comes before {bin_dir} on your PATH, so a command of macOS wins over "
+                                "Homebrew's command of the same name"))
     return out
 
 
@@ -1436,6 +1540,7 @@ def _renamed_keg(ctx: _Scan) -> list[Issue]:
     @param ctx  the scan
     @returns    the findings
     """
+    code = "brew-renamed-keg"
     out: list[Issue] = []
     for b in ctx.brews:
         if b.cat is None:
@@ -1448,14 +1553,28 @@ def _renamed_keg(ctx: _Scan) -> list[Issue]:
                 new = b.cat.renamed_to(old)
                 if not new or new == old:
                     continue
-                evidence = [f"Cellar/{old} holds {new} under its old name"]
+                title = f"Homebrew renamed {old} to {new}, and the installed copy still has the old name"
+                evidence = [f"its folder is {rack}"]
                 if not b.inst.drivable:
-                    out.append(_issue("brew-renamed-keg", old, b, evidence + [b.undrivable()]))
+                    out.append(_issue(code, old, b, evidence, [b.no_fix(code, rack)], title=title))
                     continue
-                migrate = actions.migrate(b.inst, ctx.host_arch, action_id("brew-renamed-keg", rack, "migrate"), old)
-                out.append(_issue("brew-renamed-keg", old, b, evidence, [migrate], auto_fix=True,
+                migrate = actions.migrate(b.inst, ctx.host_arch, action_id(code, rack, "migrate"), old)
+                out.append(_issue(code, old, b, evidence, [migrate], title=title, auto_fix=True,
                                   repairs_install=True))
     return out
+
+
+def _error_lines(text: str) -> list[str]:
+    """Return a failed probe's text as evidence lines: its first line, Homebrew's `Error:` lines, then the rest
+
+    The default report shows the first lines of a finding, and Homebrew states the cause on its `Error:` lines.
+
+    @param text  the error text of the inventory probes
+    @returns     the lines, each once
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    first = lines[:1] + [line for line in lines[1:] if line.startswith("Error:")]
+    return limited(list(dict.fromkeys(first + lines)))
 
 
 def _degraded_inventory(ctx: _Scan) -> list[Issue]:
@@ -1463,7 +1582,7 @@ def _degraded_inventory(ctx: _Scan) -> list[Issue]:
 
     A failed `brew info` leaves the disk walk alone, and its finding blocks `CASKS` and `REMOVE` too,
     because cask dependencies and artifacts are unknown. After a good `brew info`, a failed `brew outdated`
-    or `brew deps` gets an INFO finding, and a failed `brew missing` the not-evaluated one of its check.
+    or `brew deps` gets an INFO finding, and a failed `brew missing` the not-checked one of its check.
 
     @param ctx  the scan
     @returns    the findings
@@ -1474,14 +1593,24 @@ def _degraded_inventory(ctx: _Scan) -> list[Issue]:
         if not error:
             continue
         if not b.inv.used_json:
-            evidence = limited(error.splitlines()) + ["re-run brew-ports scan once the cause is addressed"]
-            out.append(_issue("brew-degraded-inventory", b.prefix, b, evidence))
+            code = "brew-degraded-inventory"
+            remedies = [actions.manual(b.inst, action_id(code, b.prefix, "manual"),
+                                       ["info", "--json=v2", "--installed"],
+                                       "Fix: run it yourself and resolve what Homebrew reports", ctx.host_arch),
+                        _note(code, b.prefix, "Then run `brew-ports doctor --rescan`.")]
+            out.append(_issue(code, b.prefix, b, _error_lines(error), remedies,
+                              title="`brew info` failed, so brew-ports knows only part of what this Homebrew has "
+                                    "installed"))
             continue
-        lost = [text for probe, text in (
-            ("brew outdated", "the outdated packages come from brew info, without their current versions"),
-            ("brew deps", "the dependencies come from the receipts and brew info alone")) if probe in error]
+        lost = {probe: text for probe, text in (
+            ("brew outdated", "packages with a newer version are listed without the number of that version"),
+            ("brew deps", "dependencies come from Homebrew's install records alone")) if probe in error}
         if lost:
-            out.append(_issue("brew-failed-probe", b.prefix, b, limited(error.splitlines()) + lost))
+            code = "brew-failed-probe"
+            note = _note(code, b.prefix, "Nothing to do: brew-ports works with what `brew info` gave it.")
+            out.append(_issue(code, b.prefix, b, list(lost.values()) + _error_lines(error), [note],
+                              title=f"{series(f'`{probe}`' for probe in lost)} failed, so brew-ports knows less "
+                                    "about this Homebrew"))
     return out
 
 
@@ -1499,12 +1628,16 @@ def _root_owned_keg(ctx: _Scan) -> list[Issue]:
         for name, paths in sorted(b.inv.root_owned.items()):
             rack = os.path.join(b.prefix, "Cellar", name)
             binary = b.inst.binary or os.path.join(b.prefix, "bin", "brew")
-            remedies = [_note(code, rack, f"sudo {binary} services stop {name}", "stop"),
-                        _note(code, rack, "then hand the paths back with sudo chown, or remove them with sudo rm, "
-                              "as Homebrew printed when it took root ownership of them")]
-            evidence = [f"owned by root: {p}" for p in limited(paths)]
-            evidence.append(f"a migration keeps {name} installed while these paths are root-owned")
-            out.append(_issue(code, name, b, evidence, remedies))
+            # The files lie in the formula's versions or are its `opt` link; -h hands over a link, not its target.
+            tops = [rack] + sorted({p for p in paths if p != rack and not p.startswith(rack + os.sep)
+                                    and os.path.dirname(p) == os.path.join(b.prefix, "opt")})
+            remedies = [_note(code, rack, f"Fix: sudo {binary} services stop {name}", "stop"),
+                        _note(code, rack, "Then give the files back to yourself: sudo chown -R -h \"$(whoami)\" "
+                              f"{' '.join(shlex.quote(top) for top in tops)}")]
+            evidence = [some(paths), f"a move out of this Homebrew leaves {name} installed while they do"]
+            evidence += _each(paths)
+            out.append(_issue(code, name, b, evidence, remedies,
+                              title=f"Files of {name} belong to root, so `brew` cannot change them"))
     return out
 
 
@@ -1520,10 +1653,10 @@ def _env_line_effect(name: str, value: str) -> str | None:
     """
     if name in BREW_SET:
         if not value or value.lower() in FALSY:
-            return f"turns off {name}={BREW_SET[name]}, which brew-ports sets for every brew it runs"
+            return f"turns off {name}={BREW_SET[name]}, which brew-ports sets for every `brew` command it runs"
         return None
     if value and (name in BREW_DENY or name.startswith(BREW_DENY_PREFIXES)):
-        return f"sets {name}, which brew-ports keeps out of every brew it runs"
+        return f"sets {name}, which brew-ports keeps away from every `brew` command it runs"
     return None
 
 
@@ -1548,10 +1681,13 @@ def _env_override(ctx: _Scan) -> list[Issue]:
             if _env_line_effect(line.name, line.value):
                 by_file.setdefault(line.path, []).append(line)
         for path, lines in sorted(by_file.items()):
-            evidence = [f"{path}:{line.lineno}: {line.name}={line.value} {_env_line_effect(line.name, line.value)}"
+            shown = tilde(path, ctx.home)
+            evidence = [f"line {line.lineno}: {line.name}={line.value} {_env_line_effect(line.name, line.value)}"
                         for line in sorted(lines, key=lambda line: line.lineno)]
-            note = _note("brew-env-override", path, f"remove or comment out these lines of {path}")
-            out.append(_issue("brew-env-override", path, b, evidence, [note]))
+            note = _note("brew-env-override", path, f"Fix: remove these lines from {shown}, or put a # in front of "
+                         "each.")
+            out.append(_issue("brew-env-override", path, b, evidence, [note],
+                              title=f"{shown} changes settings that brew-ports relies on when it runs `brew`"))
     return out
 
 

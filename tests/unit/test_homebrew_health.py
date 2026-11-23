@@ -3,10 +3,12 @@
 import json
 import os
 import unittest
+from unittest import mock
 
-from brew_ports import model, runner as r, state
+from brew_ports import doctor_report, model, runner as r, state
 from brew_ports.homebrew import actions, health, inventory, locate
 from brew_ports.model import Blocks, OnFailure, Severity
+from brew_ports.report import typed
 from tests.unit.helpers import make_instance, make_package
 from tests.unit.test_homebrew_health_support import (ARCH, GIT_STATUS, NOW, STAMP, HealthCase, fixture, path_entry,
                                                      service, symlink, write)
@@ -54,11 +56,20 @@ class PrefixesAndCatalogueTest(HealthCase):
         other = make_instance(prefix=self.path("usr", "local"), repository=self.path("usr", "local", "Homebrew"),
                               drivable=False, usability=model.Usability.MISSING_BINARY, binary=None, version=None)
         self.extra.append((other, None, inventory.HomebrewInventory(instance_prefix=other.prefix)))
+        self.formula("wget")
         issue = self.only("brew-several-prefixes")
-        self.assertEqual(issue.severity, Severity.INFO)
-        self.assertEqual(issue.evidence[:2], [f"{self.prefix}: usable, Homebrew 7.0.11",
-                                              f"{other.prefix}: missing-binary"])
-        self.assertEqual((issue.remedies, issue.blocks), ([], ()))
+        self.assertEqual((issue.severity, issue.title), (Severity.INFO, "This Mac has 2 Homebrew installations"))
+        self.assertEqual(issue.evidence, [f"Homebrew at {self.prefix}: 1 formula",
+                                          f"Homebrew at {other.prefix}: no packages"])
+        self.assertEqual(issue.blocks, ())
+        self.assertEqual(self.fixes(issue), [
+            "Nothing to do. To merge them, `brew-ports plan --target brew --target-prefix` with the folder of the "
+            "Homebrew you keep plans a move of every package of the other installations into it."])
+        # Where `plan --target brew` has a Homebrew to move into, the note names it.
+        with mock.patch("brew_ports.homebrew.locate.choose_target", return_value=self.inst):
+            self.assertEqual(self.fixes(self.only("brew-several-prefixes")), [
+                "Nothing to do. To merge them, `brew-ports plan --target brew` plans a move of every package of the "
+                f"other installations into Homebrew at {self.prefix}; `--target-prefix` names another Homebrew."])
 
     def test_one_prefix(self):
         self.assertEqual(self.found("brew-several-prefixes", self.detect()), [])
@@ -67,11 +78,39 @@ class PrefixesAndCatalogueTest(HealthCase):
         self.inst.usability, self.inst.drivable = model.Usability.CANNOT_RUN, False
         self.inst.usability_detail = "Homebrew's portable Ruby failed with exit 86: Bad CPU type in executable"
         issue = self.only("brew-unusable-or-dirty")
-        self.assertEqual((issue.severity, issue.title, issue.subject), (Severity.HIGH, "brew cannot run",
-                                                                       self.inst.binary))
-        self.assertEqual((issue.remedies, issue.blocks), ([], (Blocks.TARGET,)))
-        self.assertIn("Bad CPU type", issue.evidence[0])
+        self.assertEqual((issue.severity, issue.title, issue.subject),
+                         (Severity.HIGH, f"The `brew` command of Homebrew at {self.prefix} cannot run",
+                          self.inst.binary))
+        self.assertEqual(issue.blocks, (Blocks.TARGET,))
+        self.assertEqual(issue.evidence, ["Homebrew's portable Ruby failed with exit 86: Bad CPU type in executable"])
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: run it yourself and do what Homebrew asks for: {self.inst.binary} config",
+            "A move out of this installation still installs the replacements of its packages, but uninstalls none "
+            f"of them one by one. With `--delete {self.prefix}`, `brew-ports plan` plans to delete the installation "
+            "whole after the move."])
         self.assertFalse(any("doctor" in call for call in self.fake.calls))
+
+    def test_a_line_to_run_for_an_intel_homebrew_keeps_arch(self):
+        """Started without `arch -x86_64` on Apple Silicon, the `brew` of an Intel Homebrew refuses to install"""
+        self.inst.arch = "x86_64"
+        self.formula("wget", outdated=True)
+        issue = self.only("brew-outdated-keg")
+        self.assertEqual(self.fixes(issue)[1],
+                         f"To upgrade it yourself: arch -x86_64 {self.inst.binary} upgrade --formula wget")
+        self.inst.arch = "arm64"
+        self.assertEqual(self.fixes(self.only("brew-outdated-keg"))[1],
+                         f"To upgrade it yourself: {self.inst.binary} upgrade --formula wget")
+
+    def test_a_homebrew_without_its_brew_command_is_reported(self):
+        missing = os.path.join(self.prefix, "bin", "brew")
+        self.inst.usability, self.inst.drivable, self.inst.binary = model.Usability.MISSING_BINARY, False, None
+        self.inst.usability_detail = f"{missing} is missing"
+        issue = self.only("brew-unusable-or-dirty")
+        self.assertEqual((issue.title, issue.subject, issue.evidence, issue.blocks),
+                         (f"The `brew` command of Homebrew at {self.prefix} cannot run", missing,
+                          [f"{missing} is missing"], (Blocks.TARGET,)))
+        self.assertEqual(self.fixes(issue)[0],
+                         "Fix: install Homebrew there again, or leave it as it is and let a move delete it.")
 
     def test_dirty_repository(self):
         os.makedirs(os.path.join(self.prefix, ".git"))
@@ -80,12 +119,17 @@ class PrefixesAndCatalogueTest(HealthCase):
             stdout=" M Library/Homebrew/cmd/doctor.rb\n?? stray.txt\n")
         issue = self.only("brew-unusable-or-dirty")
         self.assertEqual((issue.title, issue.subject, issue.blocks),
-                         ("Homebrew repository has local changes", self.prefix, (Blocks.TARGET,)))
-        self.assertEqual(issue.evidence[1:], ["   M Library/Homebrew/cmd/doctor.rb", "  ?? stray.txt"])
+                         (f"Homebrew's own files in {self.prefix} were changed", self.prefix, (Blocks.TARGET,)))
+        self.assertEqual(issue.evidence, ["`git status` lists 2 changed files: Library/Homebrew/cmd/doctor.rb, "
+                                          "stray.txt", "`brew update` can fail over such changes"])
         self.assertTrue(issue.confirm_each)
         self.assertEqual([a.action_id for a in issue.remedies],
                          [f"doctor.brew-unusable-or-dirty.{state.slug(self.prefix)}.{step}"
-                          for step in ("stash", "patch", "recover")])
+                          for step in ("offer", "stash", "patch", "recover")])
+        self.assertEqual(self.fixes(issue), [
+            "Fix: brew-ports doctor --fix (asks, then sets the changes aside with `git stash` and saves a copy of "
+            "them in the run folder)",
+            "To get the changes back afterwards: " + typed([health.GIT, "-C", self.prefix, "stash", "pop"])])
 
     def test_clean_repository_and_no_git(self):
         os.makedirs(os.path.join(self.prefix, ".git"))
@@ -101,25 +145,34 @@ class PrefixesAndCatalogueTest(HealthCase):
             exit=128, stderr="fatal: detected dubious ownership in repository\n")
         issue = self.only("brew-unusable-or-dirty")
         self.assertEqual((issue.severity, issue.blocks, issue.remedies), (Severity.INFO, (), []))
-        self.assertIn("dubious ownership", issue.evidence[0])
+        self.assertEqual(issue.title, f"Not checked: whether Homebrew's own files in {self.prefix} were changed")
+        self.assertEqual(issue.evidence, ["`git status` failed with exit 128: fatal: detected dubious ownership in "
+                                          "repository"])
 
     def test_stale_catalogue(self):
         self.cat_kw["api_mtime"] = NOW - 8 * 86400
         issue = self.only("brew-stale-catalogue")
         self.assertEqual((issue.severity, issue.subject), (Severity.LOW, self.cat_kw["api_file"]))
-        self.assertEqual(issue.evidence, [f"{self.cat_kw['api_file']} is 8 days old"])
-        self.assertEqual([(a.kind, a.manual) for a in issue.remedies], [("note", True)])
-        self.assertIn("plan --refresh", issue.remedies[0].description)
+        self.assertEqual((issue.title, issue.evidence), ("Homebrew's package list is 8 days old", []))
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: {self.inst.binary} update",
+            "`brew-ports plan --target brew --refresh` runs it too, for the Homebrew that packages move into."])
 
     def test_missing_catalogue_and_tap_fallback(self):
         self.no_catalogue = True
         issue = self.only("brew-stale-catalogue")
+        self.assertEqual(issue.title, "Homebrew's package list is missing")
         self.assertIn("packages.*.jws.json", issue.evidence[0])
-        self.assertIn("deleted formulae and orphan Caskroom directories are not checked without a catalogue",
-                      issue.evidence)
+        self.assertEqual(issue.evidence[1], "without it, brew-ports cannot tell which installed formulae and casks "
+                                            "Homebrew has stopped offering")
         self.no_catalogue = False
         self.cat_kw = {"source": "taps", "frozen": True}
-        self.assertIn("HOMEBREW_NO_INSTALL_FROM_API", self.only("brew-stale-catalogue").evidence[0])
+        issue = self.only("brew-stale-catalogue")
+        self.assertEqual(issue.title, "Homebrew's package list is read from the homebrew/core tap, which says less "
+                                      "about each package")
+        self.assertEqual(issue.evidence[1], "HOMEBREW_NO_INSTALL_FROM_API is set, so Homebrew does not download the "
+                                            "full list")
+        self.assertEqual(self.fixes(issue), ["Nothing to do if you set that variable on purpose."])
 
     def test_fresh_catalogue(self):
         self.assertEqual(self.found("brew-stale-catalogue", self.detect()), [])
@@ -133,10 +186,16 @@ class KegsAndFormulaeTest(HealthCase):
         issue = self.only("brew-keg-without-receipt")
         self.assertEqual((issue.severity, issue.subject, issue.blocks), (Severity.HIGH, "wget", ()))
         keg = os.path.join(self.prefix, "Cellar", "wget", "1.0")
-        self.assertEqual(issue.evidence, [f"no INSTALL_RECEIPT.json in {keg}"])
+        self.assertEqual(issue.title, "wget has no install record")
+        self.assertEqual(issue.evidence, [
+            f"INSTALL_RECEIPT.json, where Homebrew records how it installed a version, is missing from {keg}",
+            "without it, brew-ports cannot tell whether you installed it yourself"])
         self.assertEqual([a.argv for a in issue.remedies], [self.brew_argv("reinstall", "--formula", "wget"),
                                                             self.brew_argv("tab", "--installed-on-request", "wget")])
         self.assertEqual((issue.auto_fix, issue.confirm_each, issue.repairs_install), (False, True, True))
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: brew-ports doctor --fix (asks, then runs `{self.inst.binary} reinstall --formula wget`, then "
+            f"`{self.inst.binary} tab --installed-on-request wget`)"])
 
     def test_kegs_with_receipts(self):
         self.formula("wget")
@@ -147,9 +206,13 @@ class KegsAndFormulaeTest(HealthCase):
         self.doctor = r.FakeResponse(exit=1, stderr=fixture("doctor-stderr.txt", PREFIX=self.prefix))
         issue = self.only("brew-deleted-formula")
         self.assertEqual((issue.severity, issue.subject), (Severity.MEDIUM, "oldtool"))
-        self.assertIn("brew doctor: Some installed kegs have no formulae!", issue.evidence)
-        self.assertEqual([a.argv for a in issue.remedies],
+        self.assertEqual(issue.title, "oldtool is installed, but Homebrew's package list does not have it under any "
+                                      "name")
+        self.assertEqual(issue.evidence, ["Homebrew can neither upgrade it nor install it again",
+                                          "`brew doctor` reports it too"])
+        self.assertEqual([a.argv for a in issue.remedies if a.kind == "command"],
                          [self.brew_argv("uninstall", "--formula", "--force", "oldtool")])
+        self.assertEqual(self.fixes(issue)[1:], ["Leave it if you still use it."])
         self.assertTrue(issue.confirm_each)
 
     def test_known_third_party_renamed_or_no_catalogue(self):
@@ -169,10 +232,19 @@ class KegsAndFormulaeTest(HealthCase):
         self.doctor = r.FakeResponse(exit=1, stderr=fixture("doctor-stderr.txt", PREFIX=self.prefix))
         issue = self.only("brew-deprecated-formula")
         self.assertEqual(issue.severity, Severity.INFO)
-        self.assertEqual(issue.evidence, ["aamath is deprecated",
-                                          "deprecation date 2026-07-17 (unmaintained); replacement: newmath",
-                                          "brew doctor: Some installed formulae are deprecated or disabled."])
-        self.assertEqual(issue.remedies, [])
+        self.assertEqual(issue.title, "aamath is deprecated: Homebrew plans to stop offering it")
+        self.assertEqual(issue.evidence, ["deprecated on 2026-07-17 (unmaintained); Homebrew suggests newmath instead",
+                                          "`brew doctor` reports it too"])
+        self.assertEqual(self.fixes(issue), ["Nothing to do for a formula that still works for you."])
+
+    def test_a_disabled_formula_gives_its_dates_and_reason_in_words(self):
+        self.formula("oldssl", disabled=True)
+        self.formulae["oldssl"] = {"deprecate_args": {":because": ":repo_archived", ":date": "2025-01-10"},
+                                   "disable_args": {":because": ":repo_archived", ":date": "2026-01-10"}}
+        issue = self.only("brew-deprecated-formula")
+        self.assertEqual(issue.title, "oldssl is disabled: Homebrew does not install it any more")
+        self.assertEqual(issue.evidence, ["deprecated on 2025-01-10 (repo archived)",
+                                          "disabled on 2026-01-10 (repo archived)"])
 
     def test_current_formula(self):
         self.formula("wget")
@@ -182,10 +254,19 @@ class KegsAndFormulaeTest(HealthCase):
         self.formula("unlinked", linked=False)
         issue = self.only("brew-unlinked-keg")
         self.assertEqual(issue.severity, Severity.MEDIUM)
+        self.assertEqual(issue.title, f"unlinked is installed, but not linked into {self.prefix}")
+        self.assertEqual(issue.evidence, [f"its commands are not in {self.prefix}/bin, and its libraries not in "
+                                          f"{self.prefix}/lib"])
         self.assertEqual(issue.remedies[0].argv, self.brew_argv("link", "unlinked"))
         self.assertEqual((issue.remedies[1].argv, issue.remedies[1].manual),
                          ([self.inst.binary, "link", "--overwrite", "--dry-run", "unlinked"], True))
         self.assertEqual((issue.auto_fix, issue.confirm_each, issue.repairs_install), (False, False, True))
+        # `doctor --fix` does not offer the link, so the report gives it to the user as a command.
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: {self.inst.binary} link unlinked",
+            f"If `brew link` reports conflicting files, list them: {self.inst.binary} link --overwrite --dry-run "
+            "unlinked",
+            "A move into this Homebrew links it when a replacement needs it."])
 
     def test_keg_only_and_linked(self):
         self.formula("openssl@3", linked=False, keg_only=True)
@@ -196,7 +277,8 @@ class KegsAndFormulaeTest(HealthCase):
         link = symlink(os.path.join(self.prefix, "bin", "gone"), "../Cellar/gone/1.0/bin/gone")
         issue = self.only("brew-broken-symlink")
         self.assertEqual((issue.severity, issue.subject), (Severity.LOW, link))
-        self.assertEqual(issue.evidence, [f"{link} -> ../Cellar/gone/1.0/bin/gone, which does not exist"])
+        self.assertEqual((issue.title, issue.evidence), (f"The link {link} points at a file that is gone",
+                                                         ["it points at ../Cellar/gone/1.0/bin/gone"]))
         rm = issue.remedies[0]
         self.assertEqual((rm.argv, rm.on_failure, rm.sudo), ([health.RM, link], OnFailure.PROBE, False))
         self.assertTrue(issue.confirm_each)
@@ -207,15 +289,27 @@ class KegsAndFormulaeTest(HealthCase):
         symlink(os.path.join(self.prefix, "bin", "jq"), "../Cellar/jq/1.0/bin/jq")
         self.assertEqual(self.found("brew-broken-symlink", self.detect()), [])
 
-    def test_old_keg(self):
+    def test_a_version_that_is_not_in_use(self):
         self.formula("wget", versions=("1.24.5", "1.25.0_2"))
-        old = os.path.join(self.prefix, "Cellar", "wget", "1.24.5")
+        unused = os.path.join(self.prefix, "Cellar", "wget", "1.24.5")
         issue = self.only("brew-several-versions")
-        self.assertEqual((issue.severity, issue.subject), (Severity.LOW, old))
-        self.assertEqual(issue.remedies[0].argv, [health.RM, "-rf", old])
-        self.assertIn(f"keeps {os.path.join(self.prefix, 'Cellar', 'wget', '1.25.0_2')} (linked and opt link)",
-                      issue.evidence)
+        self.assertEqual((issue.severity, issue.subject), (Severity.LOW, unused))
+        self.assertEqual(issue.remedies[0].argv, [health.RM, "-rf", unused])
+        self.assertEqual((issue.title, issue.evidence),
+                         ("Version 1.24.5 of wget is installed but not in use",
+                          ["in use: 1.25.0_2 (linked and the version other formulae use)"]))
         self.assertTrue(issue.confirm_each)
+
+    def test_the_version_not_in_use_can_be_the_newer_one(self):
+        """What is offered for deletion is the version that nothing links, whatever its age"""
+        self.formula("wget", versions=("1.25.0_2", "1.24.5"))     # the links go to the last one
+        issue = self.only("brew-several-versions")
+        self.assertEqual((issue.title, issue.evidence),
+                         ("Version 1.25.0_2 of wget is installed but not in use",
+                          ["in use: 1.24.5 (linked and the version other formulae use)"]))
+        self.assertEqual(issue.remedies[0].description,
+                         f"delete the unused version {os.path.join(self.prefix, 'Cellar', 'wget', '1.25.0_2')}")
+        self.assertNotIn("old", issue.title)
 
     def test_one_keg(self):
         self.formula("wget")
@@ -231,14 +325,17 @@ class DependenciesAndTapsTest(HealthCase):
         issues = self.found("brew-missing-dependency", self.detect())
         self.assertEqual([i.subject for i in issues], ["libidn2", "openssl@3"])
         issue = issues[0]
-        self.assertEqual((issue.severity, issue.evidence), (Severity.HIGH, ["brew missing: wget: libidn2 openssl@3"]))
+        self.assertEqual((issue.severity, issue.title, issue.evidence),
+                         (Severity.HIGH, "wget needs libidn2, which is not installed", ["`brew missing` reports it"]))
         self.assertEqual(issue.remedies[0].argv,
                          self.brew_argv("install", "--formula", "--as-dependency", "libidn2"))
         self.assertEqual((issue.auto_fix, issue.confirm_each, issue.repairs_install), (True, False, True))
+        self.assertEqual(self.fixes(issue), ["Fix: brew-ports doctor --fix (asks, then runs "
+                                             f"`{self.inst.binary} install --formula --as-dependency libidn2`)"])
 
     def test_bare_form_and_nothing_missing(self):
         self.inv.missing = {"": ["libidn2"]}
-        self.assertEqual(self.only("brew-missing-dependency").evidence, ["brew missing: libidn2"])
+        self.assertEqual(self.only("brew-missing-dependency").title, "libidn2 is a dependency that is not installed")
         self.inv.missing = {}
         self.assertEqual(self.found("brew-missing-dependency", self.detect()), [])
 
@@ -251,7 +348,8 @@ class DependenciesAndTapsTest(HealthCase):
             "binaries": {binary: {"references": [{"name": "/opt/local/lib/libintl.8.dylib", "class": "other"},
                                                  {"name": "/usr/lib/libSystem.B.dylib", "class": "system"}]}}}
         issue = self.only("brew-broken-linkage")
-        self.assertEqual(issue.evidence, [f"{binary}: other reference /opt/local/lib/libintl.8.dylib"])
+        self.assertEqual(issue.title, "wget loads libraries that are missing or lie outside this Homebrew")
+        self.assertEqual(issue.evidence, [f"{binary} loads /opt/local/lib/libintl.8.dylib from another installation"])
         self.assertEqual(issue.remedies[0].argv, self.brew_argv("reinstall", "--formula", "wget"))
         self.assertEqual((issue.severity, issue.confirm_each, issue.repairs_install), (Severity.HIGH, True, True))
 
@@ -268,11 +366,14 @@ class DependenciesAndTapsTest(HealthCase):
         self.inv.outdated_formulae = {"wget": "1.25.0_3"}
         issues = self.found("brew-outdated-keg", self.detect())
         self.assertEqual([(i.subject, i.title) for i in issues],
-                         [("wget", "Outdated keg"), ("firefox", "Outdated cask")])
-        self.assertEqual(issues[0].evidence, ["installed 1.0, current 1.25.0_3"])
-        self.assertEqual((issues[0].remedies[0].argv, issues[0].remedies[0].manual),
+                         [("wget", "wget has a newer version, 1.25.0_3"), ("firefox", "firefox has a newer version")])
+        self.assertEqual(issues[0].evidence, ["installed: 1.0"])
+        self.assertEqual((issues[0].remedies[1].argv, issues[0].remedies[1].manual),
                          ([self.inst.binary, "upgrade", "--formula", "wget"], True))
-        self.assertEqual(issues[1].remedies[0].argv, [self.inst.binary, "upgrade", "--cask", "firefox"])
+        self.assertEqual(issues[1].remedies[1].argv, [self.inst.binary, "upgrade", "--cask", "firefox"])
+        self.assertEqual(self.fixes(issues[0]), [
+            "Nothing to do before a move: a move into this Homebrew upgrades what it needs by itself.",
+            f"To upgrade it yourself: {self.inst.binary} upgrade --formula wget"])
 
     def test_current_keg(self):
         self.formula("wget")
@@ -281,7 +382,10 @@ class DependenciesAndTapsTest(HealthCase):
     def test_pinned_formula(self):
         self.formula("wget", pinned=True, outdated=True)
         issue = self.only("brew-pinned-formula")
-        self.assertEqual((issue.severity, issue.evidence[0]), (Severity.INFO, "wget is pinned and outdated"))
+        self.assertEqual((issue.severity, issue.title, issue.evidence),
+                         (Severity.INFO, "wget is pinned: Homebrew does not upgrade it", ["a newer version exists"]))
+        self.assertEqual(self.fixes(issue), ["Nothing to do. A move that needs a newer version of a pinned formula "
+                                             "stops until you run `brew unpin` for it."])
 
     def test_unpinned_formula(self):
         self.formula("wget")
@@ -294,7 +398,10 @@ class DependenciesAndTapsTest(HealthCase):
         self.run_dir = self.state_dir().new_run()
         issue = self.only("brew-dirty-tap")
         self.assertEqual((issue.severity, issue.subject, issue.confirm_each), (Severity.MEDIUM, "alice/casks", True))
-        self.assertEqual(issue.remedies[0].argv[-7:], ["-C", tap, "stash", "push", "--include-untracked", "-m",
+        self.assertEqual((issue.title, issue.evidence[0]),
+                         ("The files of the tap alice/casks were changed",
+                          "`git status` lists 1 changed file: Casks/s/sshfs-helper.rb"))
+        self.assertEqual(issue.remedies[1].argv[-7:], ["-C", tap, "stash", "push", "--include-untracked", "-m",
                                                        "brew-ports " + self.run_dir.run_id])
 
     def test_clean_tap_and_tap_without_git(self):
@@ -317,9 +424,10 @@ class PermissionsServicesCasksTest(HealthCase):
         issue = self.only("brew-unwritable-prefix")
         self.assertEqual((issue.severity, issue.subject), (Severity.HIGH, self.prefix))
         self.assertEqual(issue.blocks, (Blocks.TARGET, Blocks.UNINSTALL))
-        self.assertEqual(issue.evidence, [f"{locked} is not writable"])
-        self.assertTrue(issue.remedies[0].manual)
-        self.assertIn("chown", issue.remedies[0].description)
+        self.assertEqual((issue.title, issue.evidence),
+                         (f"You cannot write to 1 folder of Homebrew at {self.prefix}, so `brew` can neither install "
+                          "nor uninstall there", [f"not writable: {locked}"]))
+        self.assertEqual(self.fixes(issue), [f'Fix: sudo chown -R "$(whoami)" {locked}'])
 
     def test_writable_prefix(self):
         self.assertEqual(self.found("brew-unwritable-prefix", self.detect()), [])
@@ -330,6 +438,10 @@ class PermissionsServicesCasksTest(HealthCase):
                                  pid=321)]
         issue = self.only("brew-orphan-service")
         self.assertEqual((issue.severity, issue.subject), (Severity.LOW, "homebrew.mxcl.mysql"))
+        self.assertEqual((issue.title, issue.evidence),
+                         ("The service homebrew.mxcl.mysql is left over from mysql, which is not installed",
+                          ["its file is ~/Library/LaunchAgents/homebrew.mxcl.mysql.plist",
+                           "it is still loaded, and runs as process 321"]))
         self.assertEqual([(a.argv, a.sudo, a.on_failure) for a in issue.remedies], [
             (["/bin/launchctl", "bootout", "gui/501/homebrew.mxcl.mysql"], False, OnFailure.PROBE),
             ([health.RM, plist], False, OnFailure.PROBE)])
@@ -348,7 +460,7 @@ class PermissionsServicesCasksTest(HealthCase):
         self.cask("foo", apps=("Foo.app",))
         issue = self.only("brew-missing-app")
         self.assertEqual((issue.severity, issue.subject), (Severity.MEDIUM, "foo"))
-        self.assertEqual(issue.evidence, [f"{os.path.join(self.appdir, 'Foo.app')} is missing"])
+        self.assertEqual(issue.title, f"The app of the cask foo is missing: {os.path.join(self.appdir, 'Foo.app')}")
         self.assertEqual(issue.remedies[0].argv, self.brew_argv("reinstall", "--cask", "foo"))
         self.assertTrue(issue.confirm_each)
 
@@ -373,37 +485,51 @@ class PermissionsServicesCasksTest(HealthCase):
         os.makedirs(app)
         self.assertEqual(self.found("brew-missing-app", self.detect()), [])
         os.rmdir(app)
-        self.assertEqual(self.only("brew-missing-app").evidence, [f"{app} is missing"])
+        self.assertEqual(self.only("brew-missing-app").title, f"The app of the cask 1password is missing: {app}")
 
     def test_receiptless_cask_judged_by_a_legacy_internal_caskfile(self):
         write(os.path.join(self.receiptless_cask(), "1password.internal.json"),
               json.dumps({"version": "7.1.2", "raw_artifacts": [[":app", "1Password 7.app"]]}))
-        self.assertEqual(self.only("brew-missing-app").evidence,
-                         [f"{os.path.join(self.appdir, '1Password 7.app')} is missing"])
+        self.assertEqual(self.only("brew-missing-app").title, "The app of the cask 1password is missing: "
+                         + os.path.join(self.appdir, "1Password 7.app"))
 
-    def test_receiptless_cask_of_another_version_is_not_evaluated(self):
+    def test_receiptless_cask_of_another_version_is_not_checked(self):
         write(os.path.join(self.receiptless_cask(), "1password.rb"), 'cask "1password" do\nend\n')
         issue = self.only("brew-missing-app")
         self.assertEqual((issue.severity, issue.title, issue.remedies),
-                         (Severity.INFO, "Cask app bundle missing: not evaluated", []))
-        self.assertIn("1password 7.1.2", issue.evidence[0])
-        self.assertIn("8.11.18", issue.evidence[0])
+                         (Severity.INFO, "Not checked: whether the app of the cask 1password is in place", []))
+        self.assertEqual(issue.evidence, ["Homebrew kept no record of what 1password 7.1.2 installed, and its "
+                                          "package list describes version 8.11.18"])
         self.casks["1password"]["version"] = "7.1.2"
-        self.assertEqual(self.only("brew-missing-app").evidence,
-                         [f"{os.path.join(self.appdir, '1Password.app')} is missing"])
+        self.assertEqual(self.only("brew-missing-app").title, "The app of the cask 1password is missing: "
+                         + os.path.join(self.appdir, "1Password.app"))
 
     def test_caskroom_directory_without_a_cask(self):
         self.cask("leftover", apps=(), known=False, caskfile=False)
+        room = os.path.join(self.prefix, "Caskroom", "leftover")
+        # Without a run folder there is nowhere to save the record, so the user gets the command.
+        issue = self.only("brew-orphan-caskroom")
+        self.assertEqual((issue.confirm_each, self.fixes(issue)[0]), (False, "Fix: " + typed([health.RM, "-rf", room])))
+        self.run_dir = self.state_dir().new_run()
         issue = self.only("brew-orphan-caskroom")
         self.assertEqual((issue.severity, issue.subject), (Severity.LOW, "leftover"))
-        room = os.path.join(self.prefix, "Caskroom", "leftover")
-        archive, remove, note = issue.remedies
+        self.assertEqual(issue.title, "The cask leftover is installed, but Homebrew's package list does not have it "
+                                      "under any name")
+        self.assertEqual(issue.evidence, ["neither a tap nor Homebrew's own copy of the cask says what it is, so "
+                                          "`brew uninstall` does not work for it", f"its record is the folder {room}"])
+        _, archive, remove, note = issue.remedies
         self.assertEqual(archive.argv, [health.TAR, "-czf", "-", "-C", os.path.dirname(room), "leftover"])
-        self.assertTrue(archive.dst.endswith(os.path.join("backup", "caskroom", room.replace("/", "%") + ".tar.gz")))
+        self.assertEqual(archive.dst, os.path.join(self.run_dir.path, "backup", "caskroom",
+                                                   room.replace("/", "%") + ".tar.gz"))
         self.assertEqual(remove.argv, [health.RM, "-rf", room])
         self.assertFalse(archive.sudo or remove.sudo)
         self.assertEqual(note.kind, "note")
         self.assertTrue(issue.confirm_each)
+        self.assertEqual(self.fixes(issue), [
+            "Fix: brew-ports doctor --fix (asks, then saves Homebrew's record of the cask in the run folder, then "
+            "deletes it)",
+            "The apps and files that the cask installed stay: move them to the Trash yourself if you do not want "
+            "them."])
 
     def test_cask_defined_by_tap_caskfile_or_catalogue(self):
         self.cask("sshfs-helper", apps=(), known=False, caskfile=False)
@@ -423,13 +549,14 @@ class PermissionsServicesCasksTest(HealthCase):
         other = make_instance(prefix=self.path("usr", "local"), repository=self.path("usr", "local", "Homebrew"))
         self.extra.append((other, None, inventory.HomebrewInventory(instance_prefix=other.prefix, used_json=True)))
         issues = self.found("brew-strays-in-usr-local", self.detect())
-        self.assertEqual([(i.subject, i.title) for i in issues],
-                         [("/usr/local/lib", "Stray dylibs in /usr/local/lib"),
-                          ("/usr/local/include", "Stray headers in /usr/local/include")])
-        self.assertEqual(issues[0].evidence[:2], ["brew doctor check_for_stray_dylibs:",
-                                                  "Unbrewed dylibs were found in /usr/local/lib."])
-        self.assertEqual((issues[0].severity, issues[0].remedies[0].manual), (Severity.MEDIUM, True))
-        self.assertIn("/usr/local/lib/libstray.dylib", issues[0].remedies[0].description)
+        self.assertEqual([(i.subject, i.title) for i in issues], [
+            ("/usr/local/lib", "/usr/local/lib holds libraries that Homebrew did not install"),
+            ("/usr/local/include", "/usr/local/include holds header files that Homebrew did not install")])
+        self.assertEqual([i.evidence[0] for i in issues], ["libstray.dylib", "openssl/*"])
+        self.assertEqual(issues[0].evidence[1], "software that Homebrew or MacPorts builds can pick them up by mistake")
+        # The files are this Mac's, not one Homebrew's: the finding names no installation.
+        self.assertEqual((issues[0].severity, issues[0].instance_prefix), (Severity.MEDIUM, None))
+        self.assertEqual(self.fixes(issues[0]), ["Fix: delete or move them, unless you put them there on purpose."])
         self.assertEqual(sum(1 for call in self.fake.calls if "doctor" in call), 2)
 
     def test_strays_on_an_intel_host_or_clean_doctor(self):
@@ -448,10 +575,13 @@ class EnvironmentAndOwnershipTest(HealthCase):
                             "records": []}
         issue = self.only("brew-path-order")
         self.assertEqual((issue.severity, issue.subject), (Severity.LOW, os.path.join(self.prefix, "bin")))
-        self.assertEqual(issue.evidence, [f"live PATH entry 1 is /usr/bin, entry 2 is {self.prefix}/bin"])
-        self.assertIn("adds the PATH line", issue.remedies[0].description)
-        self.environment["records"] = [{"kind": "shellenv", "file": "~/.zprofile", "lineno": 3}]
-        self.assertIn("fixes the PATH order", self.only("brew-path-order").remedies[0].description)
+        self.assertEqual(issue.title, f"/usr/bin comes before {self.prefix}/bin on your PATH, so a command of macOS "
+                                      "wins over Homebrew's command of the same name")
+        self.assertEqual(issue.evidence, [f"/usr/bin is entry 1 of your PATH, and {self.prefix}/bin is entry 2"])
+        # The fix by hand holds for every Homebrew; `doctor` names env-cleanup for the one that command keeps.
+        self.assertEqual(self.fixes(issue), [
+            f"Fix, if this is the Homebrew you keep: put {self.prefix}/bin in front of /usr/bin in your shell's "
+            "login file."])
 
     def test_prefix_first_on_path(self):
         self.environment = {"live": {"PATH": [path_entry(os.path.join(self.prefix, "bin")), path_entry("/usr/bin")]}}
@@ -462,6 +592,9 @@ class EnvironmentAndOwnershipTest(HealthCase):
         self.cat_kw["formula_renames"] = {"act_runner": "gitea-runner"}
         issue = self.only("brew-renamed-keg")
         self.assertEqual((issue.severity, issue.subject), (Severity.LOW, "act_runner"))
+        self.assertEqual((issue.title, issue.evidence),
+                         ("Homebrew renamed act_runner to gitea-runner, and the installed copy still has the old name",
+                          [f"its folder is {os.path.join(self.prefix, 'Cellar', 'act_runner')}"]))
         self.assertEqual(issue.remedies[0].argv, self.brew_argv("migrate", "act_runner"))
         self.assertEqual((issue.auto_fix, issue.confirm_each, issue.repairs_install), (True, False, True))
 
@@ -476,7 +609,22 @@ class EnvironmentAndOwnershipTest(HealthCase):
         issue = self.only("brew-degraded-inventory")
         self.assertEqual((issue.severity, issue.subject), (Severity.HIGH, self.prefix))
         self.assertEqual(issue.blocks, (Blocks.TARGET, Blocks.CASKS, Blocks.REMOVE))
-        self.assertEqual(issue.evidence[0], "brew info --json=v2 --installed timed out")
+        self.assertEqual((issue.title, issue.evidence),
+                         ("`brew info` failed, so brew-ports knows only part of what this Homebrew has installed",
+                          ["brew info --json=v2 --installed timed out"]))
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: run it yourself and resolve what Homebrew reports: {self.inst.binary} info --json=v2 --installed",
+            "Then run `brew-ports doctor --rescan`."])
+
+    def test_homebrews_own_error_line_leads_the_evidence(self):
+        self.inst.inventory_error = ("brew info --json=v2 --installed failed with exit 1: Warning: a first line\n"
+                                     "a line of detail\n"
+                                     "Error: the line that names the cause")
+        self.inv.used_json = False
+        self.assertEqual(self.only("brew-degraded-inventory").evidence, [
+            "brew info --json=v2 --installed failed with exit 1: Warning: a first line",
+            "Error: the line that names the cause",
+            "a line of detail"])
 
     def test_no_degraded_inventory_for_macports(self):
         ports = make_instance(model.Manager.PORTS, prefix=self.path("opt", "local"), drivable=False,
@@ -496,10 +644,25 @@ class EnvironmentAndOwnershipTest(HealthCase):
         issue = self.only("brew-root-owned-keg")
         self.assertEqual((issue.severity, issue.subject, issue.blocks), (Severity.HIGH, "postgresql@16",
                                                                          (Blocks.TARGET,)))
-        self.assertEqual(issue.evidence[1], f"owned by root: {keg}")
+        self.assertEqual((issue.title, issue.evidence),
+                         ("Files of postgresql@16 belong to root, so `brew` cannot change them",
+                          [f"{os.path.join(self.prefix, 'opt', 'postgresql@16')}, {keg}",
+                           "a move out of this Homebrew leaves postgresql@16 installed while they do"]))
         self.assertTrue(all(a.manual for a in issue.remedies))
-        self.assertEqual(issue.remedies[0].description, f"sudo {self.inst.binary} services stop postgresql@16")
+        rack, opt = os.path.dirname(keg), os.path.join(self.prefix, "opt", "postgresql@16")
+        self.assertEqual(self.fixes(issue), [
+            f"Fix: sudo {self.inst.binary} services stop postgresql@16",
+            f"Then give the files back to yourself: sudo chown -R -h \"$(whoami)\" {rack} {opt}"])
         self.assertEqual((issue.auto_fix, issue.confirm_each, issue.repairs_install), (False, False, False))
+
+    def test_a_long_list_of_root_owned_files_is_kept_whole(self):
+        self.formula("redis")
+        keg = os.path.join(self.prefix, "Cellar", "redis", "1.0")
+        self.inv.root_owned = {"redis": [os.path.join(keg, f"file{n}") for n in range(12)]}
+        issue = self.only("brew-root-owned-keg")
+        # The first line names eight; the lines after the second name each file, for --verbose and doctor.json.
+        self.assertTrue(issue.evidence[0].endswith("and 4 more"))
+        self.assertEqual(issue.evidence[2:], self.inv.root_owned["redis"])
 
     def test_user_owned_kegs(self):
         self.formula("postgresql@16")
@@ -514,10 +677,15 @@ class EnvironmentAndOwnershipTest(HealthCase):
         issues = self.found("brew-env-override", self.detect())
         self.assertEqual([(i.subject, i.severity, i.blocks) for i in issues],
                          [(system_file, Severity.HIGH, (Blocks.ANY,)), (user_file, Severity.HIGH, (Blocks.ANY,))])
-        self.assertEqual(len(issues[0].evidence), 1)
-        self.assertTrue(issues[0].evidence[0].startswith(f"{system_file}:2: HOMEBREW_NO_AUTOREMOVE= turns off"))
-        self.assertEqual([e.split(":")[1] for e in issues[1].evidence], ["1", "2"])
-        self.assertTrue(issues[0].remedies[0].manual)
+        self.assertEqual(issues[0].title, f"{system_file} changes settings that brew-ports relies on when it runs "
+                                          "`brew`")
+        self.assertEqual(issues[0].evidence, ["line 2: HOMEBREW_NO_AUTOREMOVE= turns off HOMEBREW_NO_AUTOREMOVE=1, "
+                                              "which brew-ports sets for every `brew` command it runs"])
+        self.assertEqual(issues[1].evidence[0], "line 1: HOMEBREW_DEVELOPER=1 sets HOMEBREW_DEVELOPER, which "
+                                                "brew-ports keeps away from every `brew` command it runs")
+        self.assertEqual([e.split(":")[0] for e in issues[1].evidence], ["line 1", "line 2"])
+        self.assertEqual(self.fixes(issues[1]), ["Fix: remove these lines from ~/.homebrew/brew.env, or put a # in "
+                                                 "front of each."])
 
     def test_brew_env_lines_that_keep_the_profile(self):
         system_file = "/etc/homebrew/brew.env"
@@ -533,34 +701,47 @@ class EnvironmentAndOwnershipTest(HealthCase):
         self.assertEqual(self.found("brew-env-override", self.detect()), [])
 
 
-class NotEvaluatedTest(HealthCase):
-    """The not-evaluated findings of the checks that an undrivable instance or a failed probe skips"""
+class NotCheckedTest(HealthCase):
+    """The not-checked findings of the checks that an undrivable instance or a failed probe skips"""
+
+    @staticmethod
+    def unchecked(issues):
+        """Return the findings that stand for a check that could not run
+
+        @param issues  the findings
+        @returns       those the report lists under its last heading
+        """
+        return [i for i in issues if doctor_report.unchecked(i)]
 
     def test_undrivable_instance_skips_brew_checks(self):
         self.inst.usability, self.inst.drivable = model.Usability.MISSING_BINARY, False
         self.inst.usability_detail = f"{self.prefix}/bin/brew is missing"
         self.inv.used_json = False
-        issues = self.detect()
-        skipped = [i for i in issues if i.title.endswith(": not evaluated")]
-        self.assertEqual([i.code for i in skipped],
-                         ["brew-missing-dependency", "brew-outdated-keg", "brew-strays-in-usr-local"])
+        skipped = self.unchecked(self.detect())
+        self.assertEqual([(i.code, i.title) for i in skipped], [
+            ("brew-missing-dependency", "Not checked: whether an installed formula lacks a dependency"),
+            ("brew-outdated-keg", "Not checked: which packages have a newer version"),
+            ("brew-strays-in-usr-local", "Not checked: whether /usr/local holds libraries or header files that "
+                                         "Homebrew did not install")])
         self.assertTrue(all(i.severity is Severity.INFO and i.blocks == () and not i.remedies for i in skipped))
-        self.assertIn(f"brew cannot run on {self.prefix} (missing-binary", skipped[0].evidence[0])
+        self.assertEqual(skipped[0].evidence, [f"its `brew` command cannot run: {self.prefix}/bin/brew is missing"])
+        self.assertEqual(skipped[2].evidence, ["no Homebrew on this Mac can run `brew doctor`, which finds them"])
         self.assertEqual(self.fake.calls, [])
 
     def test_a_failed_brew_info_skips_the_probes_it_gates(self):
         self.inst.inventory_error = "brew info --json=v2 --installed failed with exit 1: Error: no internet"
         self.inv.used_json = False
         issues = self.detect()
-        self.assertEqual([i.code for i in issues if i.title.endswith(": not evaluated")],
-                         ["brew-missing-dependency", "brew-outdated-keg"])
+        self.assertEqual([(i.code, i.evidence) for i in self.unchecked(issues)], [
+            ("brew-missing-dependency", ["`brew info` failed there, so `brew missing` was not run"]),
+            ("brew-outdated-keg", ["`brew info` failed there, so `brew outdated` was not run"])])
         self.assertEqual(len(self.found("brew-degraded-inventory", issues)), 1)
 
     def test_a_failed_brew_missing_skips_one_check(self):
         self.inst.inventory_error = self.inv.inventory_error = "brew missing timed out"
         issues = self.detect()
-        self.assertEqual([i.code for i in issues if i.title.endswith(": not evaluated")], ["brew-missing-dependency"])
-        self.assertIn("brew missing timed out", self.found("brew-missing-dependency", issues)[0].evidence[0])
+        self.assertEqual([(i.code, i.evidence) for i in self.unchecked(issues)],
+                         [("brew-missing-dependency", ["brew missing timed out"])])
         self.assertEqual(self.found("brew-degraded-inventory", issues) + self.found("brew-failed-probe", issues), [])
 
     def test_a_failed_outdated_or_deps_probe_keeps_the_inventory(self):
@@ -570,10 +751,13 @@ class NotEvaluatedTest(HealthCase):
         issues = self.detect()
         self.assertEqual(self.found("brew-degraded-inventory", issues), [])
         probe = self.only("brew-failed-probe")
-        self.assertEqual((probe.severity, probe.blocks, probe.remedies), (Severity.INFO, (), []))
-        self.assertEqual(probe.evidence, [f"{outdated}; {deps}",
-                                          "the outdated packages come from brew info, without their current versions",
-                                          "the dependencies come from the receipts and brew info alone"])
+        self.assertEqual((probe.severity, probe.blocks), (Severity.INFO, ()))
+        self.assertEqual(probe.title, "`brew outdated` and `brew deps` failed, so brew-ports knows less about this "
+                                      "Homebrew")
+        self.assertEqual(probe.evidence, ["packages with a newer version are listed without the number of that version",
+                                          "dependencies come from Homebrew's install records alone",
+                                          f"{outdated}; {deps}"])
+        self.assertEqual(self.fixes(probe), ["Nothing to do: brew-ports works with what `brew info` gave it."])
 
 
 class OrderTest(HealthCase):
@@ -583,7 +767,7 @@ class OrderTest(HealthCase):
         self.formula("wget", receipt=False, linked=False, pinned=True)
         self.inv.missing = {"wget": ["libidn2"]}
         codes = [i.code for i in self.detect()]
-        self.assertEqual(codes, sorted(codes, key=list(health.TITLES).index))
+        self.assertEqual(codes, sorted(codes, key=list(health.SEVERITY).index))
         self.assertEqual(codes, ["brew-keg-without-receipt", "brew-unlinked-keg", "brew-missing-dependency",
                                  "brew-pinned-formula"])
 

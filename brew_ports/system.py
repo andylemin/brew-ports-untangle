@@ -68,6 +68,21 @@ def macos_version(runner) -> str | None:
     return _probe_text(runner, "0.system.sw_vers", [SW_VERS, "-productVersion"], "macOS version")
 
 
+def macos_name(darwin_major: int) -> str:
+    """Return the macOS release of a Darwin major, as people know it
+
+    @param darwin_major  the major of `uname -r`, which MacPorts records for itself and for each port
+    @returns             such as `macOS 15 (Darwin 24)`; `Darwin <n>` alone for a major with no known release
+    """
+    if 20 <= darwin_major <= 24:
+        return f"macOS {darwin_major - 9} (Darwin {darwin_major})"
+    if 25 <= darwin_major <= 26:
+        return f"macOS {darwin_major + 1} (Darwin {darwin_major})"
+    if 5 <= darwin_major <= 19:
+        return f"macOS 10.{darwin_major - 4} (Darwin {darwin_major})"
+    return f"Darwin {darwin_major}"
+
+
 def host_arch(runner) -> str:
     """Return arm64 when the hardware is Apple Silicon, even inside a Rosetta-translated shell
 

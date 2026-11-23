@@ -69,8 +69,7 @@ tar -xzf "brew-ports-0.1.0-macos-$arch.tar.gz" -C ~/.local
 - Use `curl`. A browser marks the download as quarantined, and
   Gatekeeper refuses to run Python inside it.
 - Unpack it outside every Homebrew and MacPorts prefix. If brew-ports runs from
-  inside one, `doctor` reports `system-running-inside-prefix`, and `plan`
-  refuses to start.
+  inside one, `doctor` says so, and `plan` refuses to start.
 - `SHA256SUMS` lists each release's tarball sums.
 
 From a checkout, fetch the same Python first:
@@ -101,7 +100,7 @@ brew-ports has nine commands:
 | Command | What it does |
 | --- | --- |
 | `scan` | Inventory every prefix: packages, services, taps, shell setup, cross-prefix linkage, language packages. |
-| `doctor [--fix]` | Health checks for both managers. `--fix` offers each remedy for confirmation. |
+| `doctor [--fix]` | Health checks for both managers. `--fix` offers the fixes it can make and asks before each. |
 | `recommend` | Score both directions by package coverage, casks, bottles, services, and work, and recommend one. |
 | `bootstrap-ports` | Install MacPorts from its signed installer package on a Mac without it. |
 | `plan --target brew\|ports` | Find a replacement for each package you installed yourself, ask about the uncertain ones, and write `plan.json`. |
@@ -207,7 +206,7 @@ brew-ports exits with one of six codes:
 | Code | Meaning |
 | --- | --- |
 | 0 | Success. |
-| 1 | Findings present (`doctor`, `recommend`), or a refused plan. |
+| 1 | `doctor` found something that stops a move or is broken, `recommend` has findings, or a plan was refused. |
 | 2 | Usage error. |
 | 3 | A precondition failed: running as root, the Command Line Tools missing, a blocking finding, a stale plan, or no `sudo`. |
 | 4 | An action or a service stop failed, or an interrupt stopped the run. The output names the resume command. |
@@ -215,8 +214,29 @@ brew-ports exits with one of six codes:
 
 ## Findings
 
-`doctor` reports each finding by name, with its evidence and remedy. The name's
-first word gives its area:
+`doctor` says what it checked, then whether anything stops a move. Its
+findings follow in groups:
+
+| Group | What is in it |
+| --- | --- |
+| To fix before a move | What stops a move, or a part of one. Each finding says which. |
+| Broken or at risk | What fails today, or will fail once an installation is gone. |
+| Worth cleaning up | Smaller things: leftovers, old versions, PATH entries that lead nowhere. |
+| Only if you keep … | The upkeep of one installation, on a Mac with several. Skip it for an installation you move out of. |
+| For information | Nothing that has to be done. Some have a fix you may want all the same. |
+
+Each finding is one sentence, up to three lines of what was found, and what
+to do: a line that starts with `Fix:`, one that says there is nothing to do,
+or one that says why brew-ports offers no fix. `Fix: brew-ports doctor --fix`
+marks a fix that `doctor --fix` makes for you, after it asks. Checks that
+could not run come last.
+
+`doctor` exits 1 only when a finding is in one of the first two groups.
+
+`--verbose` prints the lines that the short report leaves out, each finding's
+name, and what the scan noted. A long list ends with how many more entries
+there are. `doctor.json` in the run folder holds the findings under the same
+names. A name's first word gives its area:
 
 | Prefix | Area | Example |
 | --- | --- | --- |

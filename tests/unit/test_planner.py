@@ -341,7 +341,8 @@ class RemoveManagerOrderTest(PlannerCase):
         outcome = self.plan(delete=[self.usr_local], casks="drop", keep=["libfoo"], issues=[issue])
         self.assert_exit(outcome, 3)
         self.assertEqual(outcome.problems[:2], [
-            f"brew-ports: this stops the move: finding brew-degraded-inventory ({self.usr_local})", "    evidence"])
+            f"brew-ports: this stops the move: finding brew-degraded-inventory (Homebrew at {self.usr_local})",
+            "    evidence"])
 
     def test_kept_packages_and_manual_casks_refuse(self):
         kept = self.plan(delete=[self.usr_local], casks="drop", keep=["libfoo"])
@@ -617,7 +618,7 @@ class BlockingTest(PlannerCase):
         self.assertEqual(stays.plan.options["remove_manager"], self.usr_local)
         outcome = self.blocked(issue, delete=[self.local])
         self.assert_exit(outcome, 3)
-        self.assertIn(f"brew-ports: this stops the move: finding ports-damaged-registry ({self.local})",
+        self.assertIn(f"brew-ports: this stops the move: finding ports-damaged-registry (MacPorts at {self.local})",
                       outcome.problems)
 
     def test_blocking_comes_before_the_questions(self):
@@ -640,8 +641,8 @@ class DegradedInventoryTest(PlannerCase):
     def test_casks_drop_is_blocked(self):
         outcome = self.plan(casks="drop", issues=[self.issue])
         self.assert_exit(outcome, 3)
-        self.assertIn(f"brew-ports: this stops the move: finding brew-degraded-inventory ({self.usr_local})",
-                      outcome.problems)
+        self.assertIn("brew-ports: this stops the move: finding brew-degraded-inventory (Homebrew at "
+                      f"{self.usr_local})", outcome.problems)
 
     def test_casks_keep_passes(self):
         outcome = self.plan(issues=[self.issue])

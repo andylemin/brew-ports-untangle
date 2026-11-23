@@ -568,7 +568,7 @@ class _Builder:
                 out.append((unit.key, f"installed but switched off; `--uninstall {unit.name}` uninstalls it", FULL))
             if unit.key in self.inp.root_owned:
                 out.append((unit.key, "some of its files belong to root, so `brew` cannot uninstall it; "
-                            "`brew-ports doctor --fix` repairs that", FULL))
+                            "`brew-ports doctor` says how to fix that", FULL))
             if (self.cask_of_homebrew_for_ports(unit) and self.inp.policy == "keep"
                     and unit.key not in self.inp.roots):
                 out.append((unit.key, KEPT_APP, FORMULAE))

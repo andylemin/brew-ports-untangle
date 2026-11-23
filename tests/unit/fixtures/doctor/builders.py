@@ -191,7 +191,7 @@ class FakeClock:
 
 def health_module(name: str, issues: Sequence[model.Issue] = (), *, terminal: Sequence[str] = (),
                   removes: dict[str, Any] | None = None, verified: dict[str, bool | None] | None = None,
-                  repairs: Sequence[str] = (), repair: Callable[..., list[str]] | None = None,
+                  repairs: Sequence[str] = (), repair: Callable[..., tuple[list[str], bool]] | None = None,
                   leaves: Callable[[str], list[model.Issue]] | None = None,
                   notes: Sequence[str] = ()) -> types.SimpleNamespace:
     """Return a stand-in for `homebrew.health` or `macports.health` with the agreed functions
@@ -227,21 +227,22 @@ def health_module(name: str, issues: Sequence[model.Issue] = (), *, terminal: Se
     if name.endswith("macports.health"):
         mod.MANAGER_REPAIRS = tuple(repairs)
 
-        def manager_repair(issue, runner, run_dir, environ, console, *, confirm):
-            """Record the repair in `calls`, then answer with `repair`, else with one report line
+        def manager_repair(issue, runner, run_dir, environ, show, *, confirm):
+            """Record the repair in `calls`, then answer with `repair`, else with one report line that it shows
 
             @param issue    the finding
             @param runner   the runner
             @param run_dir  the run directory, whose id is recorded
             @param environ  the environment
-            @param console  the console
+            @param show     prints a report line as it comes
             @param confirm  asks the user a question and returns the answer
-            @returns        the report lines
+            @returns        the report lines, and that the finding is gone
             """
             mod.calls.append((issue.code, run_dir.run_id))
             if repair:
-                return repair(issue, runner, run_dir, environ, console, confirm=confirm)
-            return [f"repaired {issue.code}"]
+                return repair(issue, runner, run_dir, environ, show, confirm=confirm)
+            show(f"  repaired {issue.code}")
+            return [f"repaired {issue.code}"], True
 
         def recompute_leaves(prefix, _runner, _bundle):
             mod.recomputed.append(prefix)

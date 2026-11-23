@@ -8,18 +8,18 @@ from __future__ import annotations
 import importlib
 import os
 import sqlite3
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
-from . import env, model, progress, scan, servicectl, snapshot, state, system
+from . import doctor_report, env, envclean, model, progress, scan, servicectl, snapshot, state, system
 from .context import Context
 from .env import interpreters as env_interpreters, linkage as env_linkage, shell as env_shell
 from .homebrew import actions as brew_actions, inventory as brew_inventory, locate as brew_locate
 from .homebrew.catalogue import version_key
-from .macports import actions as mp_actions, bootstrap as mp_bootstrap, locate as mp_locate, registry
+from .macports import actions as mp_actions, locate as mp_locate, registry
 from .model import Action, Blocks, Instance, Issue, Manager, PackageKey, Service, Severity, name_key
-from .report import limited, typed
+from .report import COMMAND_OF, SCAN_REUSED, at, by_kind, counted, limited, series, some, tilde, typed
 from .runner import ActionFailed, BaseRunner, EscalationFailed, Interrupted, PreflightError, start_run
 
 # The exit codes of cli.py.
@@ -39,6 +39,17 @@ USR_LOCAL = "/usr/local"
 LEAF = "ports-unrequested-leaf"
 REGISTRY_ERRORS = (registry.RegistryMissing, registry.RegistryBusy, sqlite3.DatabaseError, OSError)
 EXTRA_FILES = {"pipx": "pipx-venvs.txt", "npm": "npm-globals.txt", "gems": "gems.txt", "cpan": "cpan-modules.txt"}
+EXTRA_LABELS = {"pipx": "pipx tools", "npm": "npm packages", "gems": "Ruby gems", "cpan": "Perl modules"}
+EXTRA_TOOLS = {"pipx": "pipx", "npm": "npm", "gems": "gem", "cpan": "cpan"}
+# A PATH finding -> the manager whose `env-cleanup --target` mends it, and the fix line of the installation it keeps.
+ENV_CLEANUP = {
+    "brew-path-order": ("brew", "Fix, if this is the Homebrew you keep: `brew-ports env-cleanup --target brew "
+                                "--apply` puts it in front of /usr/bin in your shell's login file; it shows the "
+                                "change and asks first."),
+    "ports-not-on-path": ("ports", "Fix, if this is the MacPorts you keep: `brew-ports env-cleanup --target ports "
+                                   "--apply` adds it to the PATH in your shell's login file; it shows the change "
+                                   "and asks first."),
+}
 
 
 # Building issues -------------------------------------------------------------------
@@ -125,6 +136,15 @@ def _line_subject(record: dict[str, Any]) -> str:
     return f"{record.get('file')}:{record.get('lineno')}"
 
 
+def _line(record: dict[str, Any]) -> str:
+    """Return a shell file record's place as the report names it
+
+    @param record  a record of the shell analysis
+    @returns       such as `~/.bashrc line 42`
+    """
+    return f"{tilde(str(record.get('file')))} line {record.get('lineno')}"
+
+
 def _records(environment: dict[str, Any], kind: str) -> list[dict[str, Any]]:
     """Return the shell analysis records of one kind
 
@@ -133,18 +153,6 @@ def _records(environment: dict[str, Any], kind: str) -> list[dict[str, Any]]:
     @returns            the records, in the scan's order
     """
     return [r for r in environment.get("records") or [] if r.get("kind") == kind]
-
-
-def _cleanup(code: str, subject: str | None, edits: str, what: str) -> Action:
-    """Return the remedy note of a finding that `brew-ports env-cleanup --apply` deals with
-
-    @param code     the finding's name
-    @param subject  the finding's subject; None for the host
-    @param edits    the `env-cleanup` edits that act on it
-    @param what     what the cleanup does about it
-    @returns        the note action
-    """
-    return note(code, subject, f"`brew-ports env-cleanup --apply` {what} ({edits})")
 
 
 # System ------------------------------------------------------------------------------
@@ -163,15 +171,13 @@ def _clt_missing(facts: dict[str, Any]) -> list[Issue]:
         return []
     evidence = []
     if not selected:
-        evidence.append("xcode-select -p fails: no developer directory is selected")
+        evidence.append("`xcode-select -p` finds no developer folder")
     if no_receipt:
-        evidence.append(f"{system.CLT_DIR} exists, but pkgutil --pkg-info=com.apple.pkg.CLTools_Executables fails")
-    remedies = [manual("system-clt-missing", None, "install", [system.XCODE_SELECT, "--install"],
-                       "install the Command Line Tools"),
-                note("system-clt-missing", None, "or reinstall them through Software Update, as the MacPorts "
-                                                 "ProblemHotlist describes")]
-    return [_issue("system-clt-missing", Severity.HIGH, "Command Line Tools missing or receipt missing", None, None,
-                   evidence=evidence, remedies=remedies, blocks=(Blocks.ANY,))]
+        evidence.append(f"{system.CLT_DIR} exists, but macOS has no install record of it")
+    remedies = [manual("system-clt-missing", None, "install", [system.XCODE_SELECT, "--install"], ""),
+                note("system-clt-missing", None, "Or reinstall them through Software Update.")]
+    return [_issue("system-clt-missing", Severity.HIGH, "Apple's Command Line Tools are missing, or macOS has no "
+                   "record of them", None, None, evidence=evidence, remedies=remedies, blocks=(Blocks.ANY,))]
 
 
 def _xcode_license(facts: dict[str, Any]) -> list[Issue]:
@@ -182,10 +188,11 @@ def _xcode_license(facts: dict[str, Any]) -> list[Issue]:
     """
     if facts.get("xcode_license_ok") is not False:
         return []
-    return [_issue("system-xcode-license", Severity.HIGH, "Xcode licence not accepted", facts.get("developer_dir"),
-                   None, evidence=[f"xcodebuild -license check exits non-zero for {facts.get('developer_dir')}"],
+    return [_issue("system-xcode-license", Severity.HIGH, "The Xcode licence has not been accepted",
+                   facts.get("developer_dir"), None,
+                   evidence=[f"`xcodebuild -license check` fails for {facts.get('developer_dir')}"],
                    remedies=[manual("system-xcode-license", None, "license", [system.XCODEBUILD, "-license", "accept"],
-                                    "accept the Xcode licence", sudo=True)], blocks=(Blocks.ANY,))]
+                                    "", sudo=True)], blocks=(Blocks.ANY,))]
 
 
 def _running_as_root(environ: dict[str, str]) -> list[Issue]:
@@ -197,9 +204,9 @@ def _running_as_root(environ: dict[str, str]) -> list[Issue]:
     if os.geteuid() != 0 and "SUDO_USER" not in environ:
         return []
     evidence = ["effective uid 0"] if os.geteuid() == 0 else ["SUDO_USER is set"]
-    return [_issue("system-running-as-root", Severity.CRITICAL, "Running as root or under sudo", None, None,
-                   evidence=evidence,
-                   remedies=[note("system-running-as-root", None, "run brew-ports as yourself, without sudo")],
+    return [_issue("system-running-as-root", Severity.CRITICAL, "brew-ports is running as root or under sudo", None,
+                   None, evidence=evidence,
+                   remedies=[note("system-running-as-root", None, "Fix: run brew-ports as yourself, without sudo.")],
                    blocks=(Blocks.ANY,))]
 
 
@@ -214,16 +221,16 @@ def _running_inside_prefix(facts: dict[str, Any], instances: Sequence[Instance])
     """
     index = env.PrefixIndex(instances)
     out = []
-    for key, what in (("python_path", "the Python running brew-ports"), ("tool_path", "brew-ports")):
+    for key, what in (("python_path", "The Python that runs brew-ports"), ("tool_path", "brew-ports")):
         path = facts.get(key)
         inst = index.by_identity(path) if path else None
         if inst is None:
             continue
-        out.append(_issue("system-running-inside-prefix", Severity.CRITICAL, "brew-ports runs from inside a prefix",
-                          path, inst.prefix, evidence=[f"{what} is {path}, inside {inst.prefix}"],
-                          remedies=[note("system-running-inside-prefix", inst.prefix, "run the bin/brew-ports of a "
-                                         "release bundle unpacked outside every Homebrew and MacPorts prefix, such as "
-                                         "~/.local")],
+        out.append(_issue("system-running-inside-prefix", Severity.CRITICAL, f"{what} is inside {at(inst)}, which a "
+                          "move may change", path, inst.prefix, evidence=[f"it is {path}"],
+                          remedies=[note("system-running-inside-prefix", inst.prefix, "Fix: unpack a release of "
+                                         "brew-ports outside every Homebrew and MacPorts folder, such as ~/.local, "
+                                         "and run its bin/brew-ports.")],
                           blocks=(Blocks.ANY,)))
     return out
 
@@ -239,11 +246,9 @@ def _low_disk_space(instances: Sequence[Instance]) -> list[Issue]:
         free = system.free_bytes(inst.prefix)
         if free is None or free >= LOW_SPACE_BYTES:
             continue
-        out.append(_issue("system-low-disk-space", Severity.HIGH, "Less than 5 GiB free on the volume of a prefix",
-                          inst.prefix, inst.prefix,
-                          evidence=[f"{free / GIB:.1f} GiB free on the volume of {inst.prefix}"],
-                          remedies=[note("system-low-disk-space", inst.prefix,
-                                         f"free at least 5 GiB on the volume of {inst.prefix}")],
+        out.append(_issue("system-low-disk-space", Severity.HIGH, f"Only {free / GIB:.1f} GiB is free on the disk of "
+                          f"{at(inst)}; a move needs 5", inst.prefix, inst.prefix,
+                          remedies=[note("system-low-disk-space", inst.prefix, "Fix: free up space on that disk.")],
                           blocks=(Blocks.ANY,)))
     return out
 
@@ -256,10 +261,9 @@ def _rosetta_shell(facts: dict[str, Any]) -> list[Issue]:
     """
     if not facts.get("translated"):
         return []
-    return [_issue("system-rosetta-shell", Severity.INFO, "Shell translated by Rosetta", None, None,
-                   evidence=["sysctl -n sysctl.proc_translated is 1"],
-                   remedies=[note("system-rosetta-shell", None, "none needed: every manager command runs under arch "
-                                                                "with its instance's architecture")])]
+    return [_issue("system-rosetta-shell", Severity.INFO, "This Terminal runs under Rosetta (Intel emulation)", None,
+                   None, remedies=[note("system-rosetta-shell", None, "Nothing to do: brew-ports runs each `brew` and "
+                                        "`port` command in the mode its installation needs.")])]
 
 
 def _dyld_export(environment: dict[str, Any]) -> list[Issue]:
@@ -270,10 +274,15 @@ def _dyld_export(environment: dict[str, Any]) -> list[Issue]:
     """
     out = []
     for rec in _records(environment, "dyld"):
+        if rec.get("var") in DYLD_PREFIX_VARS and rec.get("instance_prefixes"):
+            continue                    # the finding of a library path that names an installation covers it
         subject = _line_subject(rec)
-        out.append(_issue("system-dyld-export", Severity.MEDIUM, "DYLD_* export in a shell file", subject, None,
+        out.append(_issue("system-dyld-export", Severity.MEDIUM, f"{_line(rec)} sets a DYLD_ variable, which changes "
+                          "the libraries every program loads", subject, None,
                           evidence=[(rec.get("text") or "").strip()],
-                          remedies=[_cleanup("system-dyld-export", subject, "build exports", "removes the export")]))
+                          remedies=[note("system-dyld-export", subject, "Fix: remove the line unless you know that "
+                                         "you need it. A move removes it only when it points into an installation "
+                                         "that the move uninstalls.")]))
     return out
 
 
@@ -319,6 +328,15 @@ class _Host:
         inst = self.by_prefix.get(prefix or "")
         return inst.manager if inst else None
 
+    def at(self, prefix: str | None) -> str:
+        """Return the installation at a prefix as the report names it
+
+        @param prefix  an instance prefix, or None
+        @returns       such as `MacPorts at /opt/local`; the prefix itself for no instance there
+        """
+        inst = self.by_prefix.get(prefix or "")
+        return at(inst) if inst is not None else prefix or "no installation"
+
     def foreign(self, prefix: str | None) -> bool:
         """Return whether an instance of the other manager exists beside the one at `prefix`
 
@@ -346,20 +364,14 @@ def _both_managers(host: _Host) -> list[Issue]:
     lines: dict[Manager, list[str]] = {Manager.BREW: [], Manager.PORTS: []}
     for inst in host.instances:
         pkgs = host.packages(inst.prefix)
-        if not pkgs:
-            continue
-        if inst.manager is Manager.BREW:
-            formulae, casks = sum(p.kind == "formula" for p in pkgs), sum(p.kind == "cask" for p in pkgs)
-            lines[Manager.BREW].append(f"{inst.prefix}: {formulae} formulae, {casks} casks")
-        else:
-            active = sum(p.active for p in pkgs)
-            lines[Manager.PORTS].append(f"{inst.prefix}: {len(pkgs)} ports ({active} active)")
+        if pkgs:
+            lines[inst.manager].append(f"{at(inst)}: {by_kind(p.kind for p in pkgs)}")
     if not lines[Manager.BREW] or not lines[Manager.PORTS]:
         return []
-    return [_issue("env-both-managers", Severity.INFO, "Both managers present", None, None,
+    return [_issue("env-both-managers", Severity.INFO, "Homebrew and MacPorts both hold packages", None, None,
                    evidence=lines[Manager.BREW] + lines[Manager.PORTS],
                    remedies=[note("env-both-managers", None,
-                                  "`brew-ports recommend` compares migrating in both directions")])]
+                                  "Next: `brew-ports recommend` compares a move in each direction.")])]
 
 
 def _shadowed_commands(host: _Host) -> list[Issue]:
@@ -371,12 +383,17 @@ def _shadowed_commands(host: _Host) -> list[Issue]:
     shadowed = host.environment.get("shadowed") or []
     if not shadowed:
         return []
-    evidence = [f"{s.get('command')}: runs {s.get('winner') or 'nothing on PATH'} "
-                f"(provided by {', '.join(s.get('prefixes') or [])})" for s in shadowed]
-    return [_issue("env-shadowed-commands", Severity.MEDIUM, "Shadowed commands", None, None,
-                   evidence=limited(evidence),
-                   remedies=[_cleanup("env-shadowed-commands", None, "PATH order",
-                                      "orders PATH so the surviving manager wins")])]
+    winners: dict[str, list[str]] = {}
+    for s in shadowed:
+        inst = host.index.by_text(s.get("winner")) if s.get("winner") else None
+        winners.setdefault(at(inst) if inst is not None else "", []).append(str(s.get("command")))
+    evidence = [f"Typing one runs the copy of {who}: {some(names)}" if who
+                else f"Not on your PATH at all: {some(names)}" for who, names in winners.items()]
+    return [_issue("env-shadowed-commands", Severity.MEDIUM, f"{counted(len(shadowed), 'command')} "
+                   f"{'exists' if len(shadowed) == 1 else 'exist'} in more than one installation", None, None,
+                   evidence=evidence,
+                   remedies=[note("env-shadowed-commands", None, "Nothing to do: after a move, the installation you "
+                                  "keep comes first on your PATH.")])]
 
 
 def cross_reference(ref: dict[str, Any], owner_prefix: str | None, index: env.PrefixIndex) -> bool:
@@ -427,7 +444,8 @@ def _rebuild_remedies(host: _Host, inst: Instance | None, kind: str, name: str) 
                                                       name, row.requested_variants, homebrew_present=brew_present)]
         except ValueError:
             pass
-    return [note(code, name, f"rebuild {name} in its own manager once that instance can run it")]
+    command = f"`{COMMAND_OF[inst.manager]}`" if inst is not None else "its manager's"
+    return [note(code, name, f"Fix: install {name} again once the {command} command there can run.")]
 
 
 def _cross_prefix_linkage(host: _Host) -> list[Issue]:
@@ -443,8 +461,7 @@ def _cross_prefix_linkage(host: _Host) -> list[Issue]:
             continue
         for ref in report.get("references") or []:
             if cross_reference(ref, report.get("instance_prefix"), host.index):
-                found.setdefault(key, []).append(f"{path} -> {ref.get('resolved') or ref.get('name')} "
-                                                 f"({ref.get('class')})")
+                found.setdefault(key, []).append(f"{path} loads {ref.get('resolved') or ref.get('name')}")
     out = []
     for key in sorted(found):
         prefix, _, rest = key.partition("|")
@@ -452,7 +469,9 @@ def _cross_prefix_linkage(host: _Host) -> list[Issue]:
         inst = host.by_prefix.get(prefix)
         remedies = _rebuild_remedies(host, inst, kind, name)
         runnable = any(not a.manual for a in remedies)
-        out.append(_issue("env-cross-prefix-linkage", Severity.HIGH, "Cross-prefix linkage", name, prefix,
+        where = at(inst) if inst is not None else prefix
+        out.append(_issue("env-cross-prefix-linkage", Severity.HIGH, f"{name} in {where} uses libraries from another "
+                          "installation, and breaks when that one goes", name, prefix,
                           evidence=limited(found[key]), remedies=remedies, confirm_each=runnable))
     return out
 
@@ -467,8 +486,10 @@ def _local_builds(host: _Host) -> list[Issue]:
     for inst in host.instances:
         names = sorted(p.name for p in host.packages(inst.prefix) if p.built_locally)
         if names:
-            out.append(_issue("env-local-builds", Severity.INFO, "Locally built packages", inst.prefix, inst.prefix,
-                              evidence=[f"{len(names)} built locally: {', '.join(names)}"]))
+            out.append(_issue("env-local-builds", Severity.INFO, f"{counted(len(names), 'package')} of {at(inst)} "
+                              f"{'was' if len(names) == 1 else 'were'} built on this Mac, not installed prebuilt",
+                              inst.prefix, inst.prefix, evidence=[some(names)],
+                              remedies=[note("env-local-builds", inst.prefix, "Nothing to do.")]))
     return out
 
 
@@ -478,24 +499,26 @@ def _dyld_library_path(host: _Host) -> list[Issue]:
     @param host  the scan's view
     @returns     one finding per shell file line and per variable of the environment
     """
-    code, title = "env-dyld-library-path", "DYLD library path naming a prefix"
+    code = "env-dyld-library-path"
     out = []
     for rec in _records(host.environment, "dyld"):
         prefixes = rec.get("instance_prefixes") or []
         if rec.get("var") in DYLD_PREFIX_VARS and prefixes:
             subject = _line_subject(rec)
-            out.append(_issue(code, Severity.HIGH, title, subject, prefixes[0],
-                              evidence=[f"{rec.get('var')} names {', '.join(prefixes)}: "
-                                        f"{(rec.get('text') or '').strip()}"],
-                              remedies=[_cleanup(code, subject, "build exports", "removes the export")]))
+            names = series(host.at(p) for p in prefixes)
+            out.append(_issue(code, Severity.HIGH, f"{_line(rec)} makes every program load libraries from {names}",
+                              subject, prefixes[0], evidence=[(rec.get("text") or "").strip()],
+                              remedies=[note(code, subject, "Fix: remove the line. A move that uninstalls that "
+                                             "installation removes it too.")]))
     live = host.environment.get("live") or {}
     for var in DYLD_PREFIX_VARS:
         named = sorted({e.get("instance_prefix") for e in live.get(var) or [] if e.get("instance_prefix")})
         if named:
-            out.append(_issue(code, Severity.HIGH, title, var, named[0],
-                              evidence=[f"{var} in the environment names {', '.join(named)}"],
-                              remedies=[_cleanup(code, var, "build exports",
-                                                 "removes the export from the shell files")]))
+            names = series(host.at(p) for p in named)
+            out.append(_issue(code, Severity.HIGH, f"{var} in this Terminal makes every program load libraries "
+                              f"from {names}", var, named[0],
+                              remedies=[note(code, var, "Fix: remove the line that sets it from your shell files, "
+                                             "then open a new Terminal window.")]))
     return out
 
 
@@ -505,25 +528,27 @@ def _build_variables(host: _Host) -> list[Issue]:
     @param host  the scan's view
     @returns     one finding per shell file line and per variable of the environment
     """
-    code, title = "env-build-variables", "Build variable naming the other prefix"
+    code = "env-build-variables"
+    why = "Software built with the other installation can pick up files of this one through it."
     out = []
     for rec in _records(host.environment, "build"):
         named = [p for p in rec.get("instance_prefixes") or [] if host.foreign(p)]
         if named:
             subject = _line_subject(rec)
-            out.append(_issue(code, Severity.MEDIUM, title, subject, named[0],
-                              evidence=[f"{rec.get('var')} names {', '.join(named)}: "
-                                        f"{(rec.get('text') or '').strip()}"],
-                              remedies=[_cleanup(code, subject, "build exports", "removes the export")]))
+            names = series(host.at(p) for p in named)
+            out.append(_issue(code, Severity.MEDIUM, f"{_line(rec)} points {rec.get('var')} into {names}", subject,
+                              named[0], evidence=[(rec.get("text") or "").strip(), why],
+                              remedies=[note(code, subject, "Nothing to do while you keep that installation. A move "
+                                             "that uninstalls it removes this line.")]))
     live = host.environment.get("live") or {}
     for var in env_shell.BUILD_VARS:
         named = sorted({e.get("instance_prefix") for e in live.get(var) or []
                         if e.get("instance_prefix") and host.foreign(e.get("instance_prefix"))})
         if named:
-            out.append(_issue(code, Severity.MEDIUM, title, var, named[0],
-                              evidence=[f"{var} in the environment names {', '.join(named)}"],
-                              remedies=[_cleanup(code, var, "build exports",
-                                                 "removes the export from the shell files")]))
+            names = series(host.at(p) for p in named)
+            out.append(_issue(code, Severity.MEDIUM, f"{var} in this Terminal points into {names}", var, named[0],
+                              evidence=[why],
+                              remedies=[note(code, var, "Nothing to do while you keep that installation.")]))
     return out
 
 
@@ -557,20 +582,15 @@ def _split_interpreters(host: _Host) -> list[Issue]:
         a, b = host.index.prefix_of(first), host.index.prefix_of(second)
         if a == b:
             continue
-        out.append(_issue("env-split-interpreters", Severity.MEDIUM, "Split interpreters",
+        outside = "outside Homebrew and MacPorts"
+        out.append(_issue("env-split-interpreters", Severity.MEDIUM, f"{interpreter} and {tool} run from different "
+                          f"places, so {tool} installs where {interpreter} does not look",
                           f"{interpreter}/{tool}", a or b,
-                          evidence=[f"{interpreter} runs {first} ({a or 'outside both managers'})",
-                                    f"{tool} runs {second} ({b or 'outside both managers'})"]))
+                          evidence=[f"{interpreter} is {first} ({host.at(a) if a else outside})",
+                                    f"{tool} is {second} ({host.at(b) if b else outside})"],
+                          remedies=[note("env-split-interpreters", f"{interpreter}/{tool}", "Fix: call both by "
+                                         "their full path, or put the installation you use first on your PATH.")]))
     return out
-
-
-def _extra_name(item: dict[str, Any]) -> str:
-    """Return the name of a language package the interpreter scan found
-
-    @param item  a package of the interpreter extras
-    @returns     its `name`, else its `module`, else `?`
-    """
-    return str(item.get("name") or item.get("module") or "?")
 
 
 def _language_packages(host: _Host) -> list[Issue]:
@@ -579,29 +599,35 @@ def _language_packages(host: _Host) -> list[Issue]:
     @param host  the scan's view
     @returns     one finding per Python site, and per instance for each other kind
     """
-    code, title = "env-language-packages", "Language packages outside both managers"
+    code = "env-language-packages"
     extras = host.result.interpreter_extras
-    out = []
+    counts: dict[str, list[str]] = {}          # per installation, "" for the home folder
+    tools: dict[str, list[str]] = {}
     for item in extras.get("python") or []:
-        dists = item.get("dists") or []
-        if dists:
-            where = item.get("instance_prefix")
-            version = item.get("version", "")
-            subject = f"python{version}"
-            site = item.get("site_packages") or where or "user site"
-            names = ", ".join(_extra_name(d) for d in dists)
-            out.append(_issue(code, Severity.MEDIUM, title, subject, where, evidence=[f"{site}: {names}"],
-                              remedies=[note(code, subject,
-                                             f"listed in requirements-python{version}.txt in the run directory")]))
-    for kind, filename in sorted(EXTRA_FILES.items()):
-        groups: dict[str, list[str]] = {}
-        for item in extras.get(kind) or []:
-            groups.setdefault(item.get("instance_prefix") or "", []).append(_extra_name(item))
-        for where in sorted(groups):
-            out.append(_issue(code, Severity.MEDIUM, title, kind, where or None,
-                              evidence=[f"{kind} ({where or 'user'}): {', '.join(groups[where])}"],
-                              remedies=[note(code, kind, f"listed in {filename} in the run directory; a move does "
-                                                         "not reinstall them")]))
+        if item.get("dists"):
+            where = item.get("instance_prefix") or ""
+            counts.setdefault(where, []).append(f"Python {item.get('version', '')}: {len(item['dists'])}")
+            tools.setdefault(where, []).append("pip")
+    for kind in sorted(EXTRA_FILES):
+        for where in sorted({item.get("instance_prefix") or "" for item in extras.get(kind) or []}):
+            found = sum(1 for item in extras.get(kind) or [] if (item.get("instance_prefix") or "") == where)
+            counts.setdefault(where, []).append(f"{EXTRA_LABELS[kind]}: {found}")
+            tools.setdefault(where, []).append(EXTRA_TOOLS[kind])
+    run_dir = getattr(host.runner, "run_dir", None)
+    folder = tilde(run_dir.path) if run_dir is not None else "the run folder"
+    out = []
+    for where in sorted(counts):
+        used = list(dict.fromkeys(tools[where]))
+        by = f"{', '.join(used[:-1])} or {used[-1]}" if len(used) > 1 else used[0]
+        if where:
+            out.append(_issue(code, Severity.MEDIUM, f"{host.at(where)} holds packages that {by} installed; a move "
+                              "does not move them", where, where, evidence=[", ".join(counts[where])],
+                              remedies=[note(code, where, f"Their names are saved in {folder}, for you to install "
+                                             "them again after a move.")]))
+        else:
+            out.append(_issue(code, Severity.INFO, f"Your home folder holds packages that {by} installed", "home",
+                              None, evidence=[", ".join(counts[where])],
+                              remedies=[note(code, "home", "Nothing to do: a move does not touch them.")]))
     return out
 
 
@@ -614,11 +640,11 @@ def _services_of_both(host: _Host) -> list[Issue]:
     with_data = [s for s in host.result.services if s.owned and s.data_dirs]
     if len({host.manager_of(s.instance_prefix) for s in with_data} - {None}) < 2:
         return []
-    evidence = [f"{s.label} ({s.instance_prefix}): {', '.join(s.data_dirs)}" for s in with_data]
-    return [_issue("env-services-of-both", Severity.MEDIUM, "Services from both managers", None, None,
-                   evidence=evidence,
-                   remedies=[note("env-services-of-both", None,
-                                  "a plan stops and starts these services and lists their data directories")])]
+    evidence = [f"{s.label} ({host.at(s.instance_prefix)}): its data is in {', '.join(s.data_dirs)}" for s in with_data]
+    return [_issue("env-services-of-both", Severity.MEDIUM, "Homebrew and MacPorts both run services that keep data",
+                   None, None, evidence=evidence,
+                   remedies=[note("env-services-of-both", None, "Nothing to do: a plan lists the services it stops "
+                                  "and where their data is.")])]
 
 
 def _dead_path_entries(host: _Host) -> list[Issue]:
@@ -627,23 +653,28 @@ def _dead_path_entries(host: _Host) -> list[Issue]:
     @param host  the scan's view
     @returns     at most one finding
     """
-    evidence = []
-    for text in (host.environment.get("live_duplicates") or {}).get("PATH") or []:
-        evidence.append(f"PATH lists {text} more than once")
-    for entry in (host.environment.get("live") or {}).get("PATH") or []:
-        if entry.get("exists") is False:
-            evidence.append(f"PATH entry {entry.get('text')} does not exist")
+    dead: dict[str, str] = {}                  # the folder as written or expanded -> where it is added
     for rec in _records(host.environment, "assign"):
         if rec.get("var") != "PATH":
             continue
         for entry in rec.get("entries") or []:
             if entry.get("exists") is False:
-                evidence.append(f"{_line_subject(rec)} adds {entry.get('text')}, which does not exist")
-    if not evidence:
+                dead.setdefault(str(entry.get("path") or entry.get("text")),
+                                f"{entry.get('text')} (added by {_line(rec)})")
+    for entry in (host.environment.get("live") or {}).get("PATH") or []:
+        if entry.get("exists") is False:
+            dead.setdefault(str(entry.get("path") or entry.get("text")), tilde(str(entry.get("text"))))
+    twice = [tilde(str(text)) for text in (host.environment.get("live_duplicates") or {}).get("PATH") or []]
+    if not dead and not twice:
         return []
-    return [_issue("env-dead-path-entries", Severity.LOW, "Duplicate or dead PATH entries", "PATH", None,
+    parts = [f"{counted(len(dead), 'folder')} that {'does' if len(dead) == 1 else 'do'} not exist"] if dead else []
+    if twice:
+        parts.append(f"{counted(len(twice), 'folder')} twice")
+    evidence = list(dead.values()) + [f"{text} is listed more than once" for text in twice]
+    return [_issue("env-dead-path-entries", Severity.LOW, f"Your PATH lists {' and '.join(parts)}", "PATH", None,
                    evidence=limited(evidence),
-                   remedies=[_cleanup("env-dead-path-entries", "PATH", "path entries, dead entries", "drops them")])]
+                   remedies=[note("env-dead-path-entries", "PATH", "Fix: delete them from your shell files yourself; "
+                                  "brew-ports leaves them. They do no harm.")])]
 
 
 def _etc_paths(host: _Host) -> list[Issue]:
@@ -657,10 +688,11 @@ def _etc_paths(host: _Host) -> list[Issue]:
         entry = line.get("entry") or {}
         if entry.get("instance_prefix") and not line.get("stock"):
             subject = f"{line.get('file')}:{line.get('lineno')}"
-            out.append(_issue("env-etc-paths", Severity.MEDIUM, "/etc/paths entry for a prefix", subject,
-                              entry.get("instance_prefix"), evidence=[f"{subject} names {entry.get('text')}"],
-                              remedies=[_cleanup("env-etc-paths", subject, "system paths",
-                                                 "rewrites the file with sudo")]))
+            out.append(_issue("env-etc-paths", Severity.MEDIUM, f"{line.get('file')} puts {entry.get('text')} on "
+                              "every user's PATH", subject, entry.get("instance_prefix"),
+                              remedies=[note("env-etc-paths", subject, "Nothing to do while you keep "
+                                             f"{host.at(entry.get('instance_prefix'))}. A move that uninstalls it "
+                                             "removes this line, with sudo.")]))
     return out
 
 
@@ -675,12 +707,13 @@ def _gui_path(host: _Host) -> list[Issue]:
     if not named:
         return []
     kept = ":".join(e.get("text", "") for e in gui if not e.get("instance_prefix"))
-    return [_issue("env-gui-path", Severity.LOW, "GUI PATH names a prefix", "GUI PATH",
-                   named[0].get("instance_prefix"),
-                   evidence=[f"launchctl getenv PATH names {', '.join((e.get('text', '') for e in named))}"],
+    folders = series(e.get("text", "") for e in named)
+    return [_issue("env-gui-path", Severity.LOW, f"Apps opened from Finder get a PATH that includes {folders}",
+                   "GUI PATH", named[0].get("instance_prefix"),
                    remedies=[manual("env-gui-path", None, "path",
                                     [servicectl.LAUNCHCTL, "config", "user", "path", kept],
-                                    "set the GUI PATH without the prefix entries", sudo=True)])]
+                                    "Nothing to do while you keep that installation. To take it off that PATH",
+                                    sudo=True)])]
 
 
 def _shell_markers(host: _Host) -> list[Issue]:
@@ -693,10 +726,13 @@ def _shell_markers(host: _Host) -> list[Issue]:
     if not recs:
         return []
     recs.sort(key=lambda r: (str(r.get("file")), r.get("lineno") or 0))
-    evidence = [f"{_line_subject(r)} {(r.get('text') or '').strip()}" for r in recs]
-    return [_issue("env-shell-markers", Severity.INFO, "Installer and shellenv markers", None, None,
+    evidence = [f"{_line(r)}: {(r.get('text') or '').strip()}" for r in recs]
+    files = series(dict.fromkeys(tilde(str(r.get("file"))) for r in recs))
+    return [_issue("env-shell-markers", Severity.INFO, f"{counted(len(recs), 'line')} of {files} "
+                   f"{'sets' if len(recs) == 1 else 'set'} up Homebrew or MacPorts", None, None,
                    evidence=limited(evidence),
-                   remedies=[note("env-shell-markers", None, "lines `brew-ports env-cleanup` edits")])]
+                   remedies=[note("env-shell-markers", None, "Nothing to do: a move removes the lines of an "
+                                  "installation that it uninstalls.")])]
 
 
 def _user_launchd_job(host: _Host) -> list[Issue]:
@@ -709,11 +745,13 @@ def _user_launchd_job(host: _Host) -> list[Issue]:
     for svc in host.result.services:
         if svc.owned:
             continue
-        program = svc.program or f"a program under {svc.instance_prefix}"
-        out.append(_issue("env-user-launchd-job", Severity.MEDIUM, "A user's own launchd job runs a manager's binary",
-                          svc.plist, svc.instance_prefix, evidence=[f"{svc.plist} runs {program}"],
-                          remedies=[note("env-user-launchd-job", svc.plist, "edit or remove it by hand before its "
-                                         "program's package or prefix goes; the tool never stops or deletes it")]))
+        program = svc.program or f"a program in {svc.instance_prefix}"
+        out.append(_issue("env-user-launchd-job", Severity.MEDIUM, f"Your own service {svc.label} runs a program "
+                          f"from {host.at(svc.instance_prefix)}", svc.plist, svc.instance_prefix,
+                          evidence=[f"{tilde(svc.plist)} runs {program}"],
+                          remedies=[note("env-user-launchd-job", svc.plist, "Fix: edit or delete that service file "
+                                         "before a move uninstalls the program. brew-ports never stops or deletes "
+                                         "a service of your own.")]))
     return out
 
 
@@ -728,12 +766,11 @@ def _login_shell(host: _Host) -> list[Issue]:
     if not shell or not owner:
         return []
     real = host.environment.get("login_shell_realpath")
-    shown = shell if not real or real == shell else f"{shell} ({real})"
-    return [_issue("env-login-shell", Severity.HIGH, "Login shell provided by a package", shell, owner,
-                   evidence=[f"the login shell {shown} lies under {owner}"],
-                   remedies=[note("env-login-shell", shell, "a plan that removes its package needs an accepted "
-                                                            "mapping for it, and phase 5 switches the login shell "
-                                                            "before any removal")])]
+    return [_issue("env-login-shell", Severity.HIGH, f"Your login shell {shell} is part of {host.at(owner)}", shell,
+                   owner, evidence=[f"it is the file {real}"] if real and real != shell else [],
+                   remedies=[note("env-login-shell", shell, "Nothing to do: a move out of that installation changes "
+                                  "your login shell to the replacement before it uninstalls the old one, or leaves "
+                                  "the shell's package where it is and says so.")])]
 
 
 def _sourced_files(host: _Host) -> list[Issue]:
@@ -748,10 +785,12 @@ def _sourced_files(host: _Host) -> list[Issue]:
         if not prefixes and rec.get("brew") != "":
             continue
         subject = _line_subject(rec)
-        out.append(_issue("env-sourced-files", Severity.LOW, "Shell file sources files from a prefix", subject,
+        what = f"uses a path inside {host.at(prefixes[0])}" if prefixes else "runs `brew` by name"
+        out.append(_issue("env-sourced-files", Severity.LOW, f"{_line(rec)} {what}", subject,
                           prefixes[0] if prefixes else None, evidence=[(rec.get("text") or "").strip()],
-                          remedies=[_cleanup("env-sourced-files", subject, "sourced files",
-                                             "neutralises the line when that prefix is removed")]))
+                          remedies=[note("env-sourced-files", subject, "Nothing to do while you keep that "
+                                         "installation. A move that uninstalls it disables this line and keeps "
+                                         "the original as a comment.")]))
     return out
 
 
@@ -792,7 +831,7 @@ def _runnable(issue: Issue) -> list[Action]:
     @param issue  a finding
     @returns      the actions, in order
     """
-    return [a for a in issue.remedies if a.kind == "command" and not a.manual]
+    return doctor_report.runs(issue)
 
 
 def _defer_cross_linkage(issues: list[Issue]) -> None:
@@ -805,8 +844,23 @@ def _defer_cross_linkage(issues: list[Issue]) -> None:
     for issue in issues:
         code = rebuilt.get((issue.instance_prefix, issue.subject)) if issue.code == "env-cross-prefix-linkage" else None
         if code:
-            issue.remedies = [note(issue.code, issue.subject, f"rebuilt by the {code} remedy")]
+            issue.remedies = [note(issue.code, issue.subject, f"The fix of the other finding about {issue.subject} "
+                                   f"installs {issue.subject} again, which mends this too.")]
             issue.confirm_each = False
+
+
+def path_fixes(issues: Sequence[Issue], kept: Mapping[str, str | None]) -> None:
+    """Name `env-cleanup` as the fix of a PATH finding about the installation which that command keeps
+
+    A health module names the fix by hand, which holds for every installation of its manager.
+
+    @param issues  every finding; one about a kept installation is changed in place
+    @param kept    the prefix of the installation that `env-cleanup --target <manager>` keeps, by manager name
+    """
+    for issue in issues:
+        manager, fix = ENV_CLEANUP.get(issue.code, ("", ""))
+        if manager and issue.remedies and issue.instance_prefix and issue.instance_prefix == kept.get(manager):
+            issue.remedies[0] = replace(issue.remedies[0], description=fix)
 
 
 def sort_issues(issues: Sequence[Issue]) -> list[Issue]:
@@ -1004,19 +1058,22 @@ def blocking(issues: Iterable[Issue], plan_context: PlanContext) -> list[Issue]:
     return out
 
 
-def blocked_by_lines(found: Iterable[Issue]) -> list[str]:
+def blocked_by_lines(found: Sequence[Issue], instances: Sequence[Instance]) -> list[str]:
     """Return a line for each finding that stops the move, with what was found and how to fix it
 
-    @param found  the blocking findings
-    @returns      the lines; the evidence and the remedies are indented under their finding
+    @param found      the blocking findings
+    @param instances  the installations of the scan the findings come from
+    @returns          the lines; the evidence and the remedies are indented under their finding
     """
+    by_prefix = doctor_report.known(instances)
     lines = []
     for issue in found:
-        subject = f": {issue.subject}" if issue.subject else ""
-        where = f" ({issue.instance_prefix})" if issue.instance_prefix not in (None, issue.subject) else ""
-        lines.append(f"this stops the move: {issue.title}{subject}{where}")
+        lines.append(f"this stops the move: {doctor_report.named(issue, by_prefix)}")
         lines.extend(f"    {line}" for line in issue.evidence[:EVIDENCE_SHOWN])
-        lines.extend(f"    Fix: {describe(a)}" for a in issue.remedies)
+        more = len(issue.evidence) - EVIDENCE_SHOWN
+        if more > 0:
+            lines.append(f"    and {counted(more, 'more line')} (`brew-ports doctor --verbose` shows them)")
+        lines.extend(f"    {line}" for line in doctor_report.fix_lines(issue, doctor_report.refused(issue, found)))
     return lines
 
 
@@ -1091,68 +1148,13 @@ def describe(action: Action) -> str:
     return typed(action.argv, action.sudo)
 
 
-def _tag(issue: Issue, action: Action) -> str:
-    """Return the report's label of a remedy: a note, a manual command, or a fix and how it is confirmed
-
-    @param issue   the finding
-    @param action  one of its remedies
-    @returns       `note:`, `manual:`, `fix [auto]:`, `fix [confirm]:` or `fix:`
-    """
-    if action.kind == "note":
-        return "note:"
-    if action.manual:
-        return "manual:"
-    return "fix [auto]:" if issue.auto_fix else ("fix [confirm]:" if issue.confirm_each else "fix:")
-
-
-def issue_lines(issue: Issue) -> list[str]:
-    """Return the report lines of one finding: its name and title, its evidence, then its remedies
-
-    @param issue  a finding
-    @returns      the lines, indented for the report
-    """
-    head = f"  {issue.code}  {issue.title}"
-    if issue.subject:
-        head += f": {issue.subject}"
-    if issue.instance_prefix and issue.instance_prefix != issue.subject:
-        head += f"  ({issue.instance_prefix})"
-    lines = [head] + [f"        {line}" for line in issue.evidence]
-    lines += [f"        {_tag(issue, a)} {describe(a)}" for a in issue.remedies]
-    return lines
-
-
-def render(issues: Sequence[Issue], blocks: dict[str, list[str]], notes: Sequence[str] = ()) -> list[str]:
-    """Return the text report: the issues by severity, what blocks a plain plan per target, then the notes
-
-    @param issues  the findings, sorted
-    @param blocks  the names of the blocking findings by target manager
-    @param notes   the scan's notes
-    @returns       the report lines
-    """
-    if not issues:
-        lines = ["doctor: no findings"]
-    else:
-        lines = []
-        for severity in sorted(Severity, reverse=True):
-            group = [i for i in issues if i.severity is severity]
-            if group:
-                lines.append(severity.name)
-                for issue in group:
-                    lines.extend(issue_lines(issue))
-    lines.append("")
-    for target in ("brew", "ports"):
-        lines.append(f"blocks apply (target {target}): {', '.join(blocks.get(target) or []) or 'none'}")
-    lines.extend(f"note: {text}" for text in notes)
-    return lines
-
-
 def findings_exit(issues: Sequence[Issue]) -> int:
-    """Return exit 1 when an issue above INFO is present, else 0
+    """Return exit 1 when a finding calls for action: it stops a move, or something is broken
 
     @param issues  the findings
     @returns       `EXIT_FINDINGS` or `EXIT_OK`
     """
-    return EXIT_FINDINGS if any(i.severity > Severity.INFO for i in issues) else EXIT_OK
+    return EXIT_FINDINGS if doctor_report.problems(issues) else EXIT_OK
 
 
 # --fix -------------------------------------------------------------------------------
@@ -1168,18 +1170,6 @@ def _key(issue: Issue) -> tuple[str, str | None, str | None]:
     @returns      the key that names it across a recomputation
     """
     return (issue.code, issue.instance_prefix, issue.subject)
-
-
-def _at_macports_default(inst: Instance) -> bool:
-    """Return whether the instance is at `/opt/local`, the base package's only prefix: by identity, else by text
-
-    @param inst  a MacPorts instance
-    @returns     True at `/opt/local`
-    """
-    ident = system.identity(mp_locate.DEFAULT_PREFIX)
-    if ident is not None and tuple(inst.identity) == ident:
-        return True
-    return os.path.normpath(inst.prefix) == os.path.normpath(mp_locate.DEFAULT_PREFIX)
 
 
 def _versions(issue: Issue) -> set[str]:
@@ -1214,9 +1204,9 @@ def _brew_owner(prefix: str, path: str) -> tuple[str, str] | None:
 
 
 class _Fixer:
-    """`doctor --fix`: the `auto_fix` remedies behind one confirmation, then each `confirm_each` one by one
+    """`doctor --fix`: the `auto_fix` remedies behind one question, then each `confirm_each` one by one
 
-    A finding about a package that an earlier remedy of the run changed is skipped, with the rescan note.
+    A finding about a package that an earlier remedy of the run changed is skipped, and the output says so.
     """
 
     def __init__(self, ctx: Context, runner, run_dir: state.RunDir, bundle, issues: Sequence[Issue]) -> None:
@@ -1237,9 +1227,9 @@ class _Fixer:
         uid = bundle.result.system.get("uid")
         self.uid = uid if isinstance(uid, int) else os.getuid()
         self.dry_run = ctx.args.dry_run
-        self.env_overrides = {i.instance_prefix for i in self.issues if i.code == "brew-env-override"}
         self.fixed: set[int] = set()
-        self.superseded: set[int] = set()        # unrequested leaves a recomputation replaced
+        # Findings that are gone without a fix: leaves a recomputation replaced, a repair with nothing left to do.
+        self.superseded: set[int] = set()
         self.declined: set[tuple[str, str | None, str | None]] = set()
         self.snapshotted: set[str] = set()
         self.repaired: set[str | None] = set()
@@ -1247,12 +1237,23 @@ class _Fixer:
         self.changed: dict[PackageKey, str] = {}        # a package a remedy changed -> that remedy's finding
         self.touched = False
 
-    def say(self, text: str) -> None:
-        """Print one line of the `--fix` output
+    def say(self, text: str = "") -> None:
+        """Print one line of the `--fix` output; under `--json` it goes to the error stream, beside the JSON
 
-        @param text  the line
+        @param text  the line; empty for a blank line
         """
-        self.ctx.console.out(text)
+        if self.ctx.console.json_mode:
+            self.ctx.console.warn(text)
+        else:
+            self.ctx.console.out(text)
+
+    def named(self, issue: Issue) -> str:
+        """Return a finding as the `--fix` output names it
+
+        @param issue  a finding
+        @returns      its title, with its installation when the title does not name it
+        """
+        return doctor_report.named(issue, self.instances)
 
     # Which remedies ------------------------------------------------------------
 
@@ -1270,10 +1271,7 @@ class _Fixer:
         @param issue  a finding
         @returns      True when `brew-env-override` holds for its instance and one of its commands runs brew
         """
-        if not self.env_overrides:
-            return False
-        uses_brew = any(a.env_profile == "brew" for a in _runnable(issue))
-        return uses_brew and (issue.instance_prefix in self.env_overrides or None in self.env_overrides)
+        return doctor_report.refused(issue, self.issues)
 
     def ordered(self, issues: Iterable[Issue]) -> list[Issue]:
         """Sort by family; manager repairs go first among `ports-*`, as they replace the ports the others came from
@@ -1338,27 +1336,6 @@ class _Fixer:
         if not pair or not self.touches_active(issue, pair):
             return []
         return self.services_of(issue, pair)
-
-    def procedure_steps(self, issue: Issue) -> list[str]:
-        """Return the base package procedure's steps for the prompt and `--dry-run`; empty when the repair skips it
-
-        Only `ports-cannot-run`, and `ports-platform-mismatch` on a base without `port migrate`, run it.
-
-        @param issue  a finding
-        @returns      the step lines
-        """
-        if issue.code not in ("ports-platform-mismatch", "ports-cannot-run") or not self.is_manager_repair(issue):
-            return []
-        inst = self.instances.get(issue.instance_prefix or "")
-        if inst is None or not _at_macports_default(inst):
-            return []
-        if issue.code == "ports-platform-mismatch" and "migrate" in inst.features and inst.binary:
-            return []
-        try:
-            major = mp_bootstrap.macos_major(self.bundle.result.system.get("macos"))
-        except mp_bootstrap.BootstrapError:
-            return ["the MacPorts base package procedure (the macOS version is not known yet)"]
-        return mp_bootstrap.describe(major)
 
     def needs_sudo(self, issues: Sequence[Issue]) -> bool:
         """Return whether any remedy, snapshot step or service stop needs sudo, so the preflight runs first
@@ -1453,61 +1430,77 @@ class _Fixer:
         @returns      True when the finding is skipped
         """
         changed = sorted(key for key in self.packages_of(issue) if key in self.changed)
+        inst = self.instances.get(issue.instance_prefix or "")
         if issue.instance_prefix in self.repaired:
-            why = f"the manager repair changed {issue.instance_prefix}"
+            what = at(inst) if inst is not None else str(issue.instance_prefix)
         elif changed:
-            why = f"the {self.changed[changed[0]]} remedy changed {changed[0][2]}"
+            what = changed[0][2]
         else:
             return False
-        self.say(f"  {issue.code} {issue.subject or ''}: skipped, {why}; run `brew-ports doctor --rescan`")
+        self.say()
+        self.say(f"Skipped: {self.named(issue)}")
+        self.say(f"  An earlier fix of this run changed {what}, so this finding may be out of date. `brew-ports "
+                 "doctor` checks again.")
         return True
 
     # Prompts -------------------------------------------------------------------
 
-    def describe_remedy(self, issue: Issue) -> list[str]:
-        """Return the lines that present a finding before `--fix` applies it: its remedies and what runs first
+    def first(self, issue: Issue) -> list[str]:
+        """Return what `--fix` does before the commands of a fix that removes or replaces a package
 
         @param issue  the finding
-        @returns      the lines, indented for the prompt
+        @returns      the steps, as the words that follow `y `: the record it saves for undo, the services it stops
         """
-        subject = f": {issue.subject}" if issue.subject else ""
-        where = f"  ({issue.instance_prefix})" if issue.instance_prefix else ""
-        lines = [f"  {issue.code}  {issue.title}{subject}{where}"]
-        lines += [f"      {describe(a)}" for a in _runnable(issue)]
         pair = removes_package(issue)
-        if pair:
-            services = self.stoppable(issue, pair)
-            lines.append(f"      first: the phase 1 snapshot of {issue.instance_prefix or 'the instance'}")
-            if services:
-                lines.append(f"      first: stop {', '.join((s.label for s in services))} and wait for them to exit")
-            data = sorted({d for s in services for d in s.data_dirs})
-            if data:
-                lines.append(f"      data directories of {pair[1]}: {', '.join(data)}")
-        if self.is_manager_repair(issue):
-            lines.append(f"      a manager repair of {issue.instance_prefix}")
-            steps = self.procedure_steps(issue)
-            if steps:
-                lines.append("      the MacPorts base package procedure:")
-                lines += [f"        {step}" for step in steps]
-        if needs_terminal_answer(issue):
-            lines.append("      needs an answer on a terminal")
+        if not pair:
+            return []
+        inst = self.instances.get(issue.instance_prefix or "")
+        steps = []
+        if inst is not None and inst.prefix not in self.snapshotted:
+            steps.append(f"saves what is installed in {at(inst)}, for `brew-ports rollback`")
+        services = [s for s in self.stoppable(issue, pair) if s.loaded]
+        if services:
+            steps.append(f"stops {series('the service ' + s.label for s in services)}")
+        return steps
+
+    def offer(self, issue: Issue, how: str) -> list[str]:
+        """Return the lines that present a fix: the finding, what `--fix` does for it, and what else to know
+
+        @param issue  the finding
+        @param how    `ask` when a question follows, `dry` or `dry-yes` in a dry run, `run` when the commands
+                      follow unasked
+        @returns      the lines
+        """
+        lines = doctor_report.offer(issue, self.instances, self.first(issue), how)
+        pair = removes_package(issue)
+        services = self.stoppable(issue, pair) if pair else []
+        loaded = [s for s in services if s.loaded]
+        if loaded:
+            one = len(loaded) == 1
+            lines.append(f"  Afterwards it starts {'that service' if one else 'those services'} again; when the "
+                         f"package is gone, it deletes {'its service file' if one else 'their service files'} "
+                         "instead.")
+        data = sorted({d for s in services for d in s.data_dirs})
+        if pair and data:
+            lines.append(f"  The data of {pair[1]} is in {series(data)}.")
         return lines
 
     def ask(self, issue: Issue) -> bool:
-        """Present a finding and ask whether to apply it; a removal takes only an answer on a terminal
+        """Present a fix and ask whether to make it; a removal takes only an answer on a terminal
 
         @param issue  the finding
         @returns      True when the user agrees
         """
-        for line in self.describe_remedy(issue):
+        removal = needs_terminal_answer(issue)
+        asked = self.ctx.tty and (removal or not self.ctx.yes)
+        self.say()
+        for line in self.offer(issue, "ask" if asked else "run"):
             self.say(line)
-        question = f"Apply {issue.code} to {issue.subject or issue.instance_prefix or 'this host'}?"
-        if needs_terminal_answer(issue):
-            answer = self.ctx.confirm_terminal(question)
-            if not answer and not self.ctx.tty:
-                self.say(f"  {issue.code} needs an answer on a terminal: not applied")
-            return answer
-        return self.ctx.confirm(question, default=False)
+        if removal:
+            if self.ctx.yes and not self.ctx.tty:
+                self.say("  Not asked: this is one of the fixes that take your own answer on a terminal.")
+            return self.ctx.confirm_terminal(doctor_report.QUESTION)
+        return self.ctx.confirm(doctor_report.QUESTION, default=False)
 
     # Applying ------------------------------------------------------------------
 
@@ -1524,10 +1517,15 @@ class _Fixer:
         """
         if inst.prefix in self.snapshotted:
             return
-        snapshot.write(self.runner, self.run_dir, self.bundle, [inst], id_prefix="doctor",
-                       local_snapshot=not self.snapshotted, uid=self.uid)
+        first = not self.snapshotted
+        earlier = snapshot.noted(self.run_dir)
+        written = snapshot.write(self.runner, self.run_dir, self.bundle, [inst], id_prefix="doctor",
+                                 local_snapshot=first, uid=self.uid)
         self.snapshotted.add(inst.prefix)
-        self.say(f"  snapshot of {inst.prefix} in {snapshot.snapshot_dir(self.run_dir)}")
+        folder = f"the run folder, {tilde(self.run_dir.path)}," if first else "the run folder,"
+        self.say(f"  Saved what is installed in {at(inst)} in {folder} for `brew-ports rollback`.")
+        for line in snapshot.outcome(written, first, earlier):
+            self.say("  " + line)
 
     def still_installed(self, inst: Instance | None, pair: tuple[str, str]) -> bool:
         """Return whether the package is still on disk or in a fresh registry backup
@@ -1575,12 +1573,12 @@ class _Fixer:
         prefix = remedy_id(issue.code, issue.subject, "service")
         if not self.still_installed(inst, pair):
             for svc, gone in servicectl.delete_plists(self.runner, services, id_prefix=prefix):
-                if not gone:
-                    self.say(f"  could not delete {svc.plist}")
+                self.say(f"  Deleted the service file {tilde(svc.plist)}." if gone
+                         else f"  Could not delete the service file {tilde(svc.plist)}; delete it yourself.")
             return
         for svc, ok in servicectl.restart(self.runner, booted, list(self.instances.values()), id_prefix=prefix):
-            if not ok:
-                self.say(f"  could not start {svc.label} again from {svc.plist}")
+            self.say(f"  Started the service {svc.label} again." if ok
+                     else f"  Could not start the service {svc.label} again; start it yourself.")
 
     def execute(self, issue: Issue, services: Sequence[Service], booted: list[Service]) -> str | None:
         """Stop the services, run the actions and the post-check; return the failure text, or None
@@ -1601,8 +1599,13 @@ class _Fixer:
                 return str(stopped.error)
             if stopped.still_running:
                 return "; ".join(reason for _, reason in stopped.still_running)
+            for svc in stopped.booted:
+                self.say(f"  Stopped the service {svc.label}.")
         actions = _runnable(issue)
-        results = [self.runner.run(action, defer_result=True) for action in actions]
+        results = []
+        for action in actions:
+            results.append(self.runner.run(action, defer_result=True))
+            self.ran(action, results[-1])
         # A post-check decides whatever the exit statuses said; without one they decide.
         checked = verify(issue, self.runner, self.bundle)
         ok = checked if checked is not None else all(r.ok for r in results)
@@ -1610,10 +1613,19 @@ class _Fixer:
             if not action.read_only:
                 self.runner.record_result(action, ok)
         if checked is False:
-            return f"the post-check of {issue.code} found it unrepaired"
+            return f"the commands ran, but a check afterwards still finds the problem: {issue.title}"
         if not ok:
-            return f"a command of {issue.code} failed"
+            return str(ActionFailed(next(r for r in results if not r.ok)))
         return None
+
+    def ran(self, action: Action, result) -> None:
+        """Print a command that worked, and where its output was saved; a failure is the error that ends the run
+
+        @param action  the command
+        @param result  its result
+        """
+        if result.ok:
+            self.say(f"  {describe(action)} ... ok" + (f", saved as {tilde(action.dst)}" if action.dst else ""))
 
     def apply(self, issue: Issue) -> None:
         """Apply one remedy, with the snapshot and the service stops of a removal, and note the packages it changed
@@ -1637,16 +1649,15 @@ class _Fixer:
             if pair and services:
                 self.after(issue, pair, services, booted)
         if failure:
-            raise _Stopped(f"{issue.code} {issue.subject or ''}: {failure}")
+            raise _Stopped(failure)
         self.fixed.add(id(issue))
         if self.changes_package(issue):
             for key in self.packages_of(issue):
                 self.changed.setdefault(key, issue.code)
-        self.say(f"  {issue.code} {issue.subject or ''}: done")
 
     @staticmethod
     def answered(_question: str) -> bool:
-        """Answer yes to the base package procedure's question: the repair's own prompt showed its steps
+        """Answer yes to the installer's own question: the fix's question said what the installer does
 
         @param _question  the procedure's question
         @returns          True
@@ -1661,104 +1672,142 @@ class _Fixer:
         """
         self.touch()
         try:
-            lines = health_module("ports").manager_repair(issue, self.runner, self.run_dir, self.ctx.environ,
-                                                          self.ctx.console, confirm=self.answered)
+            _, fixed = health_module("ports").manager_repair(issue, self.runner, self.run_dir, self.ctx.environ,
+                                                             self.say, confirm=self.answered)
         except (ActionFailed, EscalationFailed, Interrupted) as exc:
-            raise _Stopped(f"{issue.code} {issue.instance_prefix or ''}: {exc}") from None
-        for line in lines:
-            self.say("  " + line)
+            raise _Stopped(str(exc)) from None
         self.repaired.add(issue.instance_prefix)
-        self.fixed.add(id(issue))
+        if fixed:
+            self.fixed.add(id(issue))
+        elif fixed is None:
+            self.superseded.add(id(issue))
 
     # The run -------------------------------------------------------------------
 
-    def candidates(self) -> tuple[list[Issue], list[Issue]]:
-        """Return the findings `--fix` applies after one confirmation, and those it asks about one by one
+    def candidates(self) -> tuple[list[Issue], list[Issue], list[Issue]]:
+        """Return the fixes `--fix` makes after one answer for them all, and those it asks about one by one
 
-        @returns  both lists, ordered; a finding whose brew remedy `brew-env-override` refuses is in neither
+        A single fix of the first kind is asked about like the others.
+
+        @returns  both lists, ordered, and the findings whose brew remedy `brew-env-override` refuses, which are in
+                  neither
         """
         auto = [i for i in self.issues if i.auto_fix and _runnable(i)]
         each = [i for i in self.issues if i.confirm_each and not i.auto_fix
                 and (_runnable(i) or self.is_manager_repair(i))]
-        kept_auto, kept_each = [], []
+        kept_auto, kept_each, refused = [], [], []
         for issue in auto + each:
             if self.refused(issue):
-                self.say(f"  {issue.code} {issue.subject or ''}: brew-env-override holds for {issue.instance_prefix}, "
-                         "so its brew remedy is not run")
+                refused.append(issue)
             elif issue.auto_fix:
                 kept_auto.append(issue)
             else:
                 kept_each.append(issue)
-        return self.ordered(kept_auto), self.ordered(kept_each)
+        if len(kept_auto) == 1:
+            return [], self.ordered(kept_auto + kept_each), refused
+        return self.ordered(kept_auto), self.ordered(kept_each), refused
 
-    def print_plan(self, auto: Sequence[Issue], each: Sequence[Issue]) -> None:
-        """Print what `--fix` would apply, in its two groups, without running anything
+    def listed(self, auto: Sequence[Issue], each: Sequence[Issue]) -> None:
+        """Print what a dry run leaves undone: the fixes that take one answer together, then each of the others
 
-        @param auto  the findings applied after one confirmation
+        @param auto  the findings whose fixes take one answer for them all
         @param each  the findings asked about one by one
         """
-        self.say("doctor --fix --dry-run: nothing is run")
         if auto:
-            self.say("after one confirmation:")
-            for issue in auto:
-                for line in self.describe_remedy(issue):
-                    self.say(line)
-        if each:
-            self.say("one by one, each behind its own prompt:")
-            for issue in each:
-                for line in self.describe_remedy(issue):
-                    self.say(line)
+            self.say()
+            for line in doctor_report.together(auto, self.instances, False, self.ctx.yes):
+                self.say(line)
+        for issue in each:
+            self.say()
+            asks = not self.ctx.yes or needs_terminal_answer(issue)
+            for line in self.offer(issue, "dry" if asks else "dry-yes"):
+                self.say(line)
+
+    def together(self, auto: Sequence[Issue]) -> None:
+        """Present the fixes that take one answer for them all, ask once and make them
+
+        @param auto       the findings
+        @throws _Stopped  a command, sudo or a post-check failed, or a signal arrived
+        """
+        if not auto:
+            return
+        asked = self.ctx.tty and not self.ctx.yes
+        self.say()
+        if not self.ctx.yes:
+            for line in doctor_report.together(auto, self.instances, asked):
+                self.say(line)
+        if not self.ctx.confirm(doctor_report.QUESTIONS % len(auto), default=False):
+            return
+        for issue in auto:
+            if not self.skipped(issue):
+                if not asked:
+                    self.say(self.named(issue))
+                self.apply(issue)
+
+    def one_by_one(self, each: Sequence[Issue]) -> None:
+        """Ask about each fix in turn and make the ones the user agrees to
+
+        @param each       the findings
+        @throws _Stopped  a command, sudo, a post-check or a service stop failed, or a signal arrived
+        """
+        queue = list(each)
+        while queue:
+            issue = queue.pop(0)
+            if self.skipped(issue):
+                continue
+            if not self.ask(issue):
+                self.declined.add(_key(issue))
+                continue
+            if self.is_manager_repair(issue):
+                self.manager_repair(issue)
+                continue
+            self.apply(issue)
+            if issue.code == LEAF:
+                queue = self.recomputed_leaves(issue.instance_prefix, queue)
 
     def run(self) -> int | None:
-        """Run `--fix`; return its exit code, or None when the report's code stands: no remedy to run, or `--dry-run`
+        """Run `--fix`; return its exit code, or None when the report's code stands: no fix to make, or `--dry-run`
 
         @returns                the exit code, or None
         @throws PreflightError  sudo caches no credentials for a remedy that escalates
         """
-        auto, each = self.candidates()
-        if not auto and not each:
-            self.say("doctor --fix: no remedy the tool runs")
-            return None
+        auto, each, refused = self.candidates()
         if self.dry_run:
-            self.print_plan(auto, each)
+            self.say(doctor_report.DRY_RUN)
+        if not auto and not each:
+            self.say(doctor_report.NOTHING_TO_FIX)
+            for line in doctor_report.not_offered(refused, self.instances) + doctor_report.unchanged(self.issues):
+                self.say(line)
             return None
-        if self.needs_sudo(auto + each):
+        # Without a terminal and without --yes no fix is made, so no password is asked for.
+        sudo = self.needs_sudo(auto + each) and (self.ctx.tty or self.ctx.yes)
+        opening = doctor_report.fix_opening(len(auto) + len(each), sudo, self.dry_run, self.ctx.yes, self.ctx.tty)
+        for line in opening + doctor_report.not_offered(refused, self.instances):
+            self.say(line)
+        if self.dry_run:
+            self.listed(auto, each)
+            for line in ["", doctor_report.DRY_RUN_END] + doctor_report.unchanged(self.issues):
+                self.say(line)
+            return None
+        if sudo:
             self.runner.sudo_preflight()
         # Read before any remedy runs: a remedy can replace the keg or the link a finding queued behind it names.
         for issue in auto + each:
             self.packages_of(issue)
         try:
-            if auto:
-                self.say("remedies applied without a per-item prompt:")
-                for issue in auto:
-                    for line in self.describe_remedy(issue):
-                        self.say(line)
-                if self.ctx.confirm(f"Apply these {len(auto)} remedies?", default=False):
-                    for issue in auto:
-                        if not self.skipped(issue):
-                            self.apply(issue)
-                else:
-                    self.say("  not applied")
-            queue = list(each)
-            while queue:
-                issue = queue.pop(0)
-                if self.skipped(issue):
-                    continue
-                if not self.ask(issue):
-                    self.declined.add(_key(issue))
-                    continue
-                if self.is_manager_repair(issue):
-                    self.manager_repair(issue)
-                    continue
-                self.apply(issue)
-                if issue.code == LEAF:
-                    queue = self.recomputed_leaves(issue.instance_prefix, queue)
+            self.together(auto)
+            self.one_by_one(each)
         except _Stopped as exc:
-            self.ctx.console.warn(f"brew-ports: doctor --fix stopped: {exc}")
+            self.ctx.console.error(str(exc))
+            undo = self.run_dir.run_id if self.snapshotted else None
+            for line in doctor_report.fix_stopped(tilde(self.run_dir.path), len(self.fixed), undo):
+                self.ctx.console.warn(line)
             return EXIT_ACTION
-        left = [i for i in self.issues if i.severity > Severity.INFO and id(i) not in self.fixed
-                and id(i) not in self.superseded]
-        return EXIT_FINDINGS if left else EXIT_OK
+        left = [i for i in self.issues if id(i) not in self.fixed and id(i) not in self.superseded]
+        undo = self.run_dir.run_id if self.snapshotted else None
+        for line in doctor_report.fix_closing(len(self.fixed), left, undo):
+            self.say(line)
+        return EXIT_FINDINGS if doctor_report.problems(left) else EXIT_OK
 
     def recomputed_leaves(self, prefix: str | None, queue: list[Issue]) -> list[Issue]:
         """Return the queue after a leaf removal, with the leaves recomputed from a fresh registry backup
@@ -1792,18 +1841,29 @@ def _report(ctx: Context, runner, run_dir: state.RunDir, bundle, reused: bool) -
     """
     if reused:
         env_interpreters.write_requirements(run_dir.path, bundle.result.interpreter_extras)
-        ctx.console.info("doctor: reusing the scan of the last ten minutes (--rescan takes a fresh one)")
+    scan_notes = list(bundle.notes)
     issues = detect_all(bundle, runner)
-    blocks = blocks_apply(issues, bundle.result.instances, host_arch=runner.host_arch, environ=ctx.environ,
+    if any(issue.code in ENV_CLEANUP for issue in issues):
+        path_fixes(issues, {name: envclean.kept_prefix(ctx.state, bundle, name, runner.host_arch, ctx.environ)
+                            for name in ("brew", "ports")})
+    instances = bundle.result.instances
+    blocks = blocks_apply(issues, instances, host_arch=runner.host_arch, environ=ctx.environ,
                           packages=bundle.result.packages)
     # The detectors add their notes to the bundle, so both are read after detect_all.
     result = model.DoctorResult(created=state.now_iso(), issues=issues, blocks_apply=blocks, notes=list(bundle.notes))
     data = model.to_plain(result)
     run_dir.write_json("doctor.json", model.to_json(data))
     if ctx.args.json:
+        if reused:
+            ctx.console.info(SCAN_REUSED)
         ctx.console.json(data)
+    elif ctx.args.fix or ctx.args.dry_run:
+        for line in [doctor_report.checked(instances)] + ([SCAN_REUSED] if reused else []):
+            ctx.console.out(line)
     else:
-        for line in render(issues, blocks, bundle.notes):
+        lines = doctor_report.render(issues, instances, bundle.notes[len(scan_notes):], reused=reused,
+                                     verbose=ctx.console.verbose, scan_notes=scan_notes)
+        for line in lines + doctor_report.closing(issues, len(instances) > 1):
             ctx.console.out(line)
     return issues
 
@@ -1818,6 +1878,7 @@ def cmd_doctor(ctx: Context, make_runner: Callable[[Context, state.RunDir], Base
     @returns            the exit code
     """
     args = ctx.args
+    ctx.console.echo = False        # `--fix` prints each command once, with its result
     run_dir, runner = start_run(ctx, 0, make_runner)
     with runner.signals():
         bundle, reused = scan.obtain(ctx.state, run_dir, runner, ctx.environ, rescan=args.rescan or args.deep,
@@ -1830,7 +1891,7 @@ def cmd_doctor(ctx: Context, make_runner: Callable[[Context, state.RunDir], Base
             try:
                 fixed = _Fixer(ctx, runner, run_dir, bundle, issues).run()
             except PreflightError as exc:
-                ctx.console.warn(f"brew-ports: {exc}")
+                ctx.console.error(str(exc))
                 return EXIT_PREFLIGHT
             return code if fixed is None else fixed
         finally:

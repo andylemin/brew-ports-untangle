@@ -89,10 +89,25 @@ jobs:
           brew install wget tree jq
       - name: scan
         run: brew-ports scan --json > scan.out.json
-      - name: doctor (exit 1 expected)
+      - name: doctor (a report, and the exit line when the status is 1)
+        run: |
+          code=0; brew-ports doctor > doctor.out.txt || code=$?
+          cat doctor.out.txt
+          test "$code" -le 1
+          grep -q '^Checked ' doctor.out.txt
+          if [ "$code" -eq 1 ]; then tail -n 1 doctor.out.txt | grep -q '^Exit status 1: '; fi
+          code=0; brew-ports doctor --fix --dry-run > doctor.dry.txt || code=$?
+          cat doctor.dry.txt
+          test "$code" -le 1
+          grep -q '^Checked ' doctor.dry.txt
+          grep -q '^Dry run: nothing changes\.$' doctor.dry.txt
+          if [ "$code" -eq 1 ]; then tail -n 1 doctor.dry.txt | grep -q '^Exit status 1: '; fi
+      - name: doctor --json (exit 1 exactly when a finding stops a move or is broken)
         run: |
           code=0; brew-ports doctor --json > doctor.out.json || code=$?
-          test "$code" -eq 1
+          problems="$(jq '[.issues[] | select(.severity >= 3 or (.blocks | length) > 0)] | length' doctor.out.json)"
+          echo "exit status $code; $problems findings stop a move or are broken"
+          if [ "$problems" -gt 0 ]; then test "$code" -eq 1; else test "$code" -eq 0; fi
       - name: recommend (exit 1 expected, both managers hold packages)
         run: |
           code=0; brew-ports recommend --json > recommend.out.json || code=$?

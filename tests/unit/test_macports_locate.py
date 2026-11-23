@@ -201,7 +201,11 @@ class FindTest(TempDirTest):
         error = "Error: Current platform \"darwin 25\" does not match expected platform \"darwin 22\"\n"
         inst = self.one(self.responses(version=r.FakeResponse(exit=1, stderr=error)))
         self.assertEqual(inst.usability, Usability.PLATFORM_MISMATCH)
-        self.assertIn("darwin 22", inst.usability_detail)
+        self.assertEqual(inst.usability_detail,
+                         "MacPorts was built for macOS 13 (Darwin 22); this Mac runs macOS 26 (Darwin 25)")
+        self.assertEqual((locate.release("darwin", "24"), locate.release("", "24"), locate.release("linux", "6"),
+                          locate.release("darwin", "")),
+                         ("macOS 15 (Darwin 24)", "macOS 15 (Darwin 24)", "linux 6", "darwin ?"))
         self.assertEqual(inst.features, ())
         self.assertTrue(inst.inventory_known)            # no registry, nothing installed: known empty
 

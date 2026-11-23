@@ -198,6 +198,26 @@ class HomebrewSnapshotTest(SnapshotTest):
             notes = fh.read()
         self.assertIn("brew bundle dump exited 1", notes)
         self.assertIn("tmutil localsnapshot exited 1", notes)
+        # What the commands say of it: the parts that are missing are counted apart from the disk snapshot.
+        self.assertEqual(snapshot.outcome(written), [
+            "2 parts of that record could not be saved: snapshot/notes.txt in the run folder lists them.",
+            "macOS could not take a local snapshot of the disk. `brew-ports rollback` does not need one."])
+        self.assertEqual(len(snapshot.outcome(written, disk=False)), 1)
+        self.assertTrue(snapshot.is_complete(self.run_dir))
+        # A later snapshot of the run adds to the same notes and counts only its own.
+        earlier = snapshot.noted(self.run_dir)
+        again = snapshot.write(self.fake(Host(self.run_dir, brewfile_exit=1)), self.run_dir, self.bundle(),
+                               [self.brew], local_snapshot=False)
+        self.assertEqual(snapshot.outcome(again, disk=False, earlier=earlier), [
+            "1 part of that record could not be saved: snapshot/notes.txt in the run folder names it."])
+
+    def test_a_whole_record_says_only_that_the_disk_has_a_snapshot(self):
+        self.cellar()
+        written = snapshot.write(self.fake(Host(self.run_dir)), self.run_dir, self.bundle(), [self.brew])
+        self.assertEqual(snapshot.outcome(written), [
+            "macOS also took a local snapshot of the disk, which it keeps for about a day or until it needs the "
+            "space."])
+        self.assertEqual(snapshot.outcome(written, disk=False), [])
         self.assertTrue(snapshot.is_complete(self.run_dir))
 
     def test_an_undrivable_instance_gets_disk_files_only(self):

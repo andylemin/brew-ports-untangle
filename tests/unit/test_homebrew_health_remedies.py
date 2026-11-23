@@ -45,7 +45,7 @@ class StashTest(HealthCase):
     def test_stash_then_patch_into_the_run_directory(self):
         self.run_dir = self.state_dir().new_run()
         self.dirty()
-        stash, patch, recover = self.only("brew-unusable-or-dirty").remedies
+        _, stash, patch, recover = self.only("brew-unusable-or-dirty").remedies
         self.assertEqual(stash.argv, [health.GIT, "-c", "author.name=brew-ports", "-c",
                                       "author.email=brew-ports@localhost", "-c", "committer.name=brew-ports", "-c",
                                       "committer.email=brew-ports@localhost", "-C", self.prefix, "stash", "push",
@@ -56,8 +56,7 @@ class StashTest(HealthCase):
         self.assertEqual(patch.argv, [health.GIT, "-C", self.prefix, "stash", "show", "-p", "--include-untracked",
                                       "stash@{0}"])
         self.assertEqual((patch.dst, patch.read_only, patch.manual), (expected, True, False))
-        self.assertTrue(recover.manual)
-        self.assertIn(f"git -C {self.prefix} stash pop", recover.description)
+        self.assertEqual((recover.manual, recover.argv), (True, [health.GIT, "-C", self.prefix, "stash", "pop"]))
         fake = r.FakeRunner(default=r.FakeResponse(stdout="diff --git a/notes.txt b/notes.txt\n"),
                             console=QuietConsole(), environ={"HOME": self.home}, run_dir=self.run_dir)
         fake.run(stash)
@@ -70,6 +69,10 @@ class StashTest(HealthCase):
         issue = self.only("brew-unusable-or-dirty")
         self.assertTrue(all(a.manual for a in issue.remedies))
         self.assertFalse(issue.confirm_each)
+        # Nothing here stands for a folder that does not exist: the stash is named without a run.
+        self.assertEqual((issue.remedies[0].argv[-1], issue.remedies[1].dst), ("brew-ports", None))
+        self.assertEqual([line.split(":")[0] for line in self.fixes(issue)],
+                         ["Set the changes aside", "Look at them", "To get the changes back afterwards"])
 
 
 class ReceiptAndRemovalTest(HealthCase):
@@ -87,7 +90,7 @@ class ReceiptAndRemovalTest(HealthCase):
         self.assertEqual([a.argv for a in issue.remedies],
                          [self.brew_argv("uninstall", "--formula", "--force", "oldtool")])
         self.assertEqual((issue.confirm_each, issue.repairs_install), (True, False))
-        self.assertIn("oldtool is in no catalogue name, alias, rename or tap migration", issue.evidence)
+        self.assertEqual(issue.evidence[-1], "Homebrew's package list does not have it under any name")
         self.assertTrue(health.needs_terminal_answer(issue))
         self.assertEqual(health.removes_package(issue), ("formula", "oldtool"))
         self.assertEqual(self.found("brew-deleted-formula", issues), [])
@@ -98,9 +101,11 @@ class ReceiptAndRemovalTest(HealthCase):
                                                       ":date": "2026-03-17", ":replacement_formula": "ccrypt"}}
         issue = self.only("brew-keg-without-receipt")
         self.assertEqual([(a.kind, a.manual) for a in issue.remedies], [("note", True)])
-        self.assertIn("ccrypt", issue.remedies[0].description)
-        self.assertIn("Homebrew refuses to reinstall aescrypt: disabled since 2026-03-17 "
-                      "(switched to a commercial license)", issue.evidence)
+        self.assertEqual(self.fixes(issue), [
+            "Fix: install ccrypt, which Homebrew names as its replacement, then uninstall aescrypt. A move out of "
+            "this Homebrew looks up the replacement itself."])
+        self.assertEqual(issue.evidence[-1], "Homebrew stopped installing it on 2026-03-17 (switched to a "
+                                             "commercial license)")
         self.assertEqual((issue.confirm_each, health.needs_terminal_answer(issue), health.removes_package(issue)),
                          (False, False, None))
 
@@ -109,34 +114,38 @@ class ReceiptAndRemovalTest(HealthCase):
         data = os.path.join(self.prefix, "var", "oldtool")
         os.makedirs(data)
         issue = self.only("brew-deleted-formula")
-        self.assertEqual(issue.remedies, [])
-        self.assertIn(f"the data directory {data}", issue.evidence[-1])
+        self.assertEqual(self.fixes(issue), [
+            f"brew-ports offers no fix: oldtool owns the data folder {data}. Only its own programs can read that "
+            "data, and Homebrew cannot install them again."])
         self.assertFalse(issue.confirm_each)
         self.assertIsNone(health.removes_package(issue))
         os.rmdir(data)
         plist = os.path.join(self.home, "Library", "LaunchAgents", "sh.brew.oldtool.plist")
         self.services = [service("sh.brew.oldtool", plist, self.prefix, "oldtool")]
         issue = self.only("brew-deleted-formula")
-        self.assertEqual(issue.remedies, [])
-        self.assertIn("the service sh.brew.oldtool", issue.evidence[-1])
+        self.assertTrue(all(a.manual for a in issue.remedies))
+        self.assertIn("oldtool owns the service sh.brew.oldtool.", self.fixes(issue)[0])
 
     def test_moved_formula_gets_its_new_home(self):
         self.formula("android-ndk", known=False)
         self.cat_kw["formula_tap_migrations"] = {"android-ndk": "homebrew/cask"}
         issue = self.only("brew-deleted-formula")
-        self.assertEqual(issue.evidence[0], "android-ndk moved to homebrew/cask")
+        self.assertEqual(issue.title, "android-ndk is installed, but Homebrew moved it to the tap homebrew/cask")
         self.assertEqual([(a.kind, a.manual) for a in issue.remedies], [("note", True)])
-        self.assertIn("homebrew/cask", issue.remedies[0].description)
+        self.assertEqual(self.fixes(issue), [
+            "Fix: install android-ndk from the tap homebrew/cask, then uninstall this copy. A move out of this "
+            "Homebrew looks up the replacement itself."])
 
     def test_fallback_catalogue_needs_brew_doctor(self):
         self.formula("oldtool", known=False)
         self.cat_kw = {"source": "taps"}
         issue = self.only("brew-deleted-formula")
-        self.assertEqual(issue.remedies, [])
-        self.assertIn("knows no renames", issue.evidence[-1])
+        self.assertEqual(self.fixes(issue), [
+            "brew-ports offers no fix: the package list read here does not record new names, so oldtool may only "
+            "have been renamed, and `brew doctor` does not report it."])
         self.doctor = r.FakeResponse(exit=1, stderr=fixture("doctor-stderr.txt", PREFIX=self.prefix))
         issue = self.only("brew-deleted-formula")
-        self.assertEqual([a.argv for a in issue.remedies],
+        self.assertEqual([a.argv for a in issue.remedies if a.kind == "command"],
                          [self.brew_argv("uninstall", "--formula", "--force", "oldtool")])
 
     def test_undrivable_instance_gets_no_brew_command(self):
@@ -148,8 +157,9 @@ class ReceiptAndRemovalTest(HealthCase):
         for code in ("brew-keg-without-receipt", "brew-deleted-formula", "brew-unlinked-keg"):
             with self.subTest(code=code):
                 issue = self.found(code, issues)[0]
-                self.assertEqual((issue.remedies, issue.confirm_each, issue.repairs_install), ([], False, False))
-                self.assertIn("no brew remedy is offered", issue.evidence[-1])
+                self.assertEqual((issue.confirm_each, issue.repairs_install), (False, False))
+                self.assertEqual(self.fixes(issue),
+                                 [f"No fix until the `brew` command of Homebrew at {self.prefix} runs."])
 
 
 class KeptKegTest(HealthCase):
@@ -167,15 +177,18 @@ class KeptKegTest(HealthCase):
     def removable(self):
         """Return the kegs that the `brew-several-versions` findings offer to remove
 
-        @returns  the subjects of the findings that carry a remedy
+        @returns  the subjects of the findings whose remedy is a command
         """
-        return [i.subject for i in self.found("brew-several-versions", self.detect()) if i.remedies]
+        return [i.subject for i in self.found("brew-several-versions", self.detect())
+                if any(not a.manual for a in i.remedies)]
 
     def test_the_linked_keg_and_the_opt_target_both_stay(self):
         self.formula("wget", versions=("1.0", "2.0"), opt=False)
         symlink(os.path.join(self.prefix, "opt", "wget"), self.kegs("wget", ["1.0"])[0])
         issue = self.only("brew-several-versions")
-        self.assertEqual((issue.subject, issue.remedies), ("wget", []))
+        self.assertEqual((issue.subject, issue.title), ("wget", "wget has 2 versions installed: 1.0, 2.0"))
+        self.assertEqual(issue.evidence, ["in use: 2.0 (linked), 1.0 (the version other formulae use)"])
+        self.assertEqual(self.fixes(issue), ["Nothing to do: every version stays."])
 
     def test_keg_only_formula_keeps_an_older_opt_target(self):
         self.formula("openssl@3", versions=("1.0", "2.0", "3.0"), linked=False, keg_only=True, opt=False)
@@ -195,10 +208,12 @@ class KeptKegTest(HealthCase):
         self.services = [service("sh.brew.served", self.path("agents", "sh.brew.served.plist"), self.prefix, "served",
                                  program=os.path.join(old, "bin", "served"))]
         issues = self.found("brew-several-versions", self.detect())
-        self.assertEqual([(i.subject, i.remedies) for i in issues], [("pinned", []), ("rooted", []), ("served", [])])
-        self.assertIn("pinned is pinned: every keg stays", issues[0].evidence)
-        self.assertIn(f"{self.kegs('rooted', ['1.0'])[0]} stays: it holds root-owned paths", issues[1].evidence)
-        self.assertTrue(issues[2].evidence[-1].startswith(f"{old} stays: the launchd job sh.brew.served"))
+        self.assertEqual([i.subject for i in issues], ["pinned", "rooted", "served"])
+        self.assertEqual(self.removable(), [])
+        self.assertEqual(self.fixes(issues[0]), ["Nothing to do: pinned is pinned, so every version stays."])
+        self.assertEqual(issues[1].evidence[-1], "1.0 stays too: files in it belong to root")
+        self.assertEqual(issues[2].evidence[-1], "1.0 stays too: the service sh.brew.served runs "
+                                                 f"{os.path.join(old, 'bin', 'served')} from it")
 
 
 class VariantTest(HealthCase):
@@ -211,7 +226,10 @@ class VariantTest(HealthCase):
         issues = {i.subject: i for i in self.found("brew-broken-symlink", self.detect())}
         self.assertEqual(sorted(issues), [gone, tex])
         self.assertEqual([a.argv for a in issues[gone].remedies], [[health.RM, gone]])
-        self.assertEqual((issues[tex].remedies, issues[tex].confirm_each), ([], False))
+        self.assertFalse(issues[tex].confirm_each)
+        self.assertEqual(self.fixes(issues[tex]), [
+            f"brew-ports leaves it alone: it lies outside Homebrew's own folders in {self.prefix}, so something "
+            "else may have put it there."])
 
     def test_missing_cask_dependency(self):
         self.inv.missing = {"sshfs-helper": ["macfuse-like"]}
@@ -235,6 +253,7 @@ class VariantTest(HealthCase):
         self.assertEqual([(a.argv[0], a.sudo) for a in issue.remedies], [(health.RM, False)])
 
     def test_sudo_cask_printed_and_orphan_record_removed(self):
+        self.run_dir = self.state_dir().new_run()
         self.cask("vpn", apps=("VPN.app",), privileged_uninstall=True)
         self.cask("leftover", apps=(), known=False, caskfile=False, privileged_uninstall=True)
         issues = self.detect()
@@ -245,7 +264,7 @@ class VariantTest(HealthCase):
         # Homebrew cannot load the orphan cask, so its uninstall artifacts never run:
         # the record goes the same way whatever the privileged flags say.
         room = os.path.join(self.prefix, "Caskroom", "leftover")
-        self.assertEqual(orphan.remedies[1].argv, [health.RM, "-rf", room])
+        self.assertEqual(orphan.remedies[2].argv, [health.RM, "-rf", room])
         self.assertTrue(orphan.confirm_each)
         self.assertEqual(health.removes_package(missing_app), None)
 

@@ -11,7 +11,7 @@ import os
 import re
 import shutil
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from . import model, state, system
@@ -19,6 +19,7 @@ from .env import services as env_services
 from .homebrew import actions as brew_actions, inventory as brew_inventory
 from .macports import actions as mp_actions, registry
 from .model import Instance, Manager, OnFailure, Service
+from .report import DISK_SNAPSHOT, NO_DISK_SNAPSHOT, unsaved
 
 SNAPSHOT = "snapshot"
 COMPLETE = "complete"
@@ -592,6 +593,42 @@ def write(runner, run_dir: state.RunDir, bundle, instances: Sequence[Instance], 
     writer.finish()
     writer.text((COMPLETE,), state.now_iso() + "\n")
     return writer.written
+
+
+def _notes(path: str) -> list[str]:
+    """Return the notes that a run's snapshots have kept
+
+    @param path  the run's `notes.txt`
+    @returns     its lines that hold text; none without the file
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return [line.strip() for line in fh if line.strip()]
+    except OSError:
+        return []
+
+
+def noted(run_dir: state.RunDir) -> int:
+    """Return how many notes the snapshots of a run have kept so far, which each further snapshot adds to
+
+    @param run_dir  the run
+    @returns        the count; `outcome` takes it to tell the notes of the next snapshot from these
+    """
+    return len(_notes(os.path.join(snapshot_dir(run_dir), NOTES)))
+
+
+def outcome(written: Mapping[str, str], disk: bool = True, earlier: int = 0) -> list[str]:
+    """Return what a snapshot has to say beyond its files: the parts it could not save, and the disk snapshot
+
+    @param written  the files `write` returned, by snapshot-relative path
+    @param disk     whether the snapshot asked macOS for a local snapshot of the disk
+    @param earlier  how many notes the run's earlier snapshots kept, as `noted` counted them before this one
+    @returns        the lines; none when every part was saved and no disk snapshot was asked for
+    """
+    missing = set(_notes(written[NOTES])[earlier:]) if NOTES in written else set()
+    no_disk = {note for note in missing if note.startswith(DISK_NOTE)}
+    lines = [unsaved(len(missing) - len(no_disk))] if len(missing) > len(no_disk) else []
+    return lines + ([NO_DISK_SNAPSHOT if no_disk else DISK_SNAPSHOT] if disk else [])
 
 
 def write_ports_records(run_dir: state.RunDir, instance: Instance, services: Sequence[Service]) -> dict[str, str]:

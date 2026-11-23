@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import shlex
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from . import plan_report, report
 from .model import Instance, Plan
 from .plan_phases import PHASE_NAMES
-from .report import at, counted, manager_name, place, some, tilde
+from .report import at, counted, manager_name, place, series, some, tilde
 
 QUESTIONS = {2: "Run these repairs?", 3: "Install the replacements?", 5: "Uninstall the old packages?",
              7: "Make these changes?"}
@@ -19,21 +19,8 @@ RESUME = "brew-ports apply --resume %s"
 STOPS_HERE = f"n stops the run here; `{RESUME}` continues it."
 NOTHING_STOPS = "A fresh scan of this Mac found nothing that stops the move."
 GATE = "every replacement is installed, provides commands and finds its libraries"
-DISK_SNAPSHOT = ("macOS also took a local snapshot of the disk, which it keeps for about a day or until it needs the "
-                 "space.")
-NO_DISK_SNAPSHOT = "macOS could not take a local snapshot of the disk. `brew-ports rollback` does not need one."
 FROM_PLAN = "This list is from the plan. It is made again when the phase runs: what is gone by then is skipped."
 ERROR_WIDTH = 110                   # a failed command longer than this is cut in the error that names it
-
-
-def series(items: Iterable[str]) -> str:
-    """Return items as a sentence lists them
-
-    @param items  the items
-    @returns      such as `a, b and c`; empty for none
-    """
-    items = list(items)
-    return f"{', '.join(items[:-1])} and {items[-1]}" if len(items) > 1 else "".join(items)
 
 
 def resume(run_id: str) -> str:
@@ -284,16 +271,6 @@ def record(dry_run: bool) -> str:
     """
     what = "what is installed, your shell files and your service files in the run folder, for `brew-ports rollback`"
     return f"{'Would save' if dry_run else 'Saved'} {what}."
-
-
-def unsaved(count: int) -> str:
-    """Return how much of the undo record could not be saved, and where each part is named
-
-    @param count  how many parts were not saved
-    @returns      the line
-    """
-    return (f"{counted(count, 'part')} of that record could not be saved: snapshot/notes.txt in the run folder "
-            f"{'names it' if count == 1 else 'lists them'}.")
 
 
 def failed(result: Any) -> str:

@@ -394,14 +394,15 @@ class PreflightTest(ApplyTest):
         @returns         the finding
         """
         return doctor._issue(code, severity, f"{code} title", None, prefix, evidence=["evidence"],
-                             remedies=[doctor.note(code, None, "repair it")], blocks=blocks)
+                             remedies=[doctor.note(code, None, "Fix: repair it")], blocks=blocks)
 
     def test_blocking_finding_exits_3_first(self):
         self.scenario_brew()
         self.issues = [self.issue("ports-damaged-registry", self.source.prefix, (Blocks.UNINSTALL,))]
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
         self.assertIn("\nPhase 0  Checks before starting\n"
-                      f"brew-ports: this stops the move: ports-damaged-registry title ({self.source.prefix})\n"
+                      "brew-ports: this stops the move: ports-damaged-registry title (MacPorts at "
+                      f"{self.source.prefix})\n"
                       "    evidence\n    Fix: repair it\n", self.out)
         self.assertFalse(os.path.exists(self.sd.dirty_path))
         self.assertFalse(snapshot.is_complete(self.run_dir))

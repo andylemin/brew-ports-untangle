@@ -156,6 +156,18 @@ class EnvCleanupCommandTest(TempDirTest):
     def test_a_target_without_an_instance_exits_3(self):
         self.assertEqual(self.cleanup(b.bundle([self.brew]), target="ports"), envclean.EXIT_PREFLIGHT)
 
+    def test_the_kept_installation_is_the_last_target_or_default(self):
+        other = b.instance(self.tmp, Manager.BREW, "usr/local", roots=b.USR_LOCAL_ROOTS)
+        kept = functools.partial(envclean.kept_prefix, self.sd, b.bundle([self.brew, other, self.ports]))
+        self.assertEqual(kept("ports", "arm64", {}), self.ports_prefix)
+        # Neither Homebrew lies at the default place, so only HOMEBREW_PREFIX names one.
+        self.assertIsNone(kept("brew", "arm64", {}))
+        self.assertEqual(kept("brew", "arm64", {"HOMEBREW_PREFIX": other.prefix}), other.prefix)
+        run_dir = self.completed_run([self.brew, other, self.ports])
+        self.assertEqual(kept("brew", "arm64", {"HOMEBREW_PREFIX": other.prefix}), self.brew_prefix)
+        b.malform_plan(run_dir.sub("plan.json"))
+        self.assertIsNone(kept("brew", "arm64", {"HOMEBREW_PREFIX": other.prefix}))
+
     def test_a_plan_with_a_malformed_field_exits_3(self):
         b.malform_plan(self.completed_run([self.brew, self.ports]).sub("plan.json"))
         self.assertEqual(self.cleanup(b.bundle([self.brew, self.ports])), envclean.EXIT_PREFLIGHT)

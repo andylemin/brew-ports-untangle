@@ -527,8 +527,8 @@ class CommandTest(RecommendCase):
         self.assertEqual(set(data), {"created", "brew", "ports", "recommended", "headline", "findings", "table",
                                      "sentence"})
         self.assertEqual((data["findings"], data["headline"]),
-                         (["env-both-managers"], [f"{self.host.brew_prefix}: 1 formulae, 0 casks",
-                                                  f"{self.host.ports_prefix}: 1 ports (1 active)"]))
+                         (["env-both-managers"], [f"Homebrew at {self.host.brew_prefix}: 1 formula",
+                                                  f"MacPorts at {self.host.ports_prefix}: 1 port"]))
         self.assertEqual([(r["name"], r["confidence"]) for r in data["brew"]["roots"]], [("wget", "EXACT")])
         self.assertEqual([t["key"] for t in data["ports"]["terms"]],
                          ["coverage", "unmigratable", "casks", "services", "undrivable", "work"])
@@ -565,7 +565,7 @@ class CommandTest(RecommendCase):
         out = self.stdout()
         self.assertTrue(out.startswith("recommend: reusing the scan of the last ten minutes (--rescan takes a fresh "
                                        "one)\nBoth managers present\n"
-                                       f"  {self.host.brew_prefix}: 1 formulae, 0 casks\n"), out)
+                                       f"  Homebrew at {self.host.brew_prefix}: 1 formula\n"), out)
         self.assertEqual(self.calls[0]["rescan"], False)
 
     def test_rescan_asks_for_a_fresh_scan(self):

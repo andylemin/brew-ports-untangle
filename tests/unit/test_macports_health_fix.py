@@ -12,8 +12,9 @@ from brew_ports.env import linkage as env_linkage
 from brew_ports.macports import health, locate
 from brew_ports.macports.portindex import PortEntry
 from brew_ports.model import Severity
+from brew_ports.report import tilde
 from brew_ports.runner import ActionFailed, FakeResponse
-from tests.unit.fixtures.macports.builders import QuietConsole, fake_runner, port
+from tests.unit.fixtures.macports.builders import fake_runner, port
 from tests.unit.fixtures.macports_health.sites import (ARM64, PLATFORM, Site, macho, mode_executable, port_argv,
                                                        service, sql, sudo_port, write)
 from tests.unit.helpers import TempDirTest
@@ -170,6 +171,7 @@ class RepairTest(TempDirTest):
         self.run_dir = self.state_dir().new_run()
         self.r = fake_runner(self.tmp)                 # replaced by the runner of each runner()
         self.asked: list[str] = []                     # set by repair()
+        self.shown: list[str] = []                     # set by repair()
         self.services: list[model.Service] = []        # set by migrate_site()
         for patcher in (mock.patch.object(health.brew_locate, "candidate_prefixes", return_value=[]),
                         mock.patch.object(locate, "_executable", mode_executable)):
@@ -212,16 +214,21 @@ class RepairTest(TempDirTest):
         @param confirm         the answer to every question; None answers yes
         @param default_prefix  the default MacPorts prefix; None for the site's own
         @param environ         the environment; None for one with HOME alone
-        @returns               the report lines
+        @returns               the report lines, and whether the repair says the finding is gone
         """
         self.asked = []
+        self.shown = []
 
         def ask(text):
             self.asked.append(text)
             return True if confirm is None else confirm
 
-        return health.manager_repair(self.issue(code, site), runner, self.run_dir, environ or HOME, QuietConsole(),
-                                     confirm=ask, default_prefix=default_prefix or site.prefix, platform=PLATFORM)
+        lines, fixed = health.manager_repair(self.issue(code, site), runner, self.run_dir, environ or HOME,
+                                             self.shown.append, confirm=ask,
+                                             default_prefix=default_prefix or site.prefix, platform=PLATFORM)
+        # Each line is shown once, as it comes, indented under the finding it belongs to.
+        self.assertEqual(self.shown, ["  " + line for line in lines])
+        return lines, fixed
 
     def sudo_calls(self):
         """Return the escalated commands the kept runner started
@@ -235,47 +242,81 @@ class RepairTest(TempDirTest):
         runner = self.runner(s, {tuple(port_argv(s.prefix, "version")): [
             FakeResponse(exit=1, stderr="Error: attempt to write a readonly database\n"),
             FakeResponse(stdout="Version: 2.12.7\n")], sudo_port(s.prefix, "version"): FakeResponse()})
-        lines = self.repair("ports-registry-schema-update", s, runner)
+        lines, fixed = self.repair("ports-registry-schema-update", s, runner)
         self.assertEqual(self.sudo_calls(), [sudo_port(s.prefix, "version")])
-        self.assertEqual(lines, [f"ports-registry-schema-update {s.prefix}: sudo port -N version done; "
-                                 "MacPorts there is usable"])
+        self.assertEqual((lines, fixed), ([f"sudo {s.path('bin', 'port')} -N version ... ok",
+                                           f"The `port` command of MacPorts at {s.prefix} works."], True))
         self.assertEqual(self.asked, [])
+
+    def test_a_repair_that_does_not_help_says_so(self):
+        s = Site(self.tmp, [port(1, "curl", "8.9.1")])
+        readonly = FakeResponse(exit=1, stderr="Error: attempt to write a readonly database\n")
+        runner = self.runner(s, {tuple(port_argv(s.prefix, "version")): readonly,
+                                 sudo_port(s.prefix, "version"): FakeResponse()})
+        lines, fixed = self.repair("ports-registry-schema-update", s, runner)
+        self.assertEqual((lines[-1], fixed),
+                         (f"The `port` command of MacPorts at {s.prefix} still cannot run: Error: attempt to write a "
+                          "readonly database", False))
 
     def test_a_cleared_issue_is_skipped(self):
         s = Site(self.tmp, [port(1, "curl", "8.9.1")])
-        lines = self.repair("ports-registry-schema-update", s, self.runner(s))
-        self.assertIn("the condition has cleared", lines[0])
+        lines, fixed = self.repair("ports-registry-schema-update", s, self.runner(s))
+        # None: the finding is gone, and no fix was made.
+        self.assertEqual((lines, fixed), (["Nothing to do: this is in order already."], None))
         self.assertEqual(self.sudo_calls(), [])
         with self.assertRaises(ValueError):
-            health.manager_repair(self.issue("ports-missing-image", s), self.r, self.run_dir, HOME, QuietConsole(),
+            health.manager_repair(self.issue("ports-missing-image", s), self.r, self.run_dir, HOME, None,
                                   confirm=lambda t: True)
 
     def test_cannot_run_installs_base_at_default_prefix(self):
         s = Site(self.tmp, [port(1, "curl", "8.9.1")], binary=False)
         runner = self.runner(s)
         new = s.instance(binary=s.path("bin", "port"))
-        with mock.patch.object(health.bootstrap, "bootstrap", return_value=new) as boot:
-            lines = self.repair("ports-cannot-run", s, runner)
+
+        def install(*_args, **_kw):
+            write(s.path("bin", "port"), "#!/bin/sh\nexit 0\n", 0o755)
+            return new
+        with mock.patch.object(health.bootstrap, "bootstrap", side_effect=install) as boot:
+            lines, fixed = self.repair("ports-cannot-run", s, runner)
         boot.assert_called_once_with(runner, self.run_dir, HOME, "arm64", macos_version="26.0",
                                      default_prefix=s.prefix)
         self.assertIn("MacPorts-<version>-26-<name>.pkg", self.asked[0])
-        self.assertEqual(lines, [f"ports-cannot-run {s.prefix}: MacPorts base 2.12.7 installed and synced; MacPorts "
-                                 "there is usable"])
+        self.assertEqual((lines, fixed), ([
+            "Downloading MacPorts' installer, checking its signature and running it. This can take a few minutes.",
+            f"MacPorts 2.12.7 is installed at {s.prefix}, with its package list.",
+            f"The `port` command of MacPorts at {s.prefix} works."], True))
 
     def test_cannot_run_declined_and_elsewhere(self):
         s = Site(self.tmp, [port(1, "curl", "8.9.1")], binary=False)
         with mock.patch.object(health.bootstrap, "bootstrap") as boot:
-            lines = self.repair("ports-cannot-run", s, self.runner(s), confirm=False)
+            lines, fixed = self.repair("ports-cannot-run", s, self.runner(s), confirm=False)
         boot.assert_not_called()
-        self.assertIn("declined", lines[0])
+        self.assertEqual((lines, fixed), (["Nothing changed."], False))
         other = Site(self.tmp, [port(1, "curl", "8.9.1")])
         runner = self.runner(other, {tuple(port_argv(other.prefix, "version")): FakeResponse(exit=1, stderr="boom\n")})
         with mock.patch.object(health.bootstrap, "bootstrap") as boot:
-            lines = self.repair("ports-cannot-run", other, runner, default_prefix=self.path("opt-local"),
-                                environ={"HOME": "/Users/alice", "PATH": other.path("bin")})
+            lines, fixed = self.repair("ports-cannot-run", other, runner, default_prefix=self.path("opt-local"),
+                                       environ={"HOME": "/Users/alice", "PATH": other.path("bin")})
         boot.assert_not_called()
-        self.assertIn(f"./configure --prefix={other.prefix}", lines[0])
+        self.assertEqual((lines, fixed), (["Fix: MacPorts' installer installs to /opt/local only, so build the "
+                                           "current MacPorts from source with `./configure "
+                                           f"--prefix={other.prefix}`."], False))
         self.assertEqual(self.sudo_calls(), [])
+
+    def test_ports_are_not_built_again_by_a_port_that_cannot_run(self):
+        """A repair that finds `port` broken says so; it never reads as done"""
+        s = Site(self.tmp, [port(1, "curl", "8.9.1", os_major=24)])
+        runner = self.runner(s, {tuple(port_argv(s.prefix, "version")): FakeResponse(exit=1, stderr="boom\n")})
+        lines, fixed = self.repair("ports-built-for-other-os", s, runner)
+        self.assertEqual((lines, fixed), ([f"The `port` command of MacPorts at {s.prefix} cannot run: boom",
+                                           "Its ports were not built again."], False))
+        self.assertEqual(self.sudo_calls(), [])
+
+    def test_what_is_in_use_again_is_said_for_no_port_too(self):
+        say = health._Report(None)
+        health._not_back(say, [], 0, "installed.txt", str)
+        health._not_back(say, [], 2, "installed.txt", str)
+        self.assertEqual(say.lines, ["No port was in use.", "All 2 ports that were in use are in use again."])
 
     def migrate_site(self, **kw):
         """Make a site of curl, dbus and an unrequested zlib built for Darwin 24, keeping their services
@@ -311,7 +352,7 @@ class RepairTest(TempDirTest):
         s = self.migrate_site(os_major="24")
         runner = self.runner(s, self.migrate_responses(s))
         with mock.patch.object(health.env_services, "collect", return_value=self.services):
-            lines = self.repair("ports-platform-mismatch", s, runner)
+            lines, fixed = self.repair("ports-platform-mismatch", s, runner)
         self.assertEqual(self.sudo_calls(), [sudo_port(s.prefix, "migrate", "--all"),
                                              sudo_port(s.prefix, "load", "dbus"), sudo_port(s.prefix, "sync")])
         records = self.run_dir.sub("snapshot", "ports-" + s.prefix.replace("/", "%"))
@@ -323,13 +364,19 @@ class RepairTest(TempDirTest):
                           (["zlib", "@1.3.1_0"], False, [], True, "24")])
         self.assertEqual([svc.label for svc in snapshot.read_services(os.path.join(records, "services.json"))],
                          ["org.macports.dbus", "org.macports.curl", "org.macports.zlib"])
-        reinstall = "sudo " + " ".join(port_argv(s.prefix, "install", "--no-rev-upgrade", "curl", "+http2"))
-        prefix = f"ports-platform-mismatch {s.prefix}: "
-        self.assertEqual(lines[1:], [prefix + "sudo port -N migrate --all exited 0",
-                                     prefix + "curl @8.9.1_0 was active before migrate and is inactive after it: "
-                                     + reinstall,
-                                     prefix + "startup item of dbus loaded again",
-                                     prefix + "sudo port -N sync done"])
+        port_bin = s.path("bin", "port")
+        self.assertEqual(lines[:-1], [
+            f"Saved MacPorts' record of installed ports in {tilde(records)}.",
+            f"sudo {port_bin} -N migrate --all ... ok",
+            # curl is still stored, switched off: "not in use" says no more than the record does.
+            "1 port that was in use is not in use again: curl",
+            f"  To bring curl back: sudo {port_bin} -N install --no-rev-upgrade curl +http2",
+            "The service of dbus runs again.",
+            f"sudo {port_bin} -N sync ... ok"])
+        # The fake `port migrate` leaves MacPorts itself as it was, and the last line and the result say so.
+        self.assertEqual((lines[-1], fixed), (
+            f"The `port` command of MacPorts at {s.prefix} still cannot run: MacPorts was built for macOS 15 "
+            "(Darwin 24); this Mac runs macOS 26 (Darwin 25)", False))
         self.assertEqual(self.asked, [])
 
     def test_a_failed_migrate_is_reported_and_raised(self):
@@ -342,6 +389,9 @@ class RepairTest(TempDirTest):
                 self.repair("ports-platform-mismatch", s, runner)
         self.assertEqual(self.sudo_calls()[1:], [sudo_port(s.prefix, "load", "curl"),
                                                  sudo_port(s.prefix, "load", "dbus"), sudo_port(s.prefix, "sync")])
+        # The report came before the error: the command that failed, then what is in use and what runs again.
+        self.assertEqual(self.shown[1:3], [f"  sudo {s.path('bin', 'port')} -N migrate --all ... failed (exit 1)",
+                                           "  All 3 ports that were in use are in use again."])
 
     def test_no_migrate_without_the_registry_backup(self):
         s = self.migrate_site(os_major="24")
@@ -350,8 +400,10 @@ class RepairTest(TempDirTest):
         write(os.path.join(s.portdb, "registry", "registry.db"), "not a database " * 100)
         runner = self.runner(s, self.migrate_responses(s))
         with mock.patch.object(health.env_services, "collect", return_value=self.services):
-            lines = self.repair("ports-platform-mismatch", s, runner)
-        self.assertIn("migrate --all was not run", lines[-1])
+            lines, fixed = self.repair("ports-platform-mismatch", s, runner)
+        self.assertTrue(lines[0].startswith("MacPorts' record of installed ports could not be saved first ("))
+        self.assertTrue(lines[0].endswith("), so `port migrate` was not run."))
+        self.assertFalse(fixed)
         self.assertEqual(self.sudo_calls(), [])
 
     def test_old_base_installs_the_package_then_migrates(self):
@@ -360,19 +412,25 @@ class RepairTest(TempDirTest):
         new = dataclasses.replace(s.instance(), version="2.12.7", features=locate.features_for("2.12.7"))
         with mock.patch.object(health.env_services, "collect", return_value=self.services), \
                 mock.patch.object(health.bootstrap, "bootstrap", return_value=new) as boot:
-            lines = self.repair("ports-platform-mismatch", s, runner)
+            lines, _ = self.repair("ports-platform-mismatch", s, runner)
         boot.assert_called_once()
         self.assertEqual(len(self.asked), 1)
         self.assertEqual(self.sudo_calls(), [sudo_port(s.prefix, "migrate", "--all"),
                                              sudo_port(s.prefix, "load", "dbus")])
-        self.assertIn("MacPorts base 2.12.7 installed and synced", lines[0])
+        self.assertEqual(lines[:2], [
+            "Downloading MacPorts' installer, checking its signature and running it. This can take a few minutes.",
+            f"MacPorts 2.12.7 is installed at {s.prefix}, with its package list."])
 
     def test_old_base_elsewhere_is_manual(self):
         s = self.migrate_site(os_major="24", version="2.8.1")
         runner = self.runner(s)
-        lines = self.repair("ports-platform-mismatch", s, runner, default_prefix=self.path("opt-local"),
-                            environ={"HOME": "/Users/alice", "PATH": s.path("bin")})
-        self.assertIn(f"./configure --prefix={s.prefix}, then run sudo port -N migrate --all", lines[0])
+        lines, fixed = self.repair("ports-platform-mismatch", s, runner, default_prefix=self.path("opt-local"),
+                                   environ={"HOME": "/Users/alice", "PATH": s.path("bin")})
+        # The installed 2.8.1 has no `port migrate`: the line names the current MacPorts, and its own `port`.
+        self.assertEqual(lines, ["Fix: MacPorts' installer installs to /opt/local only, so build the current "
+                                 f"MacPorts from source with `./configure --prefix={s.prefix}`, then run `sudo "
+                                 f"{s.path('bin', 'port')} -N migrate --all`."])
+        self.assertFalse(fixed)
         self.assertEqual(self.sudo_calls(), [])
 
     def test_other_os_is_skipped_once_the_active_ports_are_rebuilt(self):
@@ -380,19 +438,24 @@ class RepairTest(TempDirTest):
         s.fill([port(1, "curl", "8.9.1", location=s.image("curl", "8.9.1_0")),
                 port(2, "zlib", "1.3.1", state="imaged", os_major=24, location=s.image("zlib", "1.3.1_0"))])
         with mock.patch.object(health.env_services, "collect", return_value=[]):
-            lines = self.repair("ports-built-for-other-os", s, self.runner(s, self.migrate_responses(s)))
-        self.assertIn("the condition has cleared", lines[0])
+            lines, fixed = self.repair("ports-built-for-other-os", s, self.runner(s, self.migrate_responses(s)))
+        self.assertEqual((lines, fixed), (["Nothing to do: this is in order already."], None))
         self.assertEqual(self.sudo_calls(), [])
 
     def test_other_os_migrates_then_syncs(self):
         s = self.migrate_site()
         runner = self.runner(s, self.migrate_responses(s))
         with mock.patch.object(health.env_services, "collect", return_value=self.services):
-            self.repair("ports-built-for-other-os", s, runner)
+            lines, fixed = self.repair("ports-built-for-other-os", s, runner)
         self.assertEqual(self.sudo_calls()[-1], sudo_port(s.prefix, "sync"))
+        # zlib, built for the older macOS, is still in use after the fake `port migrate`: the repair says so.
+        self.assertEqual((lines[-1], fixed),
+                         ("Some ports in use are still built for another version of macOS.", False))
         old = self.migrate_site(version="2.9.3")
-        lines = self.repair("ports-built-for-other-os", old, self.runner(old))
-        self.assertIn("has no port migrate", lines[0])
+        lines, fixed = self.repair("ports-built-for-other-os", old, self.runner(old))
+        port_bin = old.path("bin", "port")
+        self.assertEqual((lines, fixed), ([f"Fix: MacPorts 2.9.3 is too old for `port migrate`. Run `sudo {port_bin} "
+                                           f"selfupdate`, then `sudo {port_bin} -N migrate --all`."], False))
         self.assertEqual(self.sudo_calls(), [])
 
 

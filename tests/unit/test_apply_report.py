@@ -2,7 +2,7 @@
 
 import unittest
 
-from brew_ports import apply_report, runner as r
+from brew_ports import apply_report, report, runner as r
 from brew_ports.model import Action, Manager
 from tests.unit.fixtures.executor import builders as b
 from tests.unit.helpers import make_instance, make_package
@@ -134,10 +134,10 @@ class WordsTest(unittest.TestCase):
         self.assertLessEqual(len(text), apply_report.ERROR_WIDTH + 30)
 
     def test_the_undo_record_says_how_much_is_missing(self):
-        self.assertEqual(apply_report.unsaved(1), "1 part of that record could not be saved: snapshot/notes.txt in the "
-                                                  "run folder names it.")
-        self.assertEqual(apply_report.unsaved(3), "3 parts of that record could not be saved: snapshot/notes.txt in "
-                                                  "the run folder lists them.")
+        self.assertEqual(report.unsaved(1), "1 part of that record could not be saved: snapshot/notes.txt in the "
+                                            "run folder names it.")
+        self.assertEqual(report.unsaved(3), "3 parts of that record could not be saved: snapshot/notes.txt in "
+                                            "the run folder lists them.")
 
 
 if __name__ == "__main__":

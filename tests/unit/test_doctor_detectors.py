@@ -5,7 +5,7 @@ import sys
 import unittest
 from unittest import mock
 
-from brew_ports import doctor, model, runner as r, system
+from brew_ports import doctor, doctor_report, model, runner as r, system
 from brew_ports.model import Blocks, Manager, Severity
 from tests.unit.fixtures.doctor import builders as b
 from tests.unit.helpers import TempDirTest, make_instance, make_package
@@ -150,7 +150,8 @@ class SystemTest(DetectorTest):
             found = self.detect_system()
         self.assertEqual(codes(found), ["system-low-disk-space"])
         self.assertEqual((found[0].subject, found[0].blocks), (self.brew.prefix, (Blocks.ANY,)))
-        self.assertIn("2.0 GiB free", found[0].evidence[0])
+        self.assertEqual(found[0].title, f"Only 2.0 GiB is free on the disk of Homebrew at {self.brew.prefix}; a move "
+                                         "needs 5")
         with mock.patch("brew_ports.system.free_bytes", return_value=50 * doctor.GIB):
             self.assertEqual(self.detect_system(), [])
 
@@ -165,8 +166,19 @@ class SystemTest(DetectorTest):
         found = self.detect_system(environment={"records": [rec]})
         self.assertEqual(codes(found), ["system-dyld-export"])
         self.assertEqual(found[0].subject, "/Users/alice/.zshrc:4")
-        self.assertIn("build exports", found[0].remedies[0].description)
+        self.assertEqual(found[0].title, "/Users/alice/.zshrc line 4 sets a DYLD_ variable, which changes the "
+                                         "libraries every program loads")
+        self.assertTrue(found[0].remedies[0].description.startswith("Fix: remove the line unless"))
         self.assertEqual(self.detect_system(environment={"records": [dict(rec, kind="assign")]}), [])
+
+    def test_a_library_path_into_an_installation_is_one_finding(self):
+        rec = {"kind": "dyld", "file": "/Users/alice/.zshrc", "lineno": 4, "var": "DYLD_LIBRARY_PATH",
+               "text": "export DYLD_LIBRARY_PATH=/opt/local/lib", "instance_prefixes": [self.ports.prefix]}
+        environment = {"records": [rec]}
+        self.assertEqual(self.detect_system(environment=environment), [])
+        found = self.detect_env(environment=environment)
+        self.assertEqual([i.title for i in found], [
+            "/Users/alice/.zshrc line 4 makes every program load libraries from MacPorts at " + self.ports.prefix])
 
 
 class EnvTest(DetectorTest):
@@ -177,8 +189,8 @@ class EnvTest(DetectorTest):
                 make_package("curl", kind="port", prefix=self.ports.prefix)]
         found = self.detect_env(packages=pkgs)
         self.assertEqual(codes(found), ["env-both-managers"])
-        self.assertEqual(found[0].evidence, [f"{self.brew.prefix}: 1 formulae, 0 casks",
-                                             f"{self.ports.prefix}: 1 ports (1 active)"])
+        self.assertEqual(found[0].evidence, [f"Homebrew at {self.brew.prefix}: 1 formula",
+                                             f"MacPorts at {self.ports.prefix}: 1 port"])
         self.assertEqual(self.detect_env(packages=pkgs[:1]), [])
 
     def test_shadowed_commands(self):
@@ -186,7 +198,9 @@ class EnvTest(DetectorTest):
                      "prefixes": [self.brew.prefix, self.ports.prefix]}]
         found = self.detect_env(environment={"shadowed": shadowed})
         self.assertEqual(codes(found), ["env-shadowed-commands"])
-        self.assertIn("git: runs", found[0].evidence[0])
+        self.assertEqual((found[0].title, found[0].evidence), (
+            "1 command exists in more than one installation",
+            [f"Typing one runs the copy of Homebrew at {self.brew.prefix}: git"]))
         self.assertEqual(self.detect_env(environment={"shadowed": []}), [])
 
     def test_cross_prefix_linkage_offers_a_rebuild(self):
@@ -290,9 +304,13 @@ class EnvTest(DetectorTest):
                               "dists": [{"name": "requests", "version": "2.31"}]}],
                   "pipx": [], "gems": [], "cpan": []}
         found = self.detect_env(extras=extras)
-        self.assertEqual(sorted((i.code, i.subject) for i in found),
-                         [("env-language-packages", "npm"), ("env-language-packages", "python3.12")])
-        self.assertIn("npm-globals.txt", [i for i in found if i.subject == "npm"][0].remedies[0].description)
+        # One finding per place, with counts: the names are in the lists of the run folder.
+        self.assertEqual([(i.code, i.subject, i.severity, i.title, i.evidence) for i in found], [
+            ("env-language-packages", "home", Severity.INFO, "Your home folder holds packages that pip installed",
+             ["Python 3.12: 1"]),
+            ("env-language-packages", self.brew.prefix, Severity.MEDIUM, f"Homebrew at {self.brew.prefix} holds "
+             "packages that npm installed; a move does not move them", ["npm packages: 1"])])
+        self.assertIn("for you to install them again after a move", found[1].remedies[0].description)
         self.assertEqual(self.detect_env(extras={"python": [{"version": "3.12", "dists": []}], "npm": []}), [])
 
     def test_services_from_both_managers(self):
@@ -337,7 +355,8 @@ class EnvTest(DetectorTest):
                 {"kind": "shellenv", "file": "/Users/alice/.zprofile", "lineno": 1, "text": "eval ..."}]
         found = self.detect_env(environment={"records": recs})
         self.assertEqual(codes(found), ["env-shell-markers"])
-        self.assertTrue(found[0].evidence[0].startswith("/Users/alice/.zprofile:1"))
+        self.assertEqual(found[0].title, "2 lines of /Users/alice/.zprofile set up Homebrew or MacPorts")
+        self.assertEqual(found[0].evidence[0], "/Users/alice/.zprofile line 1: eval ...")
         self.assertEqual(self.detect_env(environment={"records": []}), [])
 
     def test_users_own_launchd_job(self):
@@ -386,7 +405,8 @@ class AggregationTest(DetectorTest):
         cross = issues[1]
         self.assertFalse(cross.confirm_each)
         self.assertEqual([a.kind for a in cross.remedies], ["note"])
-        self.assertIn("brew-broken-linkage", cross.remedies[0].description)
+        self.assertEqual(cross.remedies[0].description,
+                         "The fix of the other finding about vim installs vim again, which mends this too.")
 
     def test_dispatch_to_the_health_modules(self):
         code = "brew-deleted-formula"
@@ -421,13 +441,10 @@ class AggregationTest(DetectorTest):
                           evidence=["evidence"],
                           remedies=[doctor.manual("system-clt-missing", None, "install",
                                                   ["/usr/bin/xcode-select", "--install"], "x")])])
-        lines = doctor.render(issues, {"brew": ["system-clt-missing"], "ports": []})
-        self.assertEqual(lines[0], "HIGH")
-        self.assertIn("manual: /usr/bin/xcode-select --install", "\n".join(lines))
-        self.assertLess(lines.index("HIGH"), lines.index("LOW"))
-        self.assertEqual(lines[-2:], ["blocks apply (target brew): system-clt-missing",
-                                      "blocks apply (target ports): none"])
-        self.assertEqual(doctor.render([], {})[0], "doctor: no findings")
+        lines = doctor_report.render(issues, [])
+        self.assertIn("      x: /usr/bin/xcode-select --install", lines)
+        self.assertLess(lines.index("Broken or at risk (1)"), lines.index("Worth cleaning up (1)"))
+        self.assertEqual(doctor_report.render([], [])[-1], "No problems found.")
         self.assertEqual(doctor.findings_exit(issues), 1)
         self.assertEqual(doctor.findings_exit([doctor._issue("env-local-builds", Severity.INFO, "x")]), 0)
 

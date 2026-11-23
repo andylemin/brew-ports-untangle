@@ -97,10 +97,13 @@ class RealHomebrewHealthTest(FixCase):
         return [c for c in self.fake.calls if "uninstall" in c]
 
     def test_yes_alone_never_removes_the_keg(self):
-        self.assertEqual(self.fix([], tty=False), doctor.EXIT_FINDINGS)
+        self.assertEqual(self.fix([], tty=False), doctor.EXIT_OK)   # the old formula stops no move and works
         self.assertTrue(os.path.isdir(self.rack))
         self.assertEqual(self.uninstalls(), [])
-        self.assertIn("brew-deleted-formula needs an answer on a terminal", self.ctx.console.text)
+        self.assertIn("\noldtool is installed, but Homebrew's package list does not have it under any name\n"
+                      "  Leave it if you still use it.\n"
+                      "  Not asked: this is one of the fixes that take your own answer on a terminal.\n",
+                      self.ctx.console.text)
         self.assertFalse(os.path.exists(self.sd.dirty_path))
 
     def test_a_terminal_yes_snapshots_then_removes(self):
@@ -153,14 +156,16 @@ class StaleQueueTest(FixCase):
 
     def test_a_reinstall_skips_the_removals_queued_behind_it(self):
         exit_code = self.fix([True, True, True], tty=True)
-        self.assertEqual(self.ctx.asked, ["Apply brew-keg-without-receipt to foo?"])
+        self.assertEqual(self.ctx.asked, ["Make this fix?"])
         self.assertEqual([c for c in self.fake.calls if health.RM in c], [])
-        self.assertEqual(exit_code, doctor.EXIT_FINDINGS)
+        self.assertEqual(exit_code, doctor.EXIT_OK)             # what was skipped stops no move and is not broken
         self.assertTrue(os.path.isfile(os.path.join(self.kegs[1], inventory.RECEIPT)))
         self.assertTrue(os.path.isfile(self.bin))
-        for code, subject in (("brew-broken-symlink", self.bin), ("brew-several-versions", self.kegs[1])):
-            self.assertIn(f"{code} {subject}: skipped, the brew-keg-without-receipt remedy changed foo; "
-                          "run `brew-ports doctor --rescan`", self.ctx.console.text)
+        # 2.0 is the newer version: what marks it for deletion is that 1.0 is the one in use, not its age.
+        for finding in (f"The link {self.bin} points at a file that is gone",
+                        "Version 2.0 of foo is installed but not in use"):
+            self.assertIn(f"\nSkipped: {finding}\n  An earlier fix of this run changed foo, so this finding may be "
+                          "out of date. `brew-ports doctor` checks again.\n", self.ctx.console.text)
 
 
 if __name__ == "__main__":

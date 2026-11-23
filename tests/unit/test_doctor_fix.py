@@ -8,8 +8,9 @@ import sys
 import unittest
 from unittest import mock
 
-from brew_ports import doctor, model, runner as r, servicectl, snapshot, system
+from brew_ports import doctor, doctor_report, model, runner as r, servicectl, snapshot, system
 from brew_ports.model import Manager, Severity
+from brew_ports.report import offered, tilde
 from tests.unit.fixtures.doctor import builders as b
 from tests.unit.helpers import TempDirTest, make_instance, make_package
 
@@ -219,16 +220,20 @@ class ReportTest(FixTest):
         bundle.notes.append("/opt/local: no PortIndex (no synced ports tree)")
         skipped = "/opt/local: port diagnose skipped: MacPorts there is platform-mismatch"
         code = self.doctor(bundle, b.health_modules(brew=[versions], ports_notes=[skipped]))
-        self.assertEqual(code, doctor.EXIT_FINDINGS)
+        self.assertEqual(code, doctor.EXIT_OK)                 # it stops no move and nothing is broken
         with open(os.path.join(self.fake.run_dir.path, "doctor.json"), encoding="utf-8") as fh:
             text = fh.read()
         result = model.from_json(model.DoctorResult, text)
         self.assertEqual([i.code for i in result.issues], ["brew-several-versions"])
         self.assertEqual(set(result.blocks_apply), {"brew", "ports"})
         self.assertEqual(json.loads(text)["notes"], ["/opt/local: no PortIndex (no synced ports tree)", skipped])
-        self.assertIn("LOW\n  brew-several-versions  brew-several-versions title: wget", self.output())
-        self.assertIn("blocks apply (target brew): none", self.output())
-        self.assertIn("note: " + skipped, self.output())
+        # A Mac with one installation gets no heading or suffix that names it.
+        self.assertIn("\n\nNothing stops a move. 1 thing is worth cleaning up.\n\n"
+                      "Worth cleaning up (1)\n  brew-several-versions title\n", self.output())
+        # Only what a check of doctor's own could not run is listed; what the scan noted is for --verbose.
+        self.assertIn("\nChecks that could not run\n  " + skipped, self.output())
+        self.assertNotIn("no PortIndex", self.output())
+        self.assertNotIn("Exit status", self.output())
         self.assertFalse(os.path.exists(self.sd.dirty_path))
 
     def test_info_only_exits_zero_and_json_prints_the_result(self):
@@ -262,8 +267,18 @@ class FixFlowTest(FixTest):
         self.assertTrue(self.ran(self.dependency.remedies[0]))
         self.assertTrue(self.ran(self.unlinked.remedies[0]))
         self.assertFalse(self.ran(self.versions.remedies[0]))
-        self.assertIn("brew-several-versions needs an answer on a terminal: not applied", self.output())
-        self.assertEqual(code, doctor.EXIT_FINDINGS)            # the several versions are left
+        brew = binary_of(self.brew)
+        # It says what it offers first; each command prints once, with its result; the last lines say what it did.
+        self.assertEqual(self.output().splitlines()[1:], [
+            "doctor --fix offers 3 fixes. --yes answers for you, except where a fix uninstalls a package or one of "
+            "its versions, or deletes a cask's record or a stray file: that takes your own answer on a terminal. "
+            "`brew-ports doctor` lists everything that was found.",
+            "", "brew-missing-dependency title", f"  {brew} install --formula oniguruma ... ok",
+            "", "brew-unlinked-keg title", f"  {brew} link wget ... ok",
+            "", "brew-several-versions title",
+            "  Not asked: this is one of the fixes that take your own answer on a terminal.",
+            "", "Made 2 fixes.", "Next: brew-ports doctor   (it checks again and lists what is left)"])
+        self.assertEqual(code, doctor.EXIT_OK)                  # what is left stops no move and is not broken
         self.assertLess(self.fake.calls.index(self.key(self.dependency.remedies[0])),
                         self.fake.calls.index(self.key(self.unlinked.remedies[0])))
         results = [e for e in self.fake.run_dir.journal.entries() if "result" in e]
@@ -273,28 +288,91 @@ class FixFlowTest(FixTest):
 
     def test_per_item_answers_on_a_terminal(self):
         code = self.doctor(self.bundle(), self.mods(), answers=[True, False, True], tty=True, fix=True)
-        self.assertEqual(len(self.ctx.asked), 3)
-        self.assertTrue(self.ctx.asked[0].startswith("Apply these 1 remedies"))
+        self.assertEqual(self.ctx.asked, ["Make this fix?"] * 3)
         self.assertTrue(self.ran(self.dependency.remedies[0]))
         self.assertFalse(self.ran(self.unlinked.remedies[0]))
         self.assertTrue(self.ran(self.versions.remedies[0]))
+        brew = binary_of(self.brew)
+        # Above each question: what a yes runs and what a no does.
+        self.assertIn(f"\nbrew-unlinked-keg title\n  y runs `{brew} link wget`; n changes nothing.\n", self.output())
+        self.assertIn("\nMade 2 fixes.\nNext: brew-ports doctor   (it checks again and lists what is left)\n"
+                      "Exit status 1: something needs a fix before a move, or is broken.\n", self.output())
         self.assertEqual(code, doctor.EXIT_FINDINGS)            # the answer declines the unlinked keg
+
+    def test_several_fixes_of_the_same_kind_take_one_answer(self):
+        other = self.issue("brew-missing-dependency", "yq",
+                           self.brew_action("brew-missing-dependency.yq.install", "install", "--formula", "libyaml"),
+                           auto_fix=True)
+        mods = b.health_modules(brew=[self.dependency, other])
+        code = self.doctor(self.bundle(), mods, answers=[True], tty=True, fix=True)
+        self.assertEqual(self.ctx.asked, ["Make these 2 fixes?"])
+        brew = binary_of(self.brew)
+        self.assertEqual(self.output().splitlines()[2:], [
+            "", "These 2 fixes take one answer:",
+            "  brew-missing-dependency title", f"      runs `{brew} install --formula oniguruma`",
+            "  brew-missing-dependency title", f"      runs `{brew} install --formula libyaml`",
+            "  y makes them; n changes nothing.",
+            f"  {brew} install --formula oniguruma ... ok", f"  {brew} install --formula libyaml ... ok",
+            "", "Made 2 fixes.", "Next: brew-ports doctor   (it checks again and lists what is left)"])
+        self.assertEqual(code, doctor.EXIT_OK)
+        # Under --yes nothing is asked, so each command is printed once, with its result, under its finding.
+        self.doctor(self.bundle(), mods, fix=True, yes=True)
+        self.assertEqual(self.output().splitlines()[2:7], [
+            "", "brew-missing-dependency title", f"  {brew} install --formula oniguruma ... ok",
+            "brew-missing-dependency title", f"  {brew} install --formula libyaml ... ok"])
 
     def test_no_answer_applies_nothing(self):
         self.doctor(self.bundle(), self.mods(), fix=True)
         self.assertFalse(any(self.ran(i.remedies[0]) for i in (self.dependency, self.unlinked, self.versions)))
         self.assertFalse(os.path.exists(self.sd.dirty_path))
+        # Why no fix is made is said once, in the opening, and no password is asked for.
+        self.assertEqual(self.output().splitlines()[1], "doctor --fix offers 3 fixes. There is no terminal to ask on, "
+                         "so it makes none of them: `brew-ports doctor --fix --yes` answers for you. `brew-ports "
+                         "doctor` lists everything that was found.")
+        self.assertNotIn("Not asked", self.output())
+        self.assertFalse(self.fake.sudo_ready)
+        self.assertIn("\nMade no fix.\nNext: brew-ports doctor   (it lists what was found)\n", self.output())
 
     def test_dry_run_prints_every_remedy_and_runs_nothing(self):
         code = self.doctor(self.bundle(), self.mods(), fix=True, dry_run=True, yes=True)
         self.assertEqual(code, doctor.EXIT_FINDINGS)
         self.assertEqual(self.fake.calls, [])
-        out = self.output()
-        self.assertIn("nothing is run", out)
-        for issue in (self.dependency, self.unlinked, self.versions):
-            self.assertIn(doctor.describe(issue.remedies[0]), out)
+        lines = self.output().splitlines()
+        self.assertEqual((lines[1], lines[-2:]), ("Dry run: nothing changes.", [
+            "Dry run: nothing changed.", "Exit status 1: something needs a fix before a move, or is broken."]))
+        # --yes answers for the first two; the removal still waits for an answer on a terminal.
+        for issue in (self.dependency, self.unlinked):
+            self.assertIn(f"  doctor --fix runs `{doctor.describe(issue.remedies[0])}`.", lines)
+        self.assertIn(f"  doctor --fix asks, then runs `{doctor.describe(self.versions.remedies[0])}`.", lines)
         self.assertFalse(os.path.exists(self.sd.dirty_path))
         self.assertFalse(self.fake.sudo_ready)
+
+    def test_a_dry_run_lists_what_shares_an_answer_together(self):
+        other = self.issue("brew-missing-dependency", "yq",
+                           self.brew_action("brew-missing-dependency.yq.install", "install", "--formula", "libyaml"),
+                           auto_fix=True)
+        mods = b.health_modules(brew=[self.dependency, other, self.unlinked])
+        self.doctor(self.bundle(), mods, fix=True, dry_run=True)
+        brew = binary_of(self.brew)
+        self.assertEqual(self.output().splitlines()[1:], [
+            "Dry run: nothing changes.",
+            "doctor --fix offers 3 fixes. It asks before it changes anything. `brew-ports doctor` lists everything "
+            "that was found.",
+            "", "These 2 fixes take one answer:",
+            "  brew-missing-dependency title", f"      runs `{brew} install --formula oniguruma`",
+            "  brew-missing-dependency title", f"      runs `{brew} install --formula libyaml`",
+            "", "brew-unlinked-keg title", f"  doctor --fix asks, then runs `{brew} link wget`.",
+            "", "Dry run: nothing changed.", "Exit status 1: something needs a fix before a move, or is broken."])
+
+    def test_a_dry_run_with_nothing_to_fix_explains_its_status(self):
+        broken = self.issue("brew-broken-linkage", "jq")
+        code = self.doctor(self.bundle(), b.health_modules(brew=[broken]), fix=True, dry_run=True)
+        self.assertEqual(self.output().splitlines()[1:], [
+            "Dry run: nothing changes.",
+            "No finding has a fix that `doctor --fix` can make. `brew-ports doctor` lists what was found and what to "
+            "do about it.",
+            "Exit status 1: something needs a fix before a move, or is broken."])
+        self.assertEqual(code, doctor.EXIT_FINDINGS)
 
     def test_marker_is_touched_before_the_first_change(self):
         seen: list[bool] = []
@@ -316,13 +394,18 @@ class FixFlowTest(FixTest):
         code = self.doctor(self.bundle(), self.mods(), fix=True, yes=True)
         self.assertEqual(code, doctor.EXIT_ACTION)
         self.assertFalse(self.ran(self.unlinked.remedies[0]))
-        self.assertIn("doctor --fix stopped", self.output())
+        # The error names the command as it is typed and Homebrew's own error line, then says what to do.
+        self.assertEqual(self.ctx.console.err.getvalue().splitlines(), [
+            f"brew-ports: `{binary_of(self.brew)} install --formula oniguruma` failed (exit 1): Error: no bottle",
+            f"  Its whole output is in the folder `out` of the run folder, {tilde(self.run_path())}.",
+            "  Fix the cause, then run `brew-ports doctor --fix` again."])
 
     def test_a_failed_post_check_stops_with_exit_4(self):
         code = self.doctor(self.bundle(), self.mods(brew_verified={"brew-missing-dependency": False}), fix=True,
                            yes=True)
         self.assertEqual(code, doctor.EXIT_ACTION)
-        self.assertIn("post-check of brew-missing-dependency", self.output())
+        self.assertIn("brew-ports: the commands ran, but a check afterwards still finds the problem: "
+                      "brew-missing-dependency title\n", self.output())
         results = [e for e in self.fake.run_dir.journal.entries() if "result" in e]
         self.assertEqual([(e["action_id"], e["result"]) for e in results],
                          [("doctor.brew-missing-dependency.jq.install", "failed")])
@@ -333,7 +416,22 @@ class FixFlowTest(FixTest):
         self.doctor(self.bundle(), mods, fix=True, yes=True)
         self.assertFalse(self.ran(self.dependency.remedies[0]))
         self.assertFalse(self.ran(self.unlinked.remedies[0]))
-        self.assertIn(f"brew-env-override holds for {self.brew.prefix}", self.output())
+        self.assertEqual(self.output().splitlines()[1:], [
+            "No finding has a fix that `doctor --fix` can make. `brew-ports doctor` lists what was found and what to "
+            "do about it.",
+            "", "Not offered, because a brew.env file changes the settings that brew-ports runs `brew` with "
+            "(`brew-ports doctor` lists the lines to remove):",
+            "  brew-missing-dependency title", "  brew-unlinked-keg title",
+            "Exit status 1: something needs a fix before a move, or is broken."])
+
+    def test_under_json_the_fix_lines_stay_out_of_the_output(self):
+        ctx = b.context(self.sd, fix=True, yes=True, json=True)
+        ctx.console.json_mode = True                # as the command line sets it for --json
+        with mock.patch("brew_ports.scan.obtain", return_value=(self.bundle(), False)), \
+                mock.patch.dict(sys.modules, self.mods()):
+            doctor.cmd_doctor(ctx, make_runner=self.factory())
+        self.assertEqual(len(json.loads(ctx.console.stream.getvalue())["issues"]), 3)
+        self.assertIn("\nMade 2 fixes.\n", ctx.console.err.getvalue())
 
 
 class SudoTest(FixTest):
@@ -378,8 +476,11 @@ class SudoTest(FixTest):
         self.assertEqual(repairs, [(code, self.fake.run_dir.run_id)])
         self.assertFalse(self.ran(self.missing.remedies[0]))
         self.assertFalse(self.ran(schema.remedies[0]))           # manager_repair runs it, not doctor
-        self.assertIn(f"repaired {code}", self.output())
-        self.assertIn("run `brew-ports doctor --rescan`", self.output())
+        self.assertEqual(self.output().count(f"repaired {code}"), 1)
+        at_ports = f"MacPorts at {self.ports.prefix}"
+        self.assertIn(f"\nSkipped: Active file missing ({at_ports})\n  An earlier fix of this run changed {at_ports}, "
+                      "so this finding may be out of date. `brew-ports doctor` checks again.\n", self.output())
+        self.assertIn("Some of them need your password (sudo).\n", self.output())
         self.assertTrue(os.path.exists(self.sd.dirty_path))
         self.assertEqual(exit_code, doctor.EXIT_FINDINGS)
 
@@ -397,8 +498,7 @@ class SudoTest(FixTest):
         mods = b.health_modules(ports=[cross, schema], ports_repairs=[code])
         self.doctor(b.bundle(instances=[self.brew, self.ports]), mods, fix=True, yes=True)
         self.assertFalse(self.ran(rebuild))
-        self.assertIn(f"env-cross-prefix-linkage curl: skipped, the manager repair changed {self.ports.prefix}; "
-                      "run `brew-ports doctor --rescan`", self.output())
+        self.assertIn(f"\nSkipped: Cross-prefix linkage (MacPorts at {self.ports.prefix})\n", self.output())
 
 
 class RemovalTest(FixTest):
@@ -444,7 +544,28 @@ class RemovalTest(FixTest):
         self.responder.exact[self.key(self.uninstall)] = self.remove_rack
         code = self.doctor(self.bundle([self.svc]), self.mods, answers=[True], tty=True, fix=True)
         self.assertEqual(code, doctor.EXIT_OK)
-        self.assertIn(f"data directories of mysql: {self.datadir}", self.output())
+        brew, at_brew = binary_of(self.brew), f"Homebrew at {self.brew.prefix}"
+        run_dir = self.fake.run_dir
+        # What a yes does comes above the question, a step per line; then each step with its result.
+        self.assertEqual(self.output().splitlines()[2:], [
+            "", "brew-deleted-formula title",
+            f"  y saves what is installed in {at_brew}, for `brew-ports rollback`,",
+            f"    then stops the service {LABEL},",
+            f"    then runs `{brew} uninstall --formula --force mysql`.",
+            "  n changes nothing.",
+            "  Afterwards it starts that service again; when the package is gone, it deletes its service file "
+            "instead.",
+            f"  The data of mysql is in {self.datadir}.",
+            f"  Saved what is installed in {at_brew} in the run folder, {tilde(run_dir.path)}, for `brew-ports "
+            "rollback`.",
+            "  macOS also took a local snapshot of the disk, which it keeps for about a day or until it needs the "
+            "space.",
+            f"  Stopped the service {LABEL}.",
+            f"  {brew} uninstall --formula --force mysql ... ok",
+            f"  Deleted the service file {tilde(self.plist)}.",
+            "", "Made 1 fix.",
+            f"If a fix of this run uninstalled something you want back: brew-ports rollback {run_dir.run_id}",
+            "Next: brew-ports doctor   (it checks again and lists what is left)"])
         dump = self.index(lambda c: "dump" in c)
         bootout = self.index(lambda c: c[:2] == ("/bin/launchctl", "bootout"))
         removal = self.fake.calls.index(self.key(self.uninstall))
@@ -511,9 +632,17 @@ class LeafTest(FixTest):
         @param name  the port
         @returns     the finding
         """
-        return doctor._issue(LEAF, Severity.INFO, "Unrequested leaf", name, self.ports.prefix, confirm_each=True,
+        return doctor._issue(LEAF, Severity.INFO, f"{name} is a leftover", name, self.ports.prefix, confirm_each=True,
                              remedies=[port_action(self.ports, f"doctor.{LEAF}.{name}.uninstall", "uninstall",
                                                    name, "@1.0_0")])
+
+    def asked_about(self):
+        """Return the ports whose fix the run put a question about, read from what it printed above each question
+
+        @returns  their names, in order
+        """
+        self.assertEqual(self.ctx.asked, ["Make this fix?"] * len(self.ctx.asked))
+        return [line.split()[0] for line in self.output().splitlines() if " is a leftover (" in line]
 
     def fix(self, answers, rounds):
         """Run `--fix` on a terminal over the leaves a and b
@@ -537,12 +666,12 @@ class LeafTest(FixTest):
     def test_leaves_are_recomputed_after_a_removal(self):
         ports = self.fix([True, True], [[self.leaf("c")], []])
         self.assertEqual(self.removed(), ["a", "c"])                 # b is no leaf once a is gone
-        self.assertEqual(self.ctx.asked, [f"Apply {LEAF} to a?", f"Apply {LEAF} to c?"])
+        self.assertEqual(self.asked_about(), ["a", "c"])
         self.assertEqual(ports.recomputed, [self.ports.prefix, self.ports.prefix])
 
     def test_a_declined_leaf_is_not_offered_again(self):
         self.fix([False, True, True], [[self.leaf("a"), self.leaf("c")], []])
-        self.assertEqual(self.ctx.asked, [f"Apply {LEAF} to {name}?" for name in "abc"])
+        self.assertEqual(self.asked_about(), ["a", "b", "c"])
         self.assertEqual(self.removed(), ["b", "c"])
 
 
@@ -590,7 +719,7 @@ class PortServiceTest(FixTest):
         self.assertEqual(self.fix(inactive), doctor.EXIT_OK)
         self.assertTrue(self.ran(inactive.remedies[0]))
         self.assertEqual(self.bootouts(), [])
-        self.assertNotIn("stop org.macports.redis", self.output())
+        self.assertNotIn("the service org.macports.redis", self.output())
 
     def test_rebuild_stops_and_reloads_the_service(self):
         image = doctor._issue("ports-missing-image", Severity.HIGH, "Image missing", "redis", self.ports.prefix,
@@ -626,16 +755,16 @@ class QueueTest(FixTest):
         self.rows += [make_package("curl", kind="port", prefix=prefix, spec_args=["curl", version], active=False)
                       for version in ("@8.7.0_0", "@8.6.0_0")]
 
-    def skipped(self, code, subject, by, name):
-        """Return the line `--fix` prints for a finding it skips because an earlier remedy changed its package
+    @staticmethod
+    def skipped(finding, name):
+        """Return the lines `--fix` prints for a finding it skips because an earlier fix changed its package
 
-        @param code     the skipped finding's name
-        @param subject  its subject
-        @param by       the name of the finding whose remedy changed the package
+        @param finding  the skipped finding, as the output names it
         @param name     the package
-        @returns        the line, without its indent
+        @returns        the two lines
         """
-        return f"{code} {subject}: skipped, the {by} remedy changed {name}; run `brew-ports doctor --rescan`"
+        return (f"\nSkipped: {finding}\n  An earlier fix of this run changed {name}, so this finding may be out of "
+                "date. `brew-ports doctor` checks again.\n")
 
     def test_a_reactivation_skips_the_plist_removal_queued_behind_it(self):
         code = "ports-missing-file"
@@ -656,8 +785,8 @@ class QueueTest(FixTest):
         exit_code = self.doctor(bundle, b.health_modules(ports=[dangling, missing]), fix=True, yes=True)
         self.assertTrue(all(self.ran(action) for action in steps))
         self.assertFalse(any(self.ran(action) for action in drop))
-        self.assertIn(self.skipped("ports-dangling-plist", "org.macports.curl", code, "curl"), self.output())
-        self.assertEqual(exit_code, doctor.EXIT_FINDINGS)
+        self.assertIn(self.skipped(f"Dangling plist (MacPorts at {self.ports.prefix})", "curl"), self.output())
+        self.assertEqual(exit_code, doctor.EXIT_OK)             # what was skipped stops no move and is not broken
 
     def test_an_auto_install_skips_the_queued_plist_removal(self):
         install = self.brew_action("brew-missing-dependency.jq.install", "install", "--formula", "--as-dependency",
@@ -670,8 +799,7 @@ class QueueTest(FixTest):
         self.doctor(self.bundle([svc]), b.health_modules(brew=[orphan, dependency]), fix=True, yes=True)
         self.assertTrue(self.ran(install))
         self.assertFalse(self.ran(rm))
-        self.assertIn(self.skipped("brew-orphan-service", "homebrew.mxcl.jq", "brew-missing-dependency", "jq"),
-                      self.output())
+        self.assertIn(self.skipped("brew-orphan-service title", "jq"), self.output())
 
     def test_removals_of_other_kegs_and_rows_still_run(self):
         kegs = [os.path.join(self.brew.prefix, "Cellar", "wget", version) for version in ("1.0", "2.0")]
@@ -692,45 +820,78 @@ class QueueTest(FixTest):
 
 
 class ManagerRepairTest(FixTest):
-    """A repair at /opt/local that runs the base package procedure shows its steps in the one prompt"""
+    """A repair at /opt/local that runs the MacPorts installer: one question, which says what a yes does"""
+
+    INSTALLS = "installs MacPorts over /opt/local again from its official signed installer"
+    NEEDS = ("It downloads the installer from MacPorts' releases, checks its signature and runs it with your password "
+             "(sudo). The installer adds MacPorts to the PATH in your shell's login files. Your installed ports stay.")
+    TITLE = "The `port` command of MacPorts at /opt/local is missing or does not start"
 
     def setUp(self):
         super().setUp()
         self.ports = make_instance(Manager.PORTS, "/opt/local", drivable=False,
                                    usability=model.Usability.MISSING_BINARY)
         cannot = "ports-cannot-run"
-        self.cannot_run = doctor._issue(cannot, Severity.HIGH, "port missing while the registry holds ports",
-                                        self.ports.prefix, self.ports.prefix, confirm_each=True,
-                                        remedies=[doctor.note(cannot, self.ports.prefix, "the base package procedure")])
+        # As the detector builds it: the two notes, then the sync that the repair runs after the installer.
+        sync = model.Action(action_id="doctor.ports-cannot-run.sync", kind="command",
+                            argv=["/opt/local/bin/port", "-N", "sync"], sudo=True, description="sync",
+                            env_profile="ports", instance_prefix=self.ports.prefix)
+        self.cannot_run = doctor._issue(cannot, Severity.HIGH, self.TITLE, self.ports.prefix, self.ports.prefix,
+                                        confirm_each=True,
+                                        remedies=[doctor.note(cannot, self.ports.prefix, offered(self.INSTALLS)),
+                                                  doctor.note(cannot, self.ports.prefix, self.NEEDS), sync])
         self.inner: list[bool] = []
+        self.fixed: bool | None = True
 
-        def repair(_issue, _runner, _run_dir, _environ, _console, *, confirm):
+        def repair(_issue, _runner, _run_dir, _environ, show, *, confirm):
             """Ask the base package procedure's question once and record the answer in `inner`
 
             @param _issue    the finding
             @param _runner   the runner
             @param _run_dir  the run directory
             @param _environ  the environment
-            @param _console  the console
+            @param show      prints a report line as it comes
             @param confirm   asks the user a question and returns the answer
-            @returns         the report lines
+            @returns         the report lines, and whether the repair worked
             """
             self.inner.append(confirm("The MacPorts base package procedure:\n  read ...\nRun it?"))
-            return ["MacPorts base installed"]
+            show("  MacPorts 2.12.7 is installed at /opt/local, with its package list.")
+            return ["MacPorts 2.12.7 is installed at /opt/local, with its package list."], self.fixed
         repairs = ("ports-platform-mismatch", "ports-built-for-other-os", "ports-registry-schema-update", cannot)
         self.mods = b.health_modules(ports=[self.cannot_run], ports_repairs=repairs, ports_repair=repair)
 
-    def test_one_prompt_shows_and_answers_the_procedure(self):
+    def test_one_question_says_what_a_yes_does(self):
         code = self.doctor(b.bundle(instances=[self.brew, self.ports]), self.mods, answers=[True], tty=True, fix=True)
-        self.assertEqual(self.ctx.asked, ["Apply ports-cannot-run to /opt/local?"])
+        self.assertEqual(self.ctx.asked, ["Make this fix?"])
         self.assertEqual(self.inner, [True])
-        self.assertIn("MacPorts-<version>-15-<name>.pkg", self.output())
-        self.assertIn("MacPorts base installed", self.output())
+        self.assertEqual(self.output().splitlines()[1:], [
+            "doctor --fix offers 1 fix. It asks before it changes anything. `brew-ports doctor` lists everything "
+            "that was found.",
+            "It needs your password (sudo).",
+            "", self.TITLE, f"  y {self.INSTALLS}; n changes nothing.", f"  {self.NEEDS}",
+            "  MacPorts 2.12.7 is installed at /opt/local, with its package list.",
+            "", "Made 1 fix.", "Next: brew-ports doctor   (it checks again and lists what is left)"])
+        self.assertEqual(code, doctor.EXIT_OK)
+        # The sync belongs to the repair, which runs it itself.
+        self.assertEqual(self.fake.calls, [])
+        self.assertEqual(doctor_report.fixable([self.cannot_run]), 1)
+
+    def test_a_repair_that_did_not_work_is_not_counted_as_a_fix(self):
+        self.fixed = False
+        code = self.doctor(b.bundle(instances=[self.brew, self.ports]), self.mods, answers=[True], tty=True, fix=True)
+        self.assertIn("\nMade no fix.\n", self.output())
+        self.assertEqual(code, doctor.EXIT_FINDINGS)
+
+    def test_a_repair_with_nothing_to_do_is_no_fix_and_no_finding(self):
+        self.fixed = None
+        code = self.doctor(b.bundle(instances=[self.brew, self.ports]), self.mods, answers=[True], tty=True, fix=True)
+        self.assertIn("\nMade no fix.\n", self.output())
+        self.assertNotIn("Exit status", self.output())
         self.assertEqual(code, doctor.EXIT_OK)
 
-    def test_dry_run_prints_the_procedure_and_runs_nothing(self):
+    def test_dry_run_says_what_it_would_do_and_runs_nothing(self):
         self.doctor(b.bundle(instances=[self.brew, self.ports]), self.mods, fix=True, dry_run=True, yes=True)
-        self.assertIn("sudo installer -pkg", self.output())
+        self.assertIn(f"\n{self.TITLE}\n  doctor --fix {self.INSTALLS}.\n  {self.NEEDS}\n", self.output())
         self.assertEqual(self.mods["brew_ports.macports.health"].calls, [])
         self.assertEqual(self.fake.calls, [])
         self.assertFalse(os.path.exists(self.sd.dirty_path))
@@ -787,7 +948,9 @@ class CrossLinkageRebuildTest(FixTest):
 
     def test_a_reference_left_into_the_other_prefix_fails(self):
         self.assertEqual(self.run_fix(self.libz), doctor.EXIT_ACTION)
-        self.assertIn("post-check of env-cross-prefix-linkage", self.output())
+        self.assertIn("brew-ports: the commands ran, but a check afterwards still finds the problem: vim in Homebrew "
+                      f"at {self.brew.prefix} uses libraries from another installation, and breaks when that one "
+                      "goes\n", self.output())
 
 
 if __name__ == "__main__":

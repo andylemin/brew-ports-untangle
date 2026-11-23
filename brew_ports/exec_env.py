@@ -9,14 +9,13 @@ import dataclasses
 import os
 
 from . import apply_report, snapshot
-from .apply_report import series
 from .exec_run import EXIT_ACTION, Stop, module
 from .homebrew import actions as brew_actions
 from .homebrew.catalogue import Catalogue
 from .macports import actions as mp_actions
 from .model import Action, Manager, Mapping, OnFailure, Service
 from .plan_sets import name_key
-from .report import at, counted, some, tilde
+from .report import at, counted, series, some, tilde
 
 LANGUAGE_KINDS = ("pip", "npm", "gem", "cpan")
 

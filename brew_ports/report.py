@@ -20,6 +20,15 @@ ARCH_NAMES = {"arm64": "Apple Silicon", "x86_64": "Intel"}
 COMMAND_OF = {model.Manager.BREW: "brew", model.Manager.PORTS: "port"}
 MANAGER_NAMES = {model.Manager.BREW: "Homebrew", model.Manager.PORTS: "MacPorts"}
 KIND_NOUNS = {"formula": ("formula", "formulae"), "cask": ("cask", "casks"), "port": ("port", "ports")}
+SCAN_REUSED = "Using the scan taken in the last ten minutes (--rescan takes a new one)."
+NOT_CHECKED = "Not checked: "           # starts the title of a finding that stands for a check that could not run
+FIX_OFFER = "Fix: brew-ports doctor --fix (asks, then "     # starts the line of a fix that `doctor --fix` makes
+MOVE_OUT = ("A move out of this installation still installs the replacements of its packages, but uninstalls none of "
+            "them one by one. With `--delete %s`, `brew-ports plan` plans to delete the installation whole after "
+            "the move.")
+DISK_SNAPSHOT = ("macOS also took a local snapshot of the disk, which it keeps for about a day or until it needs the "
+                 "space.")
+NO_DISK_SNAPSHOT = "macOS could not take a local snapshot of the disk. `brew-ports rollback` does not need one."
 
 
 # The reader's words ---------------------------------------------------------------------
@@ -98,6 +107,35 @@ def some(names: Iterable[str], limit: int = NAMES_SHOWN) -> str:
     return f"{', '.join(names[:limit])} and {len(names) - limit:,} more"
 
 
+def series(items: Iterable[str]) -> str:
+    """Return items as a sentence lists them
+
+    @param items  the items
+    @returns      such as `a, b and c`; empty for none
+    """
+    items = list(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}" if len(items) > 1 else "".join(items)
+
+
+def unsaved(count: int) -> str:
+    """Return how much of the undo record could not be saved, and where each part is named
+
+    @param count  how many parts were not saved
+    @returns      the line
+    """
+    return (f"{counted(count, 'part')} of that record could not be saved: snapshot/notes.txt in the run folder "
+            f"{'names it' if count == 1 else 'lists them'}.")
+
+
+def offered(does: str) -> str:
+    """Return the line of a fix that `doctor --fix` makes, for a finding whose commands would tell the reader little
+
+    @param does  what `doctor --fix` does once the user agrees, such as `saves the file, then deletes it`
+    @returns     the line, which a finding carries as a note
+    """
+    return f"{FIX_OFFER}{does})"
+
+
 def tilde(path: str, home: str | None = None) -> str:
     """Return a path with the home folder written as `~`, for prose; a command to copy keeps the full path
 
@@ -129,16 +167,17 @@ def _on_path(program: str, path: str) -> bool:
     return False
 
 
-def typed(argv: Sequence[str], sudo: bool = False, path: str | None = None) -> str:
+def typed(argv: Sequence[str], sudo: bool = False, path: str | None = None, *, intel: bool = False) -> str:
     """Return a command as the user would type it
 
     The `arch` wrapper and sudo's own options are left out. A program is given by its bare name when typing
     that name runs the same file, else by its full path: with two Homebrews, only one of them is `brew`.
 
-    @param argv  the command, with or without `sudo` and the `arch` wrapper in front
-    @param sudo  whether the command runs under sudo although `argv` does not start with it
-    @param path  the PATH that decides the bare names; None for the tool's own
-    @returns     the shell-quoted command
+    @param argv   the command, with or without `sudo` and the `arch` wrapper in front
+    @param sudo   whether the command runs under sudo although `argv` does not start with it
+    @param path   the PATH that decides the bare names; None for the tool's own
+    @param intel  keep an `arch -x86_64` wrapper: a command that the user is to run needs it as brew-ports does
+    @returns      the shell-quoted command
     """
     words = list(argv)
     if words and os.path.basename(words[0]) == "sudo":
@@ -147,11 +186,13 @@ def typed(argv: Sequence[str], sudo: bool = False, path: str | None = None) -> s
         while words and words[0].startswith("-"):
             if words.pop(0) == "--":
                 break
+    wrapper: list[str] = []
     if len(words) > 2 and os.path.basename(words[0]) == "arch" and words[1].startswith("-"):
+        wrapper = ["arch", words[1]] if intel and words[1] == "-x86_64" else []
         words = words[2:]
     if words and os.path.isabs(words[0]) and _on_path(words[0], os.environ.get("PATH", "") if path is None else path):
         words[0] = os.path.basename(words[0])
-    return shlex.join((["sudo"] if sudo else []) + words)
+    return shlex.join((["sudo"] if sudo else []) + wrapper + words)
 
 
 def cut(text: str, width: int) -> str:

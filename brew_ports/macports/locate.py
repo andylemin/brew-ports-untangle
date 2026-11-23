@@ -21,6 +21,7 @@ TCLSH_REL = os.path.join("libexec", "macports", "bin", "tclsh8.6")
 LIPO = system.LIPO
 PKG_ID = "org.macports.MacPorts"
 PLATFORM_TEXTS = ("does not match expected platform", "should be rebuilt for Apple Silicon")
+INTEL_ON_ARM = "MacPorts runs as Intel code on this Apple Silicon Mac"
 READONLY_TEXT = "attempt to write a readonly database"
 
 # Base's own files besides its package receipt, never counted as unregistered.
@@ -325,6 +326,18 @@ def known_empty(prefix: str, portdbpath: str, base: BaseFiles) -> bool:
 
 # Usability ------------------------------------------------------------------------
 
+def release(platform: str, major: str) -> str:
+    """Return a platform and its major as the report names them
+
+    @param platform  the `uname` system name in lower case, or empty when it is not recorded
+    @param major     the major release, or empty when it is not recorded
+    @returns         the macOS release of a Darwin major; else the two words, `?` for one that is not recorded
+    """
+    if platform in ("", "darwin") and major.isdigit():
+        return system.macos_name(int(major))
+    return f"{platform or '?'} {major or '?'}"
+
+
 def platform_mismatch(autoconf: Mapping[str, str], running: Platform, arch: str | None, host_arch: str,
                       stderr: str) -> str | None:
     """Return the PLATFORM_MISMATCH reason
@@ -341,9 +354,9 @@ def platform_mismatch(autoconf: Mapping[str, str], running: Platform, arch: str 
     """
     built = (autoconf.get("os_platform") or "", autoconf.get("os_major") or "")
     if (built[0] and built[0] != running[0]) or (built[1] and built[1] != str(running[1])):
-        return f"base is built for {built[0] or '?'} {built[1] or '?'}; this host runs {running[0]} {running[1]}"
+        return f"MacPorts was built for {release(*built)}; this Mac runs {release(running[0], str(running[1]))}"
     if host_arch == "arm64" and arch == "x86_64":
-        return "base runs as x86_64 on an arm64 host"
+        return INTEL_ON_ARM
     for line in stderr.splitlines():
         if any(text in line for text in PLATFORM_TEXTS):
             return line.strip()

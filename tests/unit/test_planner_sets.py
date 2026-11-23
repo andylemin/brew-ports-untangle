@@ -448,8 +448,8 @@ class KeptTest(PlannerCase):
         self.assertEqual([m.target_name for m in outcome.plan.mappings], ["wget"])
         title = f"Staying in Homebrew at {self.usr_local}"
         self.assertEqual(self.section(outcome, title), [
-            title, "  wget 1.0: some of its files belong to root, so `brew` cannot uninstall it; `brew-ports doctor "
-                   "--fix` repairs that"])
+            title, "  wget 1.0: some of its files belong to root, so `brew` cannot uninstall it; `brew-ports doctor` "
+                   "says how to fix that"])
 
     def test_root_kept_by_a_kept_package_keeps_its_mapping(self):
         self.ports_source(port("vim", self.local, "9.1", deps=["wget"]), port("wget", self.local, "1.25.0"))

@@ -704,7 +704,7 @@ class _Composer:
             detail = f" ({first[0].rstrip(':')})" if first else ""
             lines.append(f"nothing can move into {at(self.target)}: its `{COMMAND_OF[self.manager]}` command cannot "
                          f"run{detail}. `brew-ports doctor` shows the fix")
-        lines += doctor.blocked_by_lines(found)
+        lines += doctor.blocked_by_lines(found, self.result.instances)
         if lines:
             raise _Stop(EXIT_PREFLIGHT, lines, found)
 
@@ -1277,7 +1277,7 @@ def cmd_plan(ctx: Context, make_runner: Callable[[Context, state.RunDir], BaseRu
         try:
             if reused:
                 env_interpreters.write_requirements(run_dir.path, bundle.result.interpreter_extras)
-                ctx.console.info("Using the scan taken in the last ten minutes (--rescan takes a new one).")
+                ctx.console.info(report.SCAN_REUSED)
             outcome = build(bundle, options, runner, ask=ctx, state_dir=ctx.state, run_dir=run_dir,
                             verbose=ctx.console.verbose)
         finally:

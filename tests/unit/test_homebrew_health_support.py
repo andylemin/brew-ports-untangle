@@ -10,7 +10,7 @@ import os
 from typing import Any
 from unittest import mock
 
-from brew_ports import model, runner as r, scan, system
+from brew_ports import doctor_report, model, runner as r, scan, system
 from brew_ports.homebrew import health, inventory
 from brew_ports.homebrew.catalogue import Catalogue
 from tests.unit.helpers import TempDirTest, make_instance, make_package
@@ -245,6 +245,15 @@ class HealthCase(TempDirTest):
         found = self.found(code, self.detect())
         self.assertEqual(len(found), 1, [(i.code, i.subject, i.title) for i in found])
         return found[0]
+
+    @staticmethod
+    def fixes(issue):
+        """Return what the report tells the user to do about a finding
+
+        @param issue  the finding
+        @returns      the lines the report prints under it
+        """
+        return doctor_report.fix_lines(issue)
 
     def brew_argv(self, *args):
         """Return the argv of the instance's `brew` under `arch -arm64`

@@ -459,17 +459,22 @@ def link(instance: Instance, host_arch: str, action_id: str, name: str) -> Actio
     return _action(instance, action_id, argv, f"link {name}")
 
 
-def manual(instance: Instance, action_id: str, args: Sequence[str], description: str) -> Action:
+def manual(instance: Instance, action_id: str, args: Sequence[str], description: str,
+           host_arch: str | None = None) -> Action:
     """Build a `brew` line that is printed for the user and never run, such as `brew link --overwrite --dry-run <f>`
 
-    It names the instance's binary without `arch`, as the user would type it.
+    It names the instance's binary as the user would type it. The `brew` of an Intel Homebrew on an Apple Silicon
+    Mac goes behind `arch -x86_64`: started without it, Homebrew refuses to install into `/usr/local`.
 
     @param instance     the Homebrew instance whose binary the line names
     @param action_id    the action's `<phase>.<subject>.<step>` id
     @param args         the arguments after the binary
     @param description  the text shown with the line
+    @param host_arch    the host's architecture; None leaves `arch` out
     @returns            the action
     """
-    binary = instance.binary or f"{instance.prefix}/bin/brew"
-    return Action(action_id=action_id, kind="command", argv=[binary] + list(args), sudo=False,
+    argv = [instance.binary or f"{instance.prefix}/bin/brew"] + list(args)
+    if host_arch == "arm64" and instance.arch == "x86_64":
+        argv = arch_argv(instance.arch, host_arch, argv)
+    return Action(action_id=action_id, kind="command", argv=argv, sudo=False,
                   description=description, env_profile="brew", manual=True, instance_prefix=instance.prefix)

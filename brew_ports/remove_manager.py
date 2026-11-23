@@ -19,7 +19,7 @@ from .context import Context
 from .homebrew import catalogue as brew_catalogue, inventory as brew_inventory, locate as brew_locate
 from .macports import locate as mp_locate, registry
 from .model import Action, Instance, Manager, OnFailure, Plan, Service, Usability
-from .report import Redactor, at, counted, some
+from .report import Redactor, at, counted, series, some
 from .runner import RM, ActionFailed, Result, RootFiles
 
 TAR = system.TAR
@@ -1492,7 +1492,7 @@ class _Homebrew(_Removal):
         snap = snapshot.brew_dir(self.p.run_dir, self.prefix)
         missing = [n for n in (snapshot.FORMULAE, snapshot.CASKS) if not os.path.isfile(os.path.join(snap, n))]
         if missing:
-            return f"the record saved for undo lacks {apply_report.series(missing)}"
+            return f"the record saved for undo lacks {series(missing)}"
         if not self.p.origin_ok(self.inst):
             return ("it is not /opt/homebrew, /usr/local, HOMEBREW_PREFIX or a folder found through its own `brew`, "
                     "so nothing shows that Homebrew made it")
