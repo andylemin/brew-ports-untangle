@@ -57,6 +57,16 @@ class ProfileTest(unittest.TestCase):
         for kept in ("HOME", "LANG", "LC_ALL", "https_proxy", "no_proxy", "SSH_TTY", "XDG_CONFIG_HOME"):
             self.assertIn(kept, env)
 
+    def test_the_named_only_profile_turns_the_dependents_check_off(self):
+        own = dict(self.ENV, HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK="0")
+        named = r.profile_env(r.BREW_NAMED_ONLY, own, prefix="/opt/homebrew")
+        self.assertEqual(named["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"], "1")
+        # Any other `brew` command leaves Homebrew's check of the dependents on, whatever the user's shell sets.
+        plain = r.profile_env("brew", own, prefix="/opt/homebrew")
+        self.assertNotIn("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", plain)
+        del named["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"]
+        self.assertEqual(named, plain)
+
     def test_ports_and_neutral_profiles_drop_homebrew(self):
         ports = r.profile_env("ports", self.ENV, prefix="/opt/local")
         self.assertEqual(ports["COLUMNS"], "200")

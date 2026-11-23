@@ -1168,7 +1168,7 @@ def _outdated_keg(ctx: _Scan) -> list[Issue]:
 
 
 def _pinned_formula(ctx: _Scan) -> list[Issue]:
-    """Report a pinned formula: a pinned outdated dependency of a plan's target stops that plan
+    """Report a pinned formula: `plan` asks about one that is in the way of a move, and a no refuses the plan
 
     @param ctx  the scan
     @returns    the findings
@@ -1178,8 +1178,9 @@ def _pinned_formula(ctx: _Scan) -> list[Issue]:
     for b in ctx.brews:
         for pkg in b.packages("formula"):
             if pkg.pinned:
-                note = _note(code, b.racks(pkg)[0], "Nothing to do. A move that needs a newer version of a pinned "
-                             "formula stops until you run `brew unpin` for it.")
+                note = _note(code, b.racks(pkg)[0], "Nothing to do. `brew-ports plan` asks whether to remove the pin "
+                             "when it is in the way of a move, and with --upgrade-all whenever the formula has a "
+                             "newer version.")
                 out.append(_issue(code, pkg.name, b, ["a newer version exists"] if pkg.outdated else [], [note],
                                   title=f"{pkg.name} is pinned: Homebrew does not upgrade it"))
     return out

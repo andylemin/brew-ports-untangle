@@ -4,11 +4,12 @@ import os
 import unittest
 from unittest import mock
 
-from brew_ports import doctor, plan_phases
+from brew_ports import doctor, plan_phases, runner
 from brew_ports.homebrew import actions as brew_actions
-from brew_ports.model import Confidence, Mapping, OnFailure, Severity
+from brew_ports.model import Confidence, Manager, Mapping, OnFailure, Severity
 from tests.unit.fixtures.doctor.builders import service
-from tests.unit.fixtures.planner.builders import PlannerCase, actions, cask, formula, port
+from tests.unit.fixtures.planner.builders import (FakeAsk, PlannerCase, actions, cask, catalogue, formula, instance,
+                                                  port)
 
 PAYLOAD = {"formulae": {
     "wget": {"stable_version": "1.25.0", "bottle_checksum": "abc", "homepage": "https://www.gnu.org/software/wget/",
@@ -58,26 +59,187 @@ class BrewUpgradesTest(PlannerCase):
         plan = outcome.plan
         self.assertEqual(plan.target_upgrades, ["openssl@3", "curl"])
         text = self.text(outcome)
-        self.assertIn("3.5.0 -> 3.6.0", text)
-        self.assertIn("a dependency of wget", text)
-        self.assertIn("depends on openssl@3", text)
+        self.assertRegex(text, r"\n  openssl@3 +3\.5\.0 -> 3\.6\.0 +a dependency of wget\n"
+                               r"  Checked after the upgrades, and installed again if one lost a library: curl\n")
+        self.assertNotIn("8.16.0 ->", text)                     # curl has no newer version to go to
         # Only mapped targets and companions are upgraded by name; build-only dependencies are no upgrades.
         self.assertNotIn("3.upgrade.formulae", ids(plan, 3))
         self.assertNotIn("pkgconf", plan.target_upgrades)
+
+    def test_homebrew_upgrades_what_uses_an_upgraded_formula(self):
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("openssl@3", prefix, version="3.5.0", outdated=True, requested=False),
+                         formula("curl", prefix, version="8.16.0", deps=["openssl@3"], outdated=True),
+                         payload=PAYLOAD, outdated_formulae={"openssl@3": "3.6.0", "curl": "8.17.0"})
+        outcome = self.plan()
+        self.assert_exit(outcome, 0)
+        self.assertRegex(self.text(outcome), r"\n  curl +8\.16\.0 -> 8\.17\.0 +depends on openssl@3\n")
+        self.assertNotIn("Checked after the upgrades", self.text(outcome))
+
+    def duplicate(self, **openssl):
+        """Add a Homebrew target that holds wget too, at the version of the catalogue, on an outdated openssl@3
+
+        @param openssl  `Package` fields of openssl@3 over its outdated, unrequested 3.5.0
+        """
+        fields = {"version": "3.5.0", "outdated": True, "requested": False}
+        fields.update(openssl)
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("wget", prefix, version="1.25.0", deps=["openssl@3"]),
+                         formula("openssl@3", prefix, **fields),
+                         payload=PAYLOAD, outdated_formulae={"openssl@3": "3.6.0"})
+
+    def test_a_replacement_that_is_installed_upgrades_nothing(self):
+        self.duplicate()
+        outcome = self.plan()
+        self.assert_exit(outcome, 0)
+        self.assertEqual(outcome.plan.target_upgrades, [])
+        self.assertEqual(ids(outcome.plan, 3), [])              # phase 3 has nothing to run for wget
+        self.assertNotIn("Upgrades in", self.text(outcome))
+
+    def test_a_pin_under_an_installed_replacement_is_in_nobodys_way(self):
+        self.duplicate(pinned=True)
+        self.assert_exit(self.plan(), 0)
+
+    def test_what_a_replacement_uses_is_never_optional(self):
+        self.duplicate()
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        # The option upgrades openssl@3, and the move needs it all the same: the installed wget uses it, so a
+        # break of it has to stop the run before the old wget is uninstalled.
+        self.assertEqual(outcome.plan.target_upgrades, ["openssl@3"])
+        self.assertEqual(outcome.plan.optional_upgrades, [])
+        self.assertRegex(self.text(outcome), r"\nOther upgrades in .*, as --upgrade-all asks\n(.*\n){2}  openssl@3 ")
 
     def test_a_pinned_install_blocker_exits_1(self):
         self.make_target(pinned=True)
         outcome = self.plan()
         self.assert_exit(outcome, 1)
+        brew = self.target.binary
         self.assertEqual(outcome.problems[:2], [
             "brew-ports: no plan was made: 1 thing to settle first",
-            "    installing the replacement of wget would upgrade openssl@3 (a dependency of wget), which you pinned. "
-            f"Run `{self.target.binary} unpin openssl@3`, or plan with `--leave wget`"])
+            "    installing the replacement of wget would upgrade openssl@3 (a dependency of wget), which is pinned. "
+            f"Plan on a terminal without --yes to be asked about the pin, or run `{brew} unpin openssl@3` and plan "
+            "again with --rescan, or plan with `--leave wget`"])
         self.assertEqual(outcome.draft.target_upgrades, ["openssl@3", "curl"])
+        self.assertEqual(self.section(outcome, f"Pinned in Homebrew at {self.target.prefix}")[1:], [
+            f"  openssl@3 3.5.0, newest 3.6.0: stays pinned. To upgrade it: `{brew} unpin openssl@3`, then "
+            f"`{brew} upgrade --formula openssl@3`",
+            "  On a terminal and without --yes, `brew-ports plan` asks whether to remove each pin."])
 
     def test_keeping_the_root_clears_the_blocker(self):
         self.make_target(pinned=True)
         self.assert_exit(self.plan(keep=["wget"]), 0)
+
+    def test_the_pin_in_the_way_is_put_to_the_user(self):
+        self.make_target(pinned=True)
+        ask = FakeAsk({"Remove the pin": "no"})
+        outcome = self.plan(ask=ask)
+        self.assert_exit(outcome, 1)
+        at_target = f"Homebrew at {self.target.prefix}"
+        self.assertTrue(ask.asked[0].endswith(
+            f"\nopenssl@3 in {at_target} is pinned at 3.5.0; the newest version is 3.6.0. Installing the replacement "
+            "of wget would upgrade openssl@3 (a dependency of wget).\n"
+            "If you answer yes, the move removes the pin and upgrades it to 3.6.0. If you answer no, it stays pinned "
+            "and no plan is made.\n"
+            "Remove the pin and upgrade openssl@3?"), ask.asked[0])
+        self.assertEqual(outcome.problems[1],
+                         "    installing the replacement of wget would upgrade openssl@3 (a dependency of wget), which "
+                         "stays pinned, as you answered. Plan again and answer yes for it, or plan with `--leave wget`")
+        self.assertIn("  openssl@3 3.5.0, newest 3.6.0: stays pinned, as you answered. To upgrade it: ",
+                      self.text(outcome))
+        # --yes answers no question about a pin: what the user pinned stays until they say otherwise.
+        self.assert_exit(self.plan(ask=FakeAsk({"Remove the pin": "yes"}, yes=True)), 1)
+
+    def test_a_yes_removes_the_pin_and_upgrades_the_formula(self):
+        self.make_target(pinned=True)
+        outcome = self.plan(ask=FakeAsk({"Remove the pin": "yes"}))
+        self.assert_exit(outcome, 0)
+        acts = {a.action_id: a for a in actions(outcome.plan, 3)}
+        brew = self.target.binary
+        self.assertEqual(list(acts)[:2], ["3.unpin.formulae", "3.upgrade.formulae"])
+        self.assertEqual(acts["3.unpin.formulae"].argv[2:], [brew, "unpin", "openssl@3"])
+        self.assertEqual(acts["3.upgrade.formulae"].argv[2:], [brew, "upgrade", "--formula", "openssl@3"])
+        self.assertEqual(self.section(outcome, f"Pinned in Homebrew at {self.target.prefix}")[1:], [
+            "  openssl@3 3.5.0 -> 3.6.0: the pin is removed and it is upgraded, as you answered",
+            "  `brew-ports rollback` does not put a removed pin back."])
+
+    def test_a_pinned_formula_that_uses_an_upgraded_one_is_asked(self):
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("openssl@3", prefix, version="3.5.0", outdated=True, requested=False),
+                         formula("curl", prefix, version="8.16.0", deps=["openssl@3"], pinned=True),
+                         payload=PAYLOAD, outdated_formulae={"openssl@3": "3.6.0"})
+        ask = FakeAsk({"Remove the pin": "no"})
+        outcome = self.plan(ask=ask)
+        self.assert_exit(outcome, 1)
+        why = ("installing the replacement of wget upgrades openssl@3, so curl, which uses it, may have to be "
+               "installed again")
+        self.assertTrue(ask.asked[0].endswith(
+            f"\ncurl in Homebrew at {prefix} is pinned at 8.16.0. I{why[1:]}.\n"
+            "If you answer yes, the move removes the pin. If you answer no, it stays pinned and no plan is made.\n"
+            "Remove the pin of curl?"), ask.asked[0])
+        self.assertEqual(outcome.problems[1], f"    {why}, and it stays pinned, as you answered. Plan again and "
+                                              "answer yes for it, or plan with `--leave wget`")
+        self.assertIn(f"  curl 8.16.0: stays pinned, as you answered. To remove the pin: `{self.target.binary} unpin "
+                      "curl`\n", self.text(outcome))
+        # A yes removes the pin; curl has no newer version, so nothing upgrades it.
+        outcome = self.plan(ask=FakeAsk({"Remove the pin": "yes"}))
+        self.assert_exit(outcome, 0)
+        self.assertEqual([i for i in ids(outcome.plan, 3) if "pin" in i or "upgrade" in i], ["3.unpin.formulae"])
+        self.assertIn("  curl 8.16.0: the pin is removed, as you answered\n", self.text(outcome))
+
+    def two_pins(self):
+        """Add a target whose pinned openssl@3 a replacement needs, with a pinned curl that uses openssl@3
+
+        @returns  the question about each, as it ends
+        """
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("openssl@3", prefix, version="3.5.0", outdated=True, requested=False, pinned=True),
+                         formula("curl", prefix, version="8.16.0", deps=["openssl@3"], pinned=True),
+                         payload=PAYLOAD, outdated_formulae={"openssl@3": "3.6.0"})
+        return "Remove the pin and upgrade openssl@3?", "Remove the pin of curl?"
+
+    def test_the_questions_end_with_the_first_no(self):
+        first, second = self.two_pins()
+        ask = FakeAsk({first: "no", second: "yes"})
+        outcome = self.plan(ask=ask)
+        self.assert_exit(outcome, 1)
+        # What is upgraded is asked about before what uses it, and no plan is made after the no.
+        self.assertEqual([q.rsplit("\n", 1)[-1] for q in ask.asked], [first])
+        self.assertEqual(outcome.problems[0], "brew-ports: no plan was made: 2 things to settle first")
+        self.assertTrue(outcome.problems[1].endswith("which stays pinned, as you answered. Plan again and answer yes "
+                                                     "for it, or plan with `--leave wget`"), outcome.problems[1])
+        self.assertTrue(outcome.problems[2].endswith("and it is pinned. `brew-ports plan` asks about this pin once "
+                                                     "the other points are settled, or plan with `--leave wget`"),
+                        outcome.problems[2])
+        brew = self.target.binary
+        self.assertEqual(self.section(outcome, f"Pinned in Homebrew at {self.target.prefix}")[1:], [
+            f"  openssl@3 3.5.0, newest 3.6.0: stays pinned, as you answered. To upgrade it: `{brew} unpin openssl@3`, "
+            f"then `{brew} upgrade --formula openssl@3`",
+            f"  curl 8.16.0: stays pinned. To remove the pin: `{brew} unpin curl`"])
+
+    def test_a_yes_for_a_plan_that_is_not_made_removes_no_pin(self):
+        first, second = self.two_pins()
+        ask = FakeAsk({first: "yes", second: "no"})
+        outcome = self.plan(ask=ask)
+        self.assert_exit(outcome, 1)
+        self.assertEqual([q.rsplit("\n", 1)[-1] for q in ask.asked], [first, second])
+        self.assertEqual(self.section(outcome, f"Pinned in Homebrew at {self.target.prefix}")[1:], [
+            "  openssl@3 3.5.0: you answered yes; it stays pinned, as no plan is made",
+            f"  curl 8.16.0: stays pinned, as you answered. To remove the pin: `{self.target.binary} unpin curl`"])
+        # A plan that is not made upgrades nothing, so it has no word of what an upgrade leaves behind.
+        self.assertNotIn("The old version of each upgraded formula", self.text(outcome))
+
+    def test_a_plan_refused_for_another_reason_asks_about_no_pin(self):
+        self.make_target(pinned=True)
+        # wget alone cannot leave MacPorts while a port that stays there needs it.
+        self.world.packages.append(port("fetcher", self.local, "1.0", deps=["wget"]))
+        ask = FakeAsk({"Remove the pin": "yes"})
+        outcome = self.plan(ask=ask, only=["wget"], upgrade_all=True)
+        self.assert_exit(outcome, 1)
+        self.assertIn("fetcher needs it", self.text(outcome))
+        self.assertEqual([q for q in ask.asked if "Remove the pin" in q], [])
+        self.assertIn("is pinned. `brew-ports plan` asks about this pin once the other points are settled",
+                      self.text(outcome))
 
 
 class PortsUpgradesTest(PlannerCase):
@@ -94,6 +256,56 @@ class PortsUpgradesTest(PlannerCase):
         self.assert_exit(outcome, 0)
         self.assertEqual(outcome.plan.target_upgrades, ["zlib", "curl"])
         self.assertIn("1.3_0 (epoch 0) -> 1.3_1 (epoch 1)", self.text(outcome))
+
+    def host(self, *more, add=()):
+        """Make a move of wget into a MacPorts whose zlib, which wget needs, is outdated
+
+        @param more  further ports of the target
+        @param add   further PortIndex entries
+        @returns     the target's `port`, as a command of the plan report names it
+        """
+        self.brew_source(formula("wget", self.usr_local, version="1.25.0"))
+        self.ports_target(port("zlib", self.local, "1.3", outdated=True, requested=False), *more, drop=["wget"],
+                          add=[{"name": "wget", "version": "1.25.0", "depends_lib": "port:zlib"},
+                               {"name": "zlib", "version": "1.3", "revision": 1}, *add])
+        return f"sudo {self.target.binary}"
+
+    def test_a_port_that_uses_an_upgraded_port_is_only_checked(self):
+        self.host(port("curl", self.local, "8.16.0", deps=["zlib"], outdated=True),
+                  add=[{"name": "curl", "version": "8.17.0"}])
+        outcome = self.plan()
+        self.assert_exit(outcome, 0)
+        # `port install wget` upgrades what wget needs. Nothing upgrades curl, which only uses zlib.
+        self.assertEqual(ids(outcome.plan, 3), ["3.install.wget"])
+        text = self.text(outcome)
+        self.assertRegex(text, r"\n  zlib +1\.3_0 -> 1\.3_1 +a dependency of wget\n"
+                               r"  Checked after the upgrades, and installed again if one lost a library: curl\n")
+        self.assertNotIn("8.16.0_0 ->", text)
+
+    def test_upgrade_all_upgrades_a_port_that_uses_an_upgraded_one(self):
+        self.host(port("curl", self.local, "8.16.0", deps=["zlib"], outdated=True),
+                  add=[{"name": "curl", "version": "8.17.0"}])
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        self.assertEqual(ids(outcome.plan, 3), ["3.upgrade.curl", "3.upgrade.zlib", "3.install.wget"])
+        self.assertEqual(outcome.plan.optional_upgrades, ["curl"])
+        others = self.section(outcome, f"Other upgrades in MacPorts at {self.local}, as --upgrade-all asks")
+        self.assertRegex(others[3], r"^  curl +8\.16\.0_0 -> 8\.17\.0_0$")
+        self.assertEqual(others[4:], ["  The old version of each upgraded port stays stored, switched off; afterwards "
+                                      "`brew-ports doctor` offers to uninstall those versions."])
+        self.assertNotIn("Checked after the upgrades", self.text(outcome))
+
+    def test_a_replaced_port_stays_with_the_command_that_replaces_it(self):
+        sudo_port = self.host(port("py39-foo", self.local, "1.0", outdated=True, renamed_to="py313-foo"))
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        # `port upgrade` would put py313-foo in its place, which the checks of the move would take for a loss.
+        self.assertEqual(ids(outcome.plan, 3), ["3.upgrade.zlib", "3.install.wget"])
+        self.assertEqual(self.section(outcome, f"Not upgraded by --upgrade-all in MacPorts at {self.local}")[1:], [
+            f"  py39-foo: MacPorts replaced it with py313-foo. To make that change: `{sudo_port} upgrade py39-foo`"])
+        # While a Homebrew stays installed, MacPorts builds in trace mode.
+        kept = self.plan(upgrade_all=True, keep_managers=True)
+        self.assertIn(f"To make that change: `{sudo_port} -t upgrade py39-foo`\n", self.text(kept))
 
 
 class UpgradeAllTest(PlannerCase):
@@ -132,33 +344,223 @@ class UpgradeAllTest(PlannerCase):
         self.assert_exit(outcome, 0)
         plan, brew = outcome.plan, self.target.binary
         acts = {a.action_id: a for a in actions(plan, 3)}
-        # The formulae go into the one upgrade command, whose packages are checked afterwards; the apps follow.
-        self.assertEqual(acts["3.upgrade.formulae"].argv[2:], [brew, "upgrade", "--formula", "openssl@3", "pkgconf"])
+        # The upgrades that the option adds are a command of their own, the apps follow, then the installs.
+        self.assertEqual(list(acts), ["3.upgrade.others", "3.upgrade.casks", "3.install.bottled"])
+        self.assertEqual(acts["3.upgrade.others"].argv[2:], [brew, "upgrade", "--formula", "openssl@3", "pkgconf"])
         self.assertEqual(acts["3.upgrade.casks"].argv[2:], [brew, "upgrade", "--cask", "firefox"])
-        self.assertEqual(list(acts)[:2], ["3.upgrade.formulae", "3.upgrade.casks"])
         self.assertEqual(plan.target_upgrades, ["openssl@3", "pkgconf"])
+        self.assertEqual((plan.optional_upgrades, plan.optional_casks), (["pkgconf"], ["firefox"]))
         self.assertEqual(plan.options["upgrade_all"], "true")
         at_target = f"Homebrew at {self.target.prefix}"
         text = self.text(outcome)
         self.assertIn(f"\nOther upgrades in {at_target}, as --upgrade-all asks\n", text)
         self.assertRegex(text, r"\n  pkgconf +2\.4\.0 -> 2\.5\.1\n  firefox \(app\) +140\.0 -> 141\.0\n")
-        self.assertIn(f"\nNot upgraded in {at_target}\n"
-                      "  ddrescue: gnu-sed, which you pinned, uses it. To upgrade it all the same: "
-                      f"`{brew} upgrade --formula ddrescue`\n"
-                      f"  gnu-sed: you pinned it. To upgrade it: `{brew} unpin gnu-sed`, then `{brew} upgrade "
-                      "--formula gnu-sed`\n"
-                      "  docker-desktop (app): it asks for your password. To upgrade it: "
-                      f"`{brew} upgrade --cask docker-desktop`\n", text)
+        # Without a terminal nobody is asked about the pin of gnu-sed: it stays, and so does what it uses.
+        self.assertEqual(self.section(outcome, f"Pinned in {at_target}")[1:], [
+            f"  gnu-sed 4.9, newest 4.10: stays pinned. To upgrade it: `{brew} unpin gnu-sed`, then `{brew} upgrade "
+            "--formula gnu-sed`",
+            "  On a terminal and without --yes, `brew-ports plan` asks whether to remove each pin."])
+        self.assertEqual(self.section(outcome, f"Not upgraded by --upgrade-all in {at_target}")[1:], [
+            "  ddrescue: gnu-sed, which is pinned, uses it. To upgrade it all the same: "
+            f"`{brew} upgrade --formula ddrescue`",
+            "  docker-desktop (app): Homebrew asks for your password for its upgrade. To upgrade it: "
+            f"`{brew} upgrade --cask docker-desktop`"])
+        # What to know of the upgrades follows the table of them.
+        self.assertIn("\n  firefox (app)  140.0 -> 141.0\n"
+                      "  Homebrew may close an app that is open for its upgrade, and then opens it again.\n"
+                      "  The old version of each upgraded formula stays installed; afterwards `brew-ports doctor` "
+                      "offers to delete those versions.\n", text)
+        self.assertIn("\n  3  Install the replacements and upgrade the other packages\n", text)
         # What the replacements need keeps its own table, with the reason of each.
         self.assertRegex(text, r"\n  openssl@3 +3\.5\.0 -> 3\.6\.0 +a dependency of wget\n")
+
+    def test_a_yes_to_the_pin_upgrades_it_and_what_it_held_back(self):
+        self.brew_host()
+        ask = FakeAsk({"Remove the pin": "yes"})
+        outcome = self.plan(ask=ask, upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        plan, brew, at_target = outcome.plan, self.target.binary, f"Homebrew at {self.target.prefix}"
+        self.assertEqual(len(ask.asked), 1)
+        self.assertTrue(ask.asked[0].endswith(
+            f"\ngnu-sed in {at_target} is pinned at 4.9; the newest version is 4.10.\n"
+            "If you answer yes, the move removes the pin and upgrades it to 4.10. If you answer no, it stays as it "
+            "is. --upgrade-all then leaves what it uses as it is, and every package whose upgrade needs a newer "
+            "version of gnu-sed or of something it uses.\n"
+            "Remove the pin and upgrade gnu-sed?"), ask.asked[0])
+        acts = {a.action_id: a for a in actions(plan, 3)}
+        self.assertEqual(list(acts)[:3], ["3.unpin.formulae", "3.upgrade.others", "3.upgrade.casks"])
+        self.assertEqual(acts["3.unpin.formulae"].argv[2:], [brew, "unpin", "gnu-sed"])
+        self.assertEqual(acts["3.upgrade.others"].argv[2:],
+                         [brew, "upgrade", "--formula", "ddrescue", "gnu-sed", "openssl@3", "pkgconf"])
+        self.assertEqual(plan.optional_upgrades, ["ddrescue", "gnu-sed", "pkgconf"])
+        self.assertEqual(self.section(outcome, f"Pinned in {at_target}")[1:],
+                         ["  gnu-sed 4.9 -> 4.10: the pin is removed and it is upgraded, as you answered",
+                          "  `brew-ports rollback` does not put a removed pin back."])
+        others = self.section(outcome, f"Other upgrades in {at_target}, as --upgrade-all asks")
+        self.assertEqual([line.split()[0] for line in others[3:6]], ["ddrescue", "pkgconf", "firefox"])
+        self.assertEqual(self.section(outcome, f"Not upgraded by --upgrade-all in {at_target}")[1:], [
+            "  docker-desktop (app): Homebrew asks for your password for its upgrade. To upgrade it: "
+            f"`{brew} upgrade --cask docker-desktop`"])
+
+    def test_a_no_to_the_pin_is_said_to_be_the_users_answer(self):
+        self.brew_host()
+        at_target = f"Homebrew at {self.target.prefix}"
+        outcome = self.plan(ask=FakeAsk({"Remove the pin": "no"}), upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        self.assertEqual(len(self.section(outcome, f"Pinned in {at_target}")), 2)
+        self.assertIn("  gnu-sed 4.9, newest 4.10: stays pinned, as you answered. To upgrade it: ", self.text(outcome))
+        # --yes answers no question about a pin, and the report says how to be asked.
+        unasked = self.plan(ask=FakeAsk({"Remove the pin": "yes"}, yes=True), upgrade_all=True)
+        self.assertEqual(self.section(unasked, f"Pinned in {at_target}")[2],
+                         "  On a terminal and without --yes, `brew-ports plan` asks whether to remove each pin.")
+        self.assertNotIn("3.unpin.formulae", ids(unasked.plan, 3))
+
+    def pins(self, *more, casks=None, **outdated):
+        """Make a move of wget into a Homebrew with a pinned, outdated gnu-sed that uses ddrescue
+
+        @param more      further packages of the target
+        @param casks     the version each outdated cask upgrades to
+        @param outdated  the version each further outdated formula upgrades to
+        @returns         the target's `brew`
+        """
+        self.ports_source(port("wget", self.local, "1.25.0"))
+        prefix = self.path("opt", "homebrew")
+        versions = {"gnu-sed": "4.10", "ddrescue": "1.29"}
+        versions.update(outdated)
+        self.brew_target(formula("gnu-sed", prefix, version="4.9", outdated=True, pinned=True, deps=["ddrescue"]),
+                         formula("ddrescue", prefix, version="1.28", outdated=True), *more,
+                         payload=PAYLOAD, outdated_formulae=versions, outdated_casks=casks or {})
+        return self.target.binary
+
+    def test_what_a_kept_pin_holds_back_stays_with_its_command(self):
+        prefix = self.path("opt", "homebrew")
+        brew = self.pins(formula("gawk", prefix, version="5.3.0", outdated=True, deps=["gnu-sed"]),
+                         formula("bat", prefix, version="0.24", outdated=True, deps=["ddrescue"]),
+                         gawk="5.3.1", bat="0.25")
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        self.assertEqual([i for i in ids(outcome.plan, 3) if "upgrade" in i], [])
+        self.assertEqual(self.section(outcome, f"Not upgraded by --upgrade-all in Homebrew at {prefix}")[1:], [
+            "  bat: its upgrade would also upgrade ddrescue, which a pinned formula uses. To upgrade it all the same: "
+            f"`{brew} upgrade --formula bat`",
+            f"  ddrescue: gnu-sed, which is pinned, uses it. To upgrade it all the same: `{brew} upgrade --formula "
+            "ddrescue`",
+            f"  gawk: it needs the newest gnu-sed, which is pinned. To upgrade it: `{brew} unpin gnu-sed`, then "
+            f"`{brew} upgrade --formula gawk`"])
+        self.assertIn(f"\n--upgrade-all upgrades nothing more in Homebrew at {prefix}.\n", self.text(outcome))
+        # A yes to the pin frees all four.
+        freed = self.plan(ask=FakeAsk({"Remove the pin": "yes"}), upgrade_all=True)
+        self.assertEqual(next(a.argv[-4:] for a in actions(freed.plan, 3) if a.action_id == "3.upgrade.others"),
+                         ["bat", "ddrescue", "gawk", "gnu-sed"])
+        self.assertEqual(self.section(freed, f"Not upgraded by --upgrade-all in Homebrew at {prefix}"), [])
+
+    def test_a_pin_at_its_newest_version_is_asked_about(self):
+        self.ports_source(port("wget", self.local, "1.25.0"))
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("gnu-sed", prefix, version="4.10", pinned=True, deps=["ddrescue"]),
+                         formula("ddrescue", prefix, version="1.28", outdated=True),
+                         formula("node", prefix, version="26.12.0", pinned=True),
+                         payload=PAYLOAD, outdated_formulae={"ddrescue": "1.29"})
+        brew = self.target.binary
+        ask = FakeAsk({"Remove the pin": "no"})
+        kept = self.plan(ask=ask, upgrade_all=True)
+        self.assert_exit(kept, 0)
+        # node is pinned too, at its newest version, and holds nothing back: nobody is asked about it.
+        self.assertEqual(len(ask.asked), 1)
+        self.assertTrue(ask.asked[0].endswith(
+            f"\ngnu-sed in Homebrew at {prefix} is pinned at 4.10, its newest version. --upgrade-all would upgrade "
+            "ddrescue, which it uses.\n"
+            "If you answer yes, the move removes the pin and upgrades that package. If you answer no, the pin stays "
+            "and --upgrade-all leaves that package as it is.\n"
+            "Remove the pin of gnu-sed?"), ask.asked[0])
+        self.assertIn(f"  gnu-sed 4.10: stays pinned, as you answered. To remove the pin: `{brew} unpin gnu-sed`\n",
+                      self.text(kept))
+        self.assertIn("  ddrescue: gnu-sed, which is pinned, uses it. ", self.text(kept))
+        freed = self.plan(ask=FakeAsk({"Remove the pin": "yes"}), upgrade_all=True)
+        acts = {a.action_id: a for a in actions(freed.plan, 3)}
+        self.assertEqual(acts["3.unpin.formulae"].argv[2:], [brew, "unpin", "gnu-sed"])
+        self.assertEqual(acts["3.upgrade.others"].argv[2:], [brew, "upgrade", "--formula", "ddrescue"])
+        self.assertIn("  gnu-sed 4.10: the pin is removed, as you answered\n", self.text(freed))
+
+    def test_the_upgrade_commands_keep_homebrew_to_what_they_name(self):
+        self.brew_host()
+        prefix = self.path("opt", "homebrew")
+        # pkgconf is a replacement to upgrade; bat uses it and ddrescue, which the pinned gnu-sed keeps as it is.
+        self.world.packages += [port("pkgconf", self.local, "2.5.1"),
+                                formula("bat", prefix, version="0.24", outdated=True, deps=["pkgconf", "ddrescue"])]
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        acts = {a.action_id: a for a in actions(outcome.plan, 3)}
+        self.assertEqual(acts["3.upgrade.formulae"].argv[-1], "pkgconf")
+        # Homebrew would upgrade bat after pkgconf, and ddrescue with it. Under the option it adds nothing itself.
+        self.assertEqual({acts[i].env_profile for i in ("3.upgrade.formulae", "3.upgrade.others")},
+                         {runner.BREW_NAMED_ONLY})
+        self.assertNotIn("bat", acts["3.upgrade.others"].argv)
+        text = self.text(outcome)
+        self.assertIn("\n  Checked after the upgrades, and installed again if one lost a library: bat\n", text)
+        self.assertIn("\n  bat: its upgrade would also upgrade ddrescue, which a pinned formula uses. ", text)
+        self.assertNotIn("0.24 ->", text)
+        # Without the option Homebrew's own check of what uses an upgraded formula stays on.
+        plain = {a.action_id: a for a in actions(self.plan().plan, 3)}
+        self.assertEqual(plain["3.upgrade.formulae"].env_profile, "brew")
+
+    def test_a_pinned_app_is_asked_about_like_a_pinned_formula(self):
+        prefix = self.path("opt", "homebrew")
+        brew = self.pins(cask("firefox", prefix, version="140.0", outdated=True, pinned=True),
+                         cask("docker-desktop", prefix, version="4.40", outdated=True, pinned=True,
+                              privileged_uninstall=True),
+                         casks={"firefox": "141.0", "docker-desktop": "4.41"})
+        ask = FakeAsk({"Remove the pin and upgrade firefox": "no"})
+        kept = self.plan(ask=ask, upgrade_all=True)
+        self.assert_exit(kept, 0)
+        self.assertTrue(ask.asked[-1].endswith(
+            f"firefox (app) in Homebrew at {prefix} is pinned at 140.0; the newest version is 141.0.\n"
+            "If you answer yes, the move removes the pin and upgrades it to 141.0. If you answer no, it stays as it "
+            "is.\nRemove the pin and upgrade firefox?"), ask.asked[-1])
+        self.assertEqual(len(ask.asked), 2)                     # gnu-sed and firefox: the other app needs a password
+        self.assertNotIn("3.upgrade.casks", ids(kept.plan, 3))
+        self.assertIn("  firefox (app) 140.0, newest 141.0: stays pinned, as you answered. To upgrade it: "
+                      f"`{brew} unpin --cask firefox`, then `{brew} upgrade --cask firefox`\n", self.text(kept))
+        self.assertIn("  docker-desktop (app): it is pinned, and Homebrew asks for your password for its upgrade. To "
+                      f"upgrade it: `{brew} unpin --cask "
+                      f"docker-desktop`, then `{brew} upgrade --cask docker-desktop`\n", self.text(kept))
+        freed = self.plan(ask=FakeAsk({"Remove the pin and upgrade firefox": "yes"}), upgrade_all=True)
+        acts = {a.action_id: a for a in actions(freed.plan, 3)}
+        self.assertEqual(list(acts)[:2], ["3.unpin.casks", "3.upgrade.casks"])
+        self.assertEqual(acts["3.unpin.casks"].argv[2:], [brew, "unpin", "--cask", "firefox"])
+        self.assertEqual(freed.plan.optional_casks, ["firefox"])
+        self.assertIn("  firefox (app) 140.0 -> 141.0: the pin is removed and it is upgraded, as you answered\n",
+                      self.text(freed))
+
+    def test_a_command_for_an_intel_homebrew_keeps_its_arch(self):
+        self.ports_source(port("wget", self.local, "1.25.0"))
+        intel = instance(Manager.BREW, self.usr_local, arch="x86_64")
+        self.target = self.world.add(
+            intel, formula("gnu-sed", self.usr_local, version="4.9", outdated=True, pinned=True),
+            cat=catalogue(self.tmp, PAYLOAD), outdated_formulae={"gnu-sed": "4.10"})
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        brew = f"arch -x86_64 {intel.binary}"
+        self.assertIn(f"  gnu-sed 4.9, newest 4.10: stays pinned. To upgrade it: `{brew} unpin gnu-sed`, then `{brew} "
+                      "upgrade --formula gnu-sed`\n", self.text(outcome))
+
+    def test_a_version_that_homebrew_does_not_name_is_not_made_up(self):
+        self.ports_source(port("wget", self.local, "1.25.0"))
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("gnu-sed", prefix, version="4.9", outdated=True, pinned=True), payload=PAYLOAD)
+        ask = FakeAsk({"Remove the pin": "no"})
+        outcome = self.plan(ask=ask, upgrade_all=True)
+        self.assertIn(f"\ngnu-sed in Homebrew at {prefix} is pinned at 4.9; a newer version exists.\n", ask.asked[0])
+        self.assertIn("  gnu-sed 4.9: stays pinned, as you answered. To upgrade it: ", self.text(outcome))
 
     def test_the_option_says_so_when_it_adds_nothing(self):
         self.ports_source(port("wget", self.local, "1.25.0"))
         self.brew_target(formula("pkgconf", self.path("opt", "homebrew"), version="2.5.1"), payload=PAYLOAD)
         outcome = self.plan(upgrade_all=True)
         self.assert_exit(outcome, 0)
-        self.assertIn(f"\n--upgrade-all adds no upgrade: no other package of Homebrew at {self.target.prefix} has a "
-                      "newer version that it may install.\n", self.text(outcome))
+        self.assertIn(f"\n--upgrade-all upgrades nothing more in Homebrew at {self.target.prefix}.\n",
+                      self.text(outcome))
+        self.assertIn("\n  3  Install the replacements\n", self.text(outcome))
 
     def test_a_macports_target_upgrades_each_outdated_port(self):
         self.brew_source(formula("wget", self.usr_local, version="1.25.0"))
@@ -172,7 +574,9 @@ class UpgradeAllTest(PlannerCase):
         acts = {a.action_id: a for a in actions(outcome.plan, 3)}
         self.assertEqual([i for i in acts if i.startswith("3.upgrade")],
                          ["3.upgrade.wget", "3.upgrade.curl", "3.upgrade.zlib"])
-        self.assertEqual(acts["3.upgrade.curl"].argv[-3:], ["upgrade", "--no-rev-upgrade", "curl"])
+        # What the option adds is upgraded so that no successor takes the place of a replaced port.
+        self.assertEqual(acts["3.upgrade.curl"].argv[-4:], ["upgrade", "--no-replace", "--no-rev-upgrade", "curl"])
+        self.assertEqual(acts["3.upgrade.wget"].argv[-3:], ["upgrade", "--no-rev-upgrade", "wget"])
         self.assertNotEqual(acts["3.upgrade.curl"].on_failure, OnFailure.STOP)
         self.assertEqual(outcome.plan.target_upgrades, ["wget", "curl", "zlib"])
         self.assertIn(f"\nOther upgrades in MacPorts at {self.local}, as --upgrade-all asks\n", self.text(outcome))

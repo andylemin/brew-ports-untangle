@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from . import apply_report, doctor, exec_env, exec_install, exec_remove, model, scan, snapshot, state, system
 from .apply_report import MAKE_NEW_PLAN, NEW_PLAN
@@ -290,6 +290,28 @@ def recovery_lines(run: Run, result) -> list[str]:
     return lines
 
 
+def keep_tasks(run: Run, tasks: Mapping[str, str], say: bool = False) -> None:
+    """Keep the packages that an upgrade of `--upgrade-all` left broken as tasks for the user
+
+    The move does not need them, so the run goes on. Each start of a run finds them again in its own checks,
+    so a package repaired between two starts is no task of the second. A package has one task: the wording of
+    a later check, whose command fits the Mac as it is by then, takes the place of an earlier one.
+
+    @param run    the run
+    @param tasks  what the user has to do, by package, as the check worded it
+    @param say    print each task of a package that had none, where the lines of the check do not show it
+    """
+    for package, task in tasks.items():
+        earlier = run.repairs.get(package)
+        run.repairs[package] = task
+        if earlier is None:
+            run.todo.append(task)
+            if say:
+                run.say(f"  For you to do after the run: {task}")
+        elif earlier in run.todo:
+            run.todo[run.todo.index(earlier)] = task
+
+
 def gate(run: Run) -> None:
     """Run phase 4, `verify.check(gate=True)` over a fresh inventory
 
@@ -307,7 +329,9 @@ def gate(run: Run) -> None:
     result = module("verify").check(bundle, run.plan, run.runner, gate=True, run_dir=run.run_dir)
     if result.ok:
         run.say(f"  Passed: {apply_report.GATE}.")
+        keep_tasks(run, result.tasks, say=True)
         return
+    keep_tasks(run, result.tasks)
     for failure in result.failures:
         run.say("  " + failure.line())
     run.journal({"action_id": "4.gate", "kind": "note", "failures": [f.line() for f in result.failures]})
@@ -415,28 +439,29 @@ def uninstalled(run: Run) -> list[str]:
     return [prefix for prefix in run.removed if run.fresh_instance(prefix) is None]
 
 
-def newer(run: Run) -> tuple[int, str] | None:
-    """Return how many packages of the target still have a newer version, and the command that upgrades them
+def newer(run: Run) -> tuple[list[str], str, bool] | None:
+    """Return the packages of the target that still have a newer version, and the command that upgrades them
 
-    A pinned formula does not count: the command leaves it as it is.
+    A pinned package does not count: the command leaves it as it is. MacPorts builds in trace mode while a
+    Homebrew is installed, as the run's own builds do.
 
     @param run  the run, after its last scan
-    @returns    the count and the command as the user types it; None when the plan upgraded them itself, when
-                none has a newer version, or when phase 8 took no inventory to count them in
+    @returns    their names, the command as the user types it, and whether the target has a pinned package,
+                whose dependencies the command upgrades too; None when none has a newer version, or when
+                phase 8 took no inventory to count them in
     """
     target = run.target
-    if (target is None or run.bundle is None or 8 not in phase_numbers(run.plan)
-            or run.plan.options.get("upgrade_all") == "true"):
+    if target is None or run.bundle is None or 8 not in phase_numbers(run.plan):
         return None
-    count = sum(1 for pkg in run.bundle.result.packages
-                if pkg.instance_prefix == target.prefix and pkg.outdated and not pkg.pinned
-                and (pkg.kind != "port" or pkg.active))
-    if not count:
+    mine = [pkg for pkg in run.bundle.result.packages if pkg.instance_prefix == target.prefix]
+    names = [pkg.name for pkg in mine if pkg.outdated and not pkg.pinned and (pkg.kind != "port" or pkg.active)]
+    if not names:
         return None
+    pins = any(pkg.pinned for pkg in mine)
     if target.manager is Manager.BREW:
-        argv = brew_actions.manual(target, "8.upgrade.manual", ["upgrade"], "", run.runner.host_arch).argv
-        return count, typed(argv, intel=True)
-    return count, typed([target.binary or os.path.join(target.prefix, "bin", "port"), "upgrade", "outdated"], True)
+        return names, brew_actions.typed_line(target, ["upgrade"], run.runner.host_arch), pins
+    port = target.binary or os.path.join(target.prefix, "bin", "port")
+    return names, typed([port, *(["-t"] if run.homebrew_present else []), "upgrade", "outdated"], True), pins
 
 
 def verify_phase(run: Run) -> None:
@@ -453,6 +478,7 @@ def verify_phase(run: Run) -> None:
     bundle = run.fresh_scan()
     scan.write(bundle, run.run_dir)
     result = module("verify").check(bundle, run.plan, run.runner, run_dir=run.run_dir)
+    keep_tasks(run, result.tasks)
     if result.ok:
         run.say("  Passed: the replacements are in place, and what the plan uninstalls is gone.")
     for failure in result.failures:

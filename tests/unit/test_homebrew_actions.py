@@ -128,6 +128,30 @@ class MutationBuilderTest(unittest.TestCase):
         self.assertEqual(act.argv, HEAD + ["upgrade", "--formula", "wget"])
         self.assertIs(act.on_failure, model.OnFailure.SPLIT)
 
+    def test_upgrade_casks_is_a_split_batch(self):
+        act = a.upgrade_casks(ARM, "arm64", "3.upgrade.casks", ["firefox", "vlc"])
+        self.assertEqual(act.argv, HEAD + ["upgrade", "--cask", "firefox", "vlc"])
+        self.assertIs(act.on_failure, model.OnFailure.SPLIT)
+        self.assertEqual(r.split_argv(act, "vlc"), HEAD + ["upgrade", "--cask", "vlc"])
+        self.assertFalse(act.sudo)
+
+    def test_unpin_names_casks_and_leaves_formulae_bare(self):
+        formulae = a.unpin(ARM, "arm64", "3.unpin.formulae", ["node", "wget"])
+        # No --formula: a Homebrew that pins formulae alone does not know the option.
+        self.assertEqual(formulae.argv, HEAD + ["unpin", "node", "wget"])
+        casks = a.unpin(ARM, "arm64", "3.unpin.casks", ["firefox"], casks=True)
+        self.assertEqual(casks.argv, HEAD + ["unpin", "--cask", "firefox"])
+        for act in (formulae, casks):
+            self.assertIs(act.on_failure, model.OnFailure.PROBE)   # the upgrade that follows shows a pin that stayed
+            self.assertEqual(act.env_profile, "brew")
+
+    def test_a_command_for_the_user_is_typed_as_they_would_type_it(self):
+        self.assertEqual(a.typed_line(ARM, ["upgrade", "--formula", "wget"], "arm64"),
+                         "/opt/homebrew/bin/brew upgrade --formula wget")
+        # Started without `arch`, an Intel Homebrew on Apple Silicon refuses to install into /usr/local.
+        self.assertEqual(a.typed_line(INTEL, ["unpin", "node"], "arm64"), "arch -x86_64 /usr/local/bin/brew unpin node")
+        self.assertEqual(a.typed_line(INTEL, ["unpin", "node"], "x86_64"), "/usr/local/bin/brew unpin node")
+
     def test_uninstall_splits_in_the_given_order(self):
         act = a.uninstall_formulae(ARM, "arm64", "5.uninstall.formulae", ["oniguruma", "jq"],
                                    split_order=["jq", "oniguruma"])
@@ -175,8 +199,8 @@ class NameRuleTest(unittest.TestCase):
     """The refusal of empty name lists and of names that `brew` would read as options"""
 
     def test_empty_name_lists_are_refused(self):
-        for build in (a.install_formulae, a.install_casks, a.upgrade_formulae, a.uninstall_formulae,
-                      a.uninstall_casks, a.tab_installed_on_request, a.reinstall):
+        for build in (a.install_formulae, a.install_casks, a.upgrade_formulae, a.upgrade_casks, a.unpin,
+                      a.uninstall_formulae, a.uninstall_casks, a.tab_installed_on_request, a.reinstall):
             with self.subTest(build=build.__name__):
                 with self.assertRaises(ValueError):
                     build(ARM, "arm64", "3.x", [])

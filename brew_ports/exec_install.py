@@ -5,6 +5,7 @@ Homebrew counts a keg that a killed pour left as installed, so an unfinished ins
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from collections.abc import Sequence
 from typing import Any
@@ -14,10 +15,13 @@ from .env import linkage as env_linkage
 from .homebrew import actions as brew_actions, inventory as brew_inventory
 from .macports import actions as mp_actions, registry
 from .model import Action, Instance, Issue, Manager, OnFailure, Severity
+from .plan_phases import OPEN_APPS
 from .report import counted, some
 from .runner import ActionFailed
 
-BREW_BATCHES = ("3.upgrade.formulae", "3.install.bottled", "3.install.built", "3.install.casks")
+OTHERS = "3.upgrade.others"             # the formulae that `--upgrade-all` upgrades by name
+CASK_UPGRADES = "3.upgrade.casks"
+BREW_BATCHES = ("3.upgrade.formulae", OTHERS, "3.install.bottled", "3.install.built", "3.install.casks")
 REGISTRY_ERRORS = (registry.RegistryMissing, registry.RegistryBusy, sqlite3.DatabaseError, OSError)
 
 
@@ -168,12 +172,12 @@ def reinstall_split(run, target: Instance, action: Action, before: dict[str, Any
                     ) -> tuple[list[str], list[str], list[str]]:
     """Return the formulae and casks the action may have poured, to reinstall, and the names left to install
 
-    What it poured shows against the listing journaled before its first attempt; an adopted token never counts.
+    What it poured shows against the listing journaled before the attempt; an adopted token never counts.
 
     @param run     the run
     @param target  the Homebrew target
     @param action  the unfinished batch install
-    @param before  the listing journaled before its first attempt
+    @param before  the listing journaled before the attempt that was cut short
     @returns       the formulae and the cask tokens to reinstall, then the names to install
     """
     catalogue = run.bundle.catalogue(target.prefix) if run.bundle is not None else None
@@ -219,11 +223,21 @@ def _rest_action(target: Instance, host_arch: str, action: Action, names: Sequen
     @returns          a command of the batch's own kind: an upgrade, a cask install or a formula install
     """
     aid = action.action_id
-    if aid == "3.upgrade.formulae":
+    if aid in ("3.upgrade.formulae", OTHERS):
         return brew_actions.upgrade_formulae(target, host_arch, aid + ".upgrade", names)
     if aid == "3.install.casks":
         return brew_actions.install_casks(target, host_arch, aid + ".install", names)
     return brew_actions.install_formulae(target, host_arch, aid + ".install", names)
+
+
+def _as_planned(action: Action, sub: Action) -> Action:
+    """Return a command that stands in for a part of a batch, run in the batch's own environment
+
+    @param action  the batch
+    @param sub     the command that installs a part of it again, or the rest of it
+    @returns       the command, under the batch's environment profile
+    """
+    return dataclasses.replace(sub, env_profile=action.env_profile)
 
 
 def resume_batch(run, target: Instance, action: Action, before: dict[str, Any]) -> None:
@@ -234,7 +248,7 @@ def resume_batch(run, target: Instance, action: Action, before: dict[str, Any]) 
     @param run     the run
     @param target  the Homebrew target
     @param action  the unfinished batch install
-    @param before  the listing journaled before its first attempt
+    @param before  the listing journaled before the attempt that was cut short
     """
     formulae, tokens, rest = reinstall_split(run, target, action, before)
     host = run.runner.host_arch
@@ -247,6 +261,7 @@ def resume_batch(run, target: Instance, action: Action, before: dict[str, Any]) 
                                            on_failure=_policy(tokens)))
     if rest:
         subs.append(_rest_action(target, host, action, rest))
+    subs = [_as_planned(action, sub) for sub in subs]
     run.say(f"  An earlier attempt of `{run.command(action)}` did not finish: what it may have left half installed "
             "is installed again.")
     results = [run.runner.run(sub, defer_result=True) for sub in subs]
@@ -413,14 +428,17 @@ def rescan(run, target: Instance, confirmed: bool) -> None:
 def run_install(run, target: Instance, action: Action) -> None:
     """Run one phase 3 action: a resumed batch as its reinstall, a rebuild with its post-check, else as planned
 
-    A Homebrew batch journals the Cellar listing before its first attempt.
+    A Homebrew batch journals the Cellar listing before each attempt. An attempt that ran to its end with a
+    failure runs again as planned: Homebrew leaves nothing of an install that failed, so only an attempt that
+    was cut short can have left a package half installed, and a name that keeps failing must not make every
+    resume install the others again.
 
     @param run     the run
     @param target  the target instance
     @param action  the action
     """
     if target.manager is Manager.BREW and action.action_id in BREW_BATCHES:
-        if action.action_id in run.listings:
+        if action.action_id in run.unfinished:
             resume_batch(run, target, action, run.listings[action.action_id])
             return
         journal_listing(run, target, action)
@@ -443,8 +461,10 @@ def install(run) -> None:
         for action in actions:
             run.show(action, skipped=action not in pending)
         if run.plan.target_upgrades and (run.dry_run or not run.ctx.yes):
-            run.say(f"  Then every package that uses the upgraded {some(run.plan.target_upgrades)} is checked; one "
-                    "that lost a library is installed again.")
+            run.say("  Then every package that uses an upgraded one is checked; one that lost a library is installed "
+                    "again.")
+        if any(action.action_id == CASK_UPGRADES for action in pending):
+            run.say("  " + OPEN_APPS)
     if run.dry_run or target is None:
         return
     if pending:

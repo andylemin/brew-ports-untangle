@@ -20,7 +20,7 @@ from .homebrew import locate as brew_locate
 from .macports import locate as mp_locate
 from .model import Confidence, Instance, Issue, Manager, Mapping, Plan
 from .plan_sets import DROPPED, KEPT, MIGRATED, UNMIGRATABLE, WITHDRAWN, Key, Root, SourceGraph, Unit
-from .report import COMMAND_OF, at, manager_name, place, possessive, some, typed
+from .report import COMMAND_OF, at, manager_name, place, possessive, some
 from .runner import ActionFailed, BaseRunner, EscalationFailed, PreflightError, start_run
 
 EXIT_OK = 0
@@ -88,7 +88,7 @@ class PlanOptions:
     casks: str | None = None                            # keep, drop or map; None: the default keep, not given
     lang_packages: str = "report"                          # pipx with --pipx
     start_services: bool = False
-    upgrade_all: bool = False                              # upgrade every outdated package of the target
+    upgrade_all: bool = False                              # --upgrade-all
     keep_managers: bool = False                            # uninstall no old installation
     delete: list[str] = field(default_factory=list)        # the old installations to delete whatever their state
     repology: bool = False
@@ -1023,35 +1023,88 @@ class _Composer:
                 return dict(inv.outdated_casks if casks else inv.outdated_formulae)
         return {}
 
+    def unpin(self, name: str, change: str, app: bool, held: Sequence[str] = (), needed: str = "") -> bool:
+        """Ask whether the move removes the pin of a package of the target and brings it up to the newest version
+
+        @param name    the pinned formula, or the pinned cask's token
+        @param change  its installed version, and the one it upgrades to when it has a newer one
+        @param app     whether the package is a cask
+        @param held    the formulae that the pin alone keeps from an upgrade, for a formula at its newest version
+        @param needed  why the replacements need the pin gone; empty for a package only `--upgrade-all` touches
+        @returns       True for a yes; False for a no, under `--yes` and without a terminal
+        """
+        question = plan_report.pin_question(name, change, self.target, needed=needed, app=app, held=held)
+        return self.choose(question, ("yes", "no"), "no") == "yes"
+
+    def pins_in_the_way(self, view: plan_phases.TargetView, ups: plan_phases.Upgrades, refused: bool) -> list[str]:
+        """Put each pinned package that the replacements' upgrades touch to the user
+
+        The questions end with the first no, and none is put for a plan that is refused already: no plan is
+        made then, whatever the other answers are.
+
+        @param view     the target's installed packages
+        @param ups      the upgrades the replacements cause; a pin the user answers to remove is no blocker in it
+        @param refused  whether the plan is refused before any pin is looked at
+        @returns        why the plan is refused: a line for each such pin that stays
+        """
+        ups.asked = bool(getattr(self.ask, "tty", False)) and not getattr(self.ask, "yes", False)
+        ups.asking = ups.asked and not refused
+        refusals = []
+        for name, roots in list(ups.pinned.items()):            # what is upgraded, then what uses it
+            needed = (f"the replacement{'' if len(roots) == 1 else 's'} of {some(roots)}" if roots
+                      else "the replacements")
+            reason = ups.reasons.get(name, "")
+            used = reason.removeprefix("depends on ")
+            if used != reason:
+                why = f"installing {needed} upgrades {used}, so {name}, which uses it, may have to be installed again"
+                it = ", and it"
+            else:
+                why, it = f"installing {needed} would upgrade {name} ({reason})", ", which"
+            change = ups.versions.get(name, "")
+            if ups.asking and self.unpin(name, change, False, needed=why):
+                plan_phases.unpinned(view, ups, name)
+                continue
+            answered, ups.asking = ups.asking, False
+            how = plan_phases.unpin_commands(view, self.host_arch, name, upgrade=name not in ups.checked)
+            ups.kept_pins[name] = (change, how, answered)
+            leave = f", or plan with `--leave {','.join(roots)}`" if roots else ""
+            if answered:
+                refusals.append(f"{why}{it} stays pinned, as you answered. Plan again and answer yes for it{leave}")
+            elif ups.asked:
+                refusals.append(f"{why}{it} is pinned. `brew-ports plan` asks about this pin once the other points "
+                                f"are settled{leave}")
+            else:
+                run = plan_phases.command(view, self.host_arch, "unpin", name)
+                refusals.append(f"{why}{it} is pinned. Plan on a terminal without --yes to be asked about the pin, "
+                                f"or run `{run}` and plan again with --rescan{leave}")
+        return refusals
+
     def finish(self) -> None:
         """Fix the plan's repairs, rebuilds, upgrades and phases, and the refusals they add"""
         view = plan_phases.TargetView(self.target, self.ctx.installed, self.ctx.catalogue, self.ctx.portindex)
         mappings = self.accepted()
         targets = self.target_roots(mappings)
-        repairs = plan_phases.phase2_issues(self.issues, view, set(view.closure(targets)))
+        used = set(view.closure(targets))                  # the replacements and everything they use
+        repairs = plan_phases.phase2_issues(self.issues, view, used)
         repaired = [i.subject for i in repairs if i.code in plan_phases.REINSTALL_CODES and i.subject]
         rebuild = [n for n in self.rebuilds() if view.key(n) not in {view.key(r) for r in repaired}]
         ups = plan_phases.upgrades(view, targets, repaired + rebuild, self.outdated())
-        if self.options.upgrade_all:
-            plan_phases.every_upgrade(view, self.host_arch, ups, self.outdated(), self.outdated(casks=True))
-        self.draft.upgrades = ups
         refusals = list(self.sets.refusals) + self.refusals
-        for name, roots in sorted(ups.pinned.items()):
-            needed = (f"the replacement{'' if len(roots) == 1 else 's'} of {some(roots)}" if roots
-                      else "the replacements")
-            leave = f", or plan with `--leave {','.join(roots)}`" if roots else ""
-            unpin = typed([self.target.binary or "brew", "unpin", name])
-            refusals.append(f"installing {needed} would upgrade {name} ({ups.reasons.get(name)}), which you pinned. "
-                            f"Run `{unpin}`{leave}")
+        refusals += self.pins_in_the_way(view, ups, bool(refusals))
+        survivors = [i for i in self.result.instances if i not in self.removed]
+        if self.options.upgrade_all:
+            plan_phases.every_upgrade(view, self.host_arch, ups, (self.outdated(), self.outdated(casks=True)),
+                                      self.unpin, trace=any(i.manager is Manager.BREW for i in survivors))
+            ups.optional = [name for name in ups.others if name not in used]
+        self.draft.upgrades = ups
         items, projects = plan_phases.installs(mappings)
         if self.manager is Manager.BREW:
-            phase3 = plan_phases.phase3_brew(view, self.host_arch, items, projects=projects, explicit=ups.explicit,
-                                             rebuilds=rebuild, casks=list(ups.casks))
+            phase3 = plan_phases.phase3_brew(view, self.host_arch, items, projects=projects, ups=ups,
+                                             rebuilds=rebuild, named_only=self.options.upgrade_all)
         else:
             homebrew = any(i.manager is Manager.BREW for i in self.result.instances)
             phase3 = plan_phases.phase3_ports(view, self.host_arch, items, projects=projects, homebrew_present=homebrew,
-                                              rebuilds=rebuild, others=ups.others)
-        survivors = [i for i in self.result.instances if i not in self.removed]
+                                              rebuilds=rebuild, others=ups.also)
         phase6 = plan_phases.phase6(self.removed, self.target, self.result.services, self.environ, survivors)
         phases = plan_phases.assemble(plan_phases.phase2(repairs), phase3, phase6, bool(self.removed))
         self.draft.stops = self.stops()
@@ -1112,7 +1165,8 @@ class _Composer:
         """
         roots = self.draft.roots
         sets = self.sets
-        upgrades = list(self.draft.upgrades.names) if self.draft.upgrades else []
+        ups = self.draft.upgrades or plan_phases.Upgrades()
+        upgrades = list(ups.names)
         return Plan(
             created=state.now_iso(), run_id=self.run_dir.run_id if self.run_dir is not None else "",
             target=self.manager, instances=list(self.result.instances),
@@ -1123,7 +1177,8 @@ class _Composer:
                           if r.mapping is not None and r.status in (UNMIGRATABLE, DROPPED, WITHDRAWN)],
             removal_set=dict(sets.removal), path_removed=dict(sets.path_removed),
             manual_casks=[u.name for u in sets.manual_casks], target_upgrades=upgrades, phases=phases,
-            options=self.options.as_strings(self.target.prefix, [i.prefix for i in self.removed]))
+            options=self.options.as_strings(self.target.prefix, [i.prefix for i in self.removed]),
+            optional_upgrades=list(ups.optional), optional_casks=list(ups.casks))
 
     @staticmethod
     def order(key: Key) -> tuple[str, int, str]:

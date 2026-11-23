@@ -61,6 +61,18 @@ class WordsTest(unittest.TestCase):
             "Phase 6  Uninstall MacPorts at /opt/local", "Phase 7  Clean up the shell files",
             "Phase 8  Final check"])
 
+    def test_phase_3_says_when_it_upgrades_the_other_packages_too(self):
+        self.assertEqual(apply_report.question(3, self.plan), "Install the replacements?")
+        self.assertEqual(apply_report.question(5, self.plan), "Uninstall the old packages?")
+        for more in ({"optional": ["pkgconf"]}, {"optional_casks": ["firefox"]}):
+            plan = b.plan(self.target, self.sources, mappings=[self.jq], upgrade_all=True, **more)
+            self.assertEqual(apply_report.heading(3, plan, []),
+                             "Phase 3  Install the replacements and upgrade the other packages")
+            self.assertEqual(apply_report.question(3, plan), "Install the replacements and upgrade the other packages?")
+        # The option alone changes nothing: a plan that found no other package to upgrade installs only.
+        plain = b.plan(self.target, self.sources, mappings=[self.jq], upgrade_all=True)
+        self.assertEqual(apply_report.heading(3, plain, []), "Phase 3  Install the replacements")
+
     def test_the_closing_lines_of_a_run(self):
         self.assertEqual(apply_report.finished(self.plan, ["/opt/local"], "r1", ["edit ~/.bash_profile yourself"]), [
             "", "Finished: 1 package moved into Homebrew at /opt/homebrew; MacPorts at /opt/local uninstalled; "
@@ -78,14 +90,36 @@ class WordsTest(unittest.TestCase):
         self.assertNotIn("For you to do:", kept)
 
     def test_the_closing_lines_name_what_still_has_a_newer_version(self):
-        lines = apply_report.finished(self.plan, [], "r1", [], (12, "brew upgrade"))
-        self.assertEqual(lines[-2:], [
-            "12 packages of Homebrew at /opt/homebrew have a newer version, which this move did not install. To "
-            "upgrade them: brew upgrade",
+        many = [f"pkg{n}" for n in range(12)]
+        lines = apply_report.finished(self.plan, [], "r1", [], (many, "brew upgrade", False))
+        self.assertEqual(lines[-3:], [
+            "12 packages of Homebrew at /opt/homebrew have a newer version, which this move did not install: "
+            f"{report.some(many)}.",
+            "To upgrade them: brew upgrade",
             "Next: open a new Terminal window, which finds the moved commands and reads any edited shell file."])
-        one = apply_report.finished(self.plan, [], "r1", [], (1, "brew upgrade"))
-        self.assertEqual(one[-2], "1 package of Homebrew at /opt/homebrew has a newer version, which this move did "
-                                  "not install. To upgrade it: brew upgrade")
+        self.assertIn(" and 4 more.", lines[-3])
+        one = apply_report.finished(self.plan, [], "r1", [], (["jq"], "brew upgrade", False))
+        self.assertEqual(one[-3:-1], ["1 package of Homebrew at /opt/homebrew has a newer version, which this move "
+                                      "did not install: jq.", "To upgrade it: brew upgrade"])
+
+    def test_the_upgrade_command_says_what_it_does_beside_a_pin(self):
+        lines = apply_report.finished(self.plan, [], "r1", [], (["jq"], "brew upgrade", True))
+        self.assertEqual(lines[-3:-1], ["To upgrade it: brew upgrade", "  That command upgrades every package without "
+                                        "a pin, also one that a pinned package uses."])
+
+    def test_after_upgrade_all_the_closing_lines_say_why_some_stay(self):
+        plan = b.plan(self.target, self.sources, mappings=[self.jq], upgrade_all=True)
+        left = (["ddrescue", "bat", "docker-desktop"], "brew upgrade", False)
+        self.assertEqual(apply_report.finished(plan, [], "r1", [], left)[-3:-1], [
+            "3 packages of Homebrew at /opt/homebrew still have a newer version, because the plan left them as they "
+            "are or their upgrade failed: ddrescue, bat, docker-desktop.", "To upgrade them: brew upgrade"])
+        self.assertEqual(apply_report.finished(plan, [], "r1", [], (["bat"], "brew upgrade", False))[-3],
+                         "1 package of Homebrew at /opt/homebrew still has a newer version, because the plan left it "
+                         "as it is or its upgrade failed: bat.")
+        # A plan file without the option's record, as an older brew-ports wrote it, is read as a plan without it.
+        plan.options = {}
+        older = apply_report.finished(plan, [], "r1", [], (["bat"], "brew upgrade", False))
+        self.assertIn("which this move did not install", older[-3])
 
     def test_a_run_that_ends_early_keeps_the_tasks_and_the_undo(self):
         self.assertEqual(apply_report.leftovers(self.plan, [], "r1", ["Start dbus yourself."]), [

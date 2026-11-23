@@ -196,8 +196,8 @@ def install(instance: Instance, host_arch: str, action_id: str, name: str, varia
 
 
 def upgrade(instance: Instance, host_arch: str, action_id: str, name: str, *, homebrew_present: bool,
-            no_deps: bool = False) -> Action:
-    """Build `sudo port -N [-n] [-t] upgrade --no-rev-upgrade <name>`, which keeps `requested_variants`
+            no_deps: bool = False, no_replace: bool = False) -> Action:
+    """Build `sudo port -N [-n] [-t] upgrade [--no-replace] --no-rev-upgrade <name>`, which keeps `requested_variants`
 
     For an outdated mapped target (phase 3), an outdated active row without an image (with `-n`) or
     a replaced port.
@@ -208,11 +208,14 @@ def upgrade(instance: Instance, host_arch: str, action_id: str, name: str, *, ho
     @param name              the port to upgrade
     @param homebrew_present  whether a Homebrew prefix exists, which adds `-t`
     @param no_deps           pass `-n`, which leaves the port's dependencies as they are
+    @param no_replace        pass `--no-replace`, so that no successor takes the place of a replaced port that
+                             the upgrade reaches
     @returns                 the action
     @throws ValueError       a name `port` would misread, or the instance has no `port` binary
     """
     name = _names([name])[0]
-    args = (["-n"] if no_deps else []) + _trace(homebrew_present) + ["upgrade", "--no-rev-upgrade", name]
+    verb = ["upgrade", "--no-replace"] if no_replace else ["upgrade"]
+    args = (["-n"] if no_deps else []) + _trace(homebrew_present) + verb + ["--no-rev-upgrade", name]
     return _command(instance, host_arch, action_id, args, f"upgrade {name} in {instance.prefix}")
 
 

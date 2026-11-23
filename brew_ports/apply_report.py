@@ -8,11 +8,10 @@ from typing import Any
 
 from . import plan_report, report
 from .model import Instance, Plan
-from .plan_phases import PHASE_NAMES
+from .plan_phases import phase_name
 from .report import at, counted, manager_name, place, series, some, tilde
 
-QUESTIONS = {2: "Run these repairs?", 3: "Install the replacements?", 5: "Uninstall the old packages?",
-             7: "Make these changes?"}
+QUESTIONS = {2: "Run these repairs?", 5: "Uninstall the old packages?", 7: "Make these changes?"}
 NEW_PLAN = "make a new plan with `brew-ports plan`"
 MAKE_NEW_PLAN = "  Make a new plan with `brew-ports plan`, then apply that."
 RESUME = "brew-ports apply --resume %s"
@@ -140,8 +139,18 @@ def heading(number: int, plan: Plan, removed: Sequence[str]) -> str:
     elif number == 6 and removed:
         name = f"Uninstall {named(plan, removed)}"
     else:
-        name = PHASE_NAMES.get(number, "").capitalize()
+        name = phase_name(plan, number).capitalize()
     return f"Phase {number}  {name}"
+
+
+def question(number: int, plan: Plan) -> str:
+    """Return the question `apply` asks before a phase
+
+    @param number  the phase number
+    @param plan    the plan
+    @returns       the question; phase 3 asks under the name of its heading
+    """
+    return f"{phase_name(plan, 3).capitalize()}?" if number == 3 else QUESTIONS[number]
 
 
 def tasks(todo: Sequence[str], dry_run: bool = False) -> list[str]:
@@ -176,16 +185,18 @@ def leftovers(plan: Plan, removed: Sequence[str], run_id: str, todo: Sequence[st
 
 
 def finished(plan: Plan, removed: Sequence[str], run_id: str, todo: Sequence[str],
-             newer: tuple[int, str] | None = None) -> list[str]:
+             newer: tuple[Sequence[str], str, bool] | None = None) -> list[str]:
     """Return the closing lines of a run that finished: what was done, what is left to the user, undo, next
 
     @param plan     the plan
     @param removed  the prefixes of the old installations phase 6 uninstalled
     @param run_id   the run's id
     @param todo     what is left for the user to do, each task once
-    @param newer    how many packages of the target have a newer version that the move did not install, with the
-                    command that upgrades them; None when there is nothing to say of that
-    @returns        the lines
+    @param newer    the packages of the target that have a newer version that the move did not install, the
+                    command that upgrades them, and whether the target has a pinned package; None when there
+                    is nothing to say of that
+    @returns        the lines; after a plan made with `--upgrade-all`, those packages are what that plan left
+                    as it is and what failed to upgrade
     """
     moved = len(plan.mappings)
     done = [f"{counted(moved, 'package')} moved into {named(plan, [plan.target_prefix])}"] if moved else []
@@ -197,10 +208,17 @@ def finished(plan: Plan, removed: Sequence[str], run_id: str, todo: Sequence[str
             done.append(f"{report.by_kind(kinds)} uninstalled from {named(plan, [prefix])}")
     upgrade = []
     if newer is not None:
-        count, command = newer
-        upgrade = [f"{counted(count, 'package')} of {named(plan, [plan.target_prefix])} "
-                   f"{'has' if count == 1 else 'have'} a newer version, which this move did not install. To upgrade "
-                   f"{'it' if count == 1 else 'them'}: {command}"]
+        names, command, pins = newer
+        one = len(names) == 1
+        if plan.options.get("upgrade_all") == "true":
+            why = (f"still {'has' if one else 'have'} a newer version, because the plan left "
+                   f"{'it as it is' if one else 'them as they are'} or {'its' if one else 'their'} upgrade failed")
+        else:
+            why = f"{'has' if one else 'have'} a newer version, which this move did not install"
+        upgrade = [f"{counted(len(names), 'package')} of {named(plan, [plan.target_prefix])} {why}: {some(names)}.",
+                   f"To upgrade {'it' if one else 'them'}: {command}"]
+        if pins:
+            upgrade.append("  That command upgrades every package without a pin, also one that a pinned package uses.")
     return (["", f"Finished: {'; '.join(done)}." if done else "Finished."] + leftovers(plan, removed, run_id, todo)
             + upgrade
             + ["Next: open a new Terminal window, which finds the moved commands and reads any edited shell file."])

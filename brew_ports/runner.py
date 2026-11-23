@@ -68,6 +68,9 @@ BREW_DENY = frozenset((
     "HOMEBREW_PATH", "HOMEBREW_SUDO_CHECKED", "HOMEBREW_SUDO_THROUGH_SUDO_USER",
 ))
 BREW_DENY_PREFIXES = ("HOMEBREW_BUNDLE_", "HOMEBREW_UPGRADE_GREEDY", "HOMEBREW_FORCE_BREW_WRAPPER")
+# The `brew` profile of a command that names every formula it is to change: Homebrew then neither upgrades nor
+# reinstalls the formulae that use one of them. The caller checks those itself.
+BREW_NAMED_ONLY = "brew-named-only"
 PRESERVE_ENV_REFUSAL = "sudo: sorry, you are not allowed to"
 
 
@@ -176,13 +179,13 @@ def profile_env(profile: str, inherited: Mapping[str, str], prefix: str | None =
     It is built from the pass-through names, plus for `brew` the user's `HOMEBREW_*` settings outside
     the deny-list, so `DYLD_*`, build variables, `PYTHONPATH` and the like never reach a child.
 
-    @param profile    `brew`, `ports` or `neutral`
+    @param profile    `brew`, `BREW_NAMED_ONLY`, `ports` or `neutral`
     @param inherited  the environment the profile filters
     @param prefix     the instance prefix, whose `bin` and `sbin` lead `PATH`; `brew` and `ports` need it
     @returns          the child's environment
     """
     env = {k: v for k, v in inherited.items() if k in PASS_THROUGH or k.startswith("LC_")}
-    if profile == "brew":
+    if profile in ("brew", BREW_NAMED_ONLY):
         if not prefix:
             raise ValueError("the brew profile needs the instance prefix")
         for key, value in inherited.items():
@@ -190,6 +193,8 @@ def profile_env(profile: str, inherited: Mapping[str, str], prefix: str | None =
                     and not key.startswith(BREW_DENY_PREFIXES) and key not in BREW_SET):
                 env[key] = value
         env.update(BREW_SET)
+        if profile == BREW_NAMED_ONLY:
+            env["HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK"] = "1"
         env["PATH"] = f"{prefix}/bin:{prefix}/sbin:{SYSTEM_PATH}"
     elif profile == "ports":
         if not prefix:

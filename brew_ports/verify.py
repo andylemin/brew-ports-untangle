@@ -77,6 +77,8 @@ class VerifyResult:
     gate: bool = False
     failures: list[Finding] = field(default_factory=list)
     reports: list[Finding] = field(default_factory=list)
+    # What the user has to repair after an upgrade of `--upgrade-all`: the task of each package, by its name.
+    tasks: dict[str, str] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -112,15 +114,31 @@ class VerifyResult:
         """
         self.reports.append(Finding(step, subject, text))
 
-    def lines(self) -> list[str]:
-        """Return the text output: a head line, then a line per failure and per report line
+    def task(self, step: str, subject: str, text: str, todo: str) -> None:
+        """Record a broken package that only `--upgrade-all` brought into the checks: a report line and a task
 
-        @returns  `verify: passed` or the failure count, then the `FAIL` and `note` lines
+        The move needs no such package, so it never fails the run. A package gets one task.
+
+        @param step     the check, a key of `CHECKS`
+        @param subject  the package
+        @param text     what is wrong with it, for the report
+        @param todo     the task: what the user does, why, and the command
+        """
+        self.report(step, subject, f"{text} (for you to repair; the move does not need it)")
+        self.tasks.setdefault(subject, todo)
+
+    def lines(self) -> list[str]:
+        """Return the text output: a head line, a line per failure and per report line, then the tasks
+
+        @returns  `verify: passed` or the failure count, the `FAIL` and `note` lines, and `For you to do:` with
+                  the tasks when there are any
         """
         what = "gate" if self.gate else "verify"
         count = len(self.failures)
         head = f"{what}: passed" if self.ok else f"{what}: {count} failure{'' if count == 1 else 's'}"
-        return [head] + ["FAIL " + f.line() for f in self.failures] + ["note " + f.line() for f in self.reports]
+        todo = ["For you to do:"] + [f"  {task}" for task in self.tasks.values()] if self.tasks else []
+        return ([head] + ["FAIL " + f.line() for f in self.failures] + ["note " + f.line() for f in self.reports]
+                + todo)
 
 
 def _files_in(directory: str) -> list[str]:
@@ -187,7 +205,7 @@ def rebuilt_names(plan: Plan, prefix: str) -> list[str]:
             if action.kind != "command" or action.manual or action.instance_prefix != prefix:
                 continue
             words = [a for a in action.argv if a in REBUILDS]
-            if not words:
+            if not words or "--cask" in action.argv:
                 continue
             tail = action.argv[action.argv.index(words[0]) + 1:]
             names = list(action.split_order) or [a for a in tail if not a.startswith(("-", "+", "@"))]
@@ -409,6 +427,14 @@ class _PortsTarget:
 
     active = installed
 
+    def stored(self, name: str) -> bool:
+        """Return whether the registry holds a version of a port, active or not
+
+        @param name  the port's name, in any case
+        @returns     True when the port has a row
+        """
+        return any(r.name.lower() == name.lower() for r in self.rows)
+
     def files(self, row: registry.PortRow) -> list[registry.FileRow]:
         """Return the registry's file rows of a port
 
@@ -603,6 +629,11 @@ class _Verifier:
         self.target = next((i for i in self.instances if envclean.spells(i, plan.target_prefix)), None)
         self.catalogue = bundle.catalogue(self.target.prefix) if self.target is not None else None
         self.mappings = [m for m in plan.mappings if m.target_name]
+        # What only `--upgrade-all` upgrades, and the packages whose libraries are judged only because of it: a
+        # break there is a task for the user, never a failure of the move.
+        self.optional = {name.lower() for name in plan.optional_upgrades}
+        self.optional_casks = set(plan.optional_casks)
+        self.only_optional: set[str] = set()
         self.state: Any = None
         self._venvs: dict[str, Any] | None = None
         self._venv_error: str | None = None
@@ -987,12 +1018,13 @@ class _Verifier:
 
     # Clean linkage ---------------------------------------------------------------------
 
-    def upgrade_dependents(self) -> list[str]:
+    def upgrade_dependents(self, needed: bool = False) -> list[str]:
         """Return the target packages that depend on a `target_upgrades` package
 
-        @returns  the names; empty without `target_upgrades`
+        @param needed  count only the upgrades the replacements need, not those `--upgrade-all` adds
+        @returns       the names; empty without such an upgrade
         """
-        upgraded = {n.lower() for n in self.plan.target_upgrades}
+        upgraded = {n.lower() for n in self.plan.target_upgrades} - (self.optional if needed else set())
         if not upgraded:
             return []
         return [n for n in self.state.names() if upgraded & {d.lower() for d in self.state.deps(n)}]
@@ -1000,11 +1032,16 @@ class _Verifier:
     def scan_set(self) -> dict[str, list[str]]:
         """Return the binaries of the mapped targets, companions, rebuilt packages and `target_upgrades` dependents
 
+        The names among them that the move itself does not touch are kept in `only_optional`.
+
         @returns  the binaries by linkage key `<prefix>|<kind>|<name>`
         """
         prefix = self._found_target().prefix
-        names = [m.target_name for m in self.mappings if m.target_kind in INSTALLED_KINDS]
-        names += self.companions() + rebuilt_names(self.plan, prefix) + self.upgrade_dependents()
+        names = [_target_name(m) for m in self.mappings if m.target_kind in INSTALLED_KINDS] + self.companions()
+        rebuilt = rebuilt_names(self.plan, prefix)
+        moved = names + [n for n in rebuilt if n.lower() not in self.optional] + self.upgrade_dependents(needed=True)
+        names += rebuilt + self.upgrade_dependents()
+        self.only_optional = {n.lower() for n in names} - {n.lower() for n in moved}
         out: dict[str, list[str]] = {}
         for name in dict.fromkeys(names):
             if self.state.manager is Manager.BREW:
@@ -1030,12 +1067,21 @@ class _Verifier:
         name = key.rsplit("|", 1)[-1]
         cls = ref.get("class")
         shown = ref.get("resolved") or ref.get("name") or ""
-        if cls == "missing":
+        aside = name.lower() in self.only_optional
+        if cls == "missing" and aside:
+            cause = ("its upgrade, which --upgrade-all asked for," if name.lower() in self.optional
+                     else "--upgrade-all upgraded a package it uses, which")
+            self.result.task("linkage", name, f"{path} references {ref.get('name')}, which does not exist",
+                             f"Install {name} again, because {cause} left it without a library it needs: "
+                             f"{self.again(name, 'reinstall')}")
+        elif cls == "missing":
             self.result.fail("linkage", name, f"{path} references {ref.get('name')}, which does not exist")
         elif cls in ("other", "usrlocal"):
             why = removal.reason(shown)
-            if why:
+            if why and not aside:
                 self.result.fail("linkage", name, f"{path} references {shown}, {why}")
+            elif why:
+                self.result.report("linkage", name, f"{path} references {shown}, {why}")
             else:
                 self.result.report("linkage", name, f"{path} keeps a cross-prefix reference to {shown}")
         else:
@@ -1061,8 +1107,10 @@ class _Verifier:
                 items = [found["binaries"][p] for p in paths if found["binaries"].get(p, {}).get("package") == key]
                 if items and all(item.get("error") for item in items):
                     what = "its binary" if len(items) == 1 else f"any of its {len(items)} binaries"
-                    self.result.fail("linkage", key.rsplit("|", 1)[-1], f"otool -l could not read {what} "
-                                     f"({items[0]['error']}), so its linkage is unknown")
+                    name = key.rsplit("|", 1)[-1]
+                    note = self.result.report if name.lower() in self.only_optional else self.result.fail
+                    note("linkage", name, f"otool -l could not read {what} ({items[0]['error']}), so its linkage "
+                         "is unknown")
             for error in found.get("errors") or []:
                 self.result.report("linkage", self._found_target().prefix, error)
         self.brew_missing()
@@ -1398,16 +1446,64 @@ class _Verifier:
                 ok = self.state.has_cask(name)
             else:
                 ok = self.state.active(name) if active else self.state.installed(name)
-            if not ok:
+            if ok:
+                continue
+            optional = name in self.optional_casks if kind == "cask" else name.lower() in self.optional
+            if optional:
+                self.lost(name, cask=kind == "cask")
+            else:
                 self.result.fail("gate", name, f"was active in {target.prefix} before the run and is not now: "
                                  f"`brew-ports rollback {self.run_dir.run_id}` reinstalls it")
 
     def upgrades(self) -> None:
-        """Check every package of `target_upgrades` is installed"""
+        """Check every package of `target_upgrades` is installed; one that only `--upgrade-all` names is a task"""
         prefix = self._found_target().prefix
         for name in self.plan.target_upgrades:
-            if not self.state.installed(name):
-                self.result.fail("gate", name, f"is in target_upgrades and not installed in {prefix}")
+            if self.state.installed(name):
+                continue
+            if name.lower() in self.optional:
+                self.lost(name)
+            else:
+                self.result.fail("gate", name, f"phase 3 was to upgrade or check it, and it is not installed in "
+                                 f"{prefix}")
+
+    def again(self, name: str, verb: str, *, cask: bool = False) -> str:
+        """Return the command that puts a package of the target back in use, as the user types it
+
+        @param name  the formula, the port or the cask's token
+        @param verb  `install` for a package that is gone, `link` for a formula that is not linked, `activate`
+                     for a port that is stored but switched off, `reinstall` for a package with a broken binary,
+                     which a port mends by a forced upgrade
+        @param cask  whether the package is a cask
+        @returns     the command; MacPorts builds in trace mode while a Homebrew is installed
+        """
+        target = self._found_target()
+        if target.manager is Manager.BREW:
+            kind = [] if verb == "link" else ["--cask" if cask else "--formula"]
+            return brew_actions.typed_line(target, [verb, *kind, name], self.runner.host_arch)
+        trace = ["-t"] if any(i.manager is Manager.BREW for i in self.bundle.result.instances) else []
+        args = {"reinstall": ["-n", *trace, "upgrade", "--force", name], "activate": ["activate", name]}.get(
+            verb, [*trace, "install", name])
+        return report.typed([target.binary or os.path.join(target.prefix, "bin", "port"), *args], True)
+
+    def lost(self, name: str, *, cask: bool = False) -> None:
+        """Record a package that only `--upgrade-all` upgrades and that is not in use after its upgrade, as a task
+
+        @param name  the formula, the port or the cask's token
+        @param cask  whether the package is a cask
+        """
+        target = self._found_target()
+        where = report.at(target)
+        subject = f"the app {name}" if cask else name
+        if target.manager is Manager.PORTS and self.state.stored(name):
+            verb, do, left = "activate", "Switch", f"stored in {where}, but switched off"
+        elif cask or not self.state.installed(name):
+            verb, do, left = "install", "Install", f"uninstalled in {where}"
+        else:
+            verb, do, left = "link", "Link", f"installed, but not linked into {where}"
+        self.result.task("gate", subject, f"is {left} after its upgrade",
+                         f"{do} {subject}{' on' if verb == 'activate' else ''} again, because its upgrade, which "
+                         f"--upgrade-all asked for, left it {left}: {self.again(name, verb, cask=cask)}")
 
 
 def check(bundle, plan: Plan, runner, *, gate: bool = False, run_dir: state.RunDir | None = None) -> VerifyResult:

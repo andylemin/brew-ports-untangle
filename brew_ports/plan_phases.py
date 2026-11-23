@@ -15,9 +15,9 @@ from typing import Any
 from . import doctor, env, system
 from .homebrew import actions as brew_actions, locate as brew_locate
 from .macports import actions as mp_actions
-from .model import Action, Instance, Issue, Manager, Mapping, OnFailure, Package, Phase, Service
+from .model import Action, Instance, Issue, Manager, Mapping, OnFailure, Package, Phase, Plan, Service
 from .report import at, series, typed
-from .runner import RM, arch_argv
+from .runner import BREW_NAMED_ONLY, RM, arch_argv
 from .state import slug
 
 # the findings phase 2 repairs, in the order it repairs them
@@ -46,6 +46,10 @@ HOMEBREW_PREFIX_FILES = (
 PHASE_NAMES = {0: "checks before starting", 1: "save a record for undo", 2: "repair the installation that stays",
                3: "install the replacements", 4: "check the replacements", 5: "uninstall the old packages",
                6: "uninstall the old managers", 7: "clean up the shell files", 8: "final check"}
+PHASE_3_ALL = "install the replacements and upgrade the other packages"     # phase 3 of a plan with `--upgrade-all`
+# What `brew upgrade --cask` does with the apps that the cask tells it to quit, unless the user turned that off.
+OPEN_APPS = "Homebrew may close an app that is open for its upgrade, and then opens it again."
+NEWEST = "the newest version"       # stands for the version an upgrade installs, where `brew outdated` names none
 
 
 # The target's dependency closure ----------------------------------------------------------------
@@ -190,12 +194,13 @@ class TargetView:
         @returns                  such as `3.5.0 -> 3.6.0`; a port whose epoch changes shows both epochs
         """
         pkg = self.installed(name)
-        old = pkg.version if pkg else "?"
+        old = (pkg.version if pkg else "") or "?"
         if self.brew:
-            return f"{old} -> {outdated_versions.get(self.key(name)) or 'the newest version'}"
+            new = outdated_versions.get(self.key(name)) or (outdated_versions.get(pkg.name) if pkg else None)
+            return f"{old} -> {new or NEWEST}"
         entry = self.portindex.get(name) if self.portindex is not None else None
         if entry is None:
-            return f"{old} -> the newest version"
+            return f"{old} -> {NEWEST}"
         new = f"{entry.version}_{entry.revision}"
         if pkg is not None and entry.epoch != pkg.epoch:
             return f"{old} (epoch {pkg.epoch}) -> {new} (epoch {entry.epoch})"
@@ -211,11 +216,23 @@ class Upgrades:
     names: list[str] = field(default_factory=list)
     reasons: dict[str, str] = field(default_factory=dict)
     versions: dict[str, str] = field(default_factory=dict)
-    explicit: list[str] = field(default_factory=list)          # mapped targets and companions: phase 3 upgrades them
+    explicit: list[str] = field(default_factory=list)          # phase 3 upgrades them by name, for the replacements
     pinned: dict[str, list[str]] = field(default_factory=dict)  # pinned blocker -> the roots whose mappings need it
-    # With `--upgrade-all`: the formulae or ports that no replacement needs, the casks with their version change,
-    # and the formulae and the casks that stay as they are, each with the reason.
+    checked: list[str] = field(default_factory=list)   # in `names` for the check after the upgrades, not upgraded
+    # Pins, as the user answered: the formulae and the casks whose pin the plan removes, each with its version
+    # change, and the pinned ones that stay, each with its version change, what the user runs for it, and
+    # whether the user answered no for it.
+    unpin: dict[str, str] = field(default_factory=dict)
+    unpin_casks: dict[str, str] = field(default_factory=dict)
+    kept_pins: dict[str, tuple[str, str, bool]] = field(default_factory=dict)
+    asked: bool = False                                # a terminal and no --yes: questions about pins can be put
+    asking: bool = False                               # and the plan is not refused so far, so they are put
+    # With `--upgrade-all`: the formulae or ports it upgrades by name; those of them that no replacement's
+    # upgrades reach; those of these that no replacement uses either, so that the move does not need them; the
+    # casks with their version change; the formulae and the casks that stay as they are, with the reason.
+    also: list[str] = field(default_factory=list)
     others: list[str] = field(default_factory=list)
+    optional: list[str] = field(default_factory=list)
     casks: dict[str, str] = field(default_factory=dict)
     left: dict[str, str] = field(default_factory=dict)
     left_casks: dict[str, str] = field(default_factory=dict)
@@ -225,8 +242,9 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
              outdated_versions: dict[str, str]) -> Upgrades:
     """Return the target upgrades the plan causes, and the pinned packages among them as blockers
 
-    The outdated mapped targets, companions, reinstalled packages and dependencies of the mapped targets are
-    upgraded, with every package that depends on one.
+    The outdated mapped targets, companions and reinstalled packages are upgraded, with what a mapped target
+    needs when phase 3 installs or upgrades that target. Every package that depends on one of them is checked
+    after the upgrades: Homebrew upgrades the outdated ones among them, `port upgrade` leaves them as they are.
 
     @param view               the target's installed packages and catalogue
     @param targets            the roots that need each mapped target and companion, by target name
@@ -238,7 +256,7 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
     cause: dict[str, set[str]] = {}
     closures = {name: view.closure([name]) for name in targets}
 
-    def add(name: str, reason: str, roots: Iterable[str]) -> None:
+    def add(name: str, reason: str, roots: Iterable[str], upgraded: bool = True) -> None:
         pkg = view.installed(name)
         if pkg is None:
             return
@@ -246,7 +264,11 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
         if key not in out.names:
             out.names.append(key)
             out.reasons[key] = reason
-            out.versions[key] = view.version_change(key, outdated_versions)
+            if pkg.outdated and upgraded:
+                out.versions[key] = view.version_change(key, outdated_versions)
+            else:
+                out.versions[key] = pkg.version or "?"
+                out.checked.append(key)
         cause.setdefault(key, set()).update(roots)
 
     for name, roots in targets.items():
@@ -260,7 +282,11 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
         if pkg is not None and pkg.outdated:
             add(name, "reinstalled by the plan", [r for t, rs in targets.items() for r in rs
                                                   if view.key(name) in closures[t]])
+    again = {view.key(name) for name in reinstalled}
     for name, roots in targets.items():
+        pkg = view.installed(name)
+        if pkg is not None and not pkg.outdated and view.key(name) not in again:
+            continue                    # installed and current: phase 3 runs nothing that upgrades what it needs
         for dep in closures[name][1:]:
             pkg = view.installed(dep)
             if pkg is not None and pkg.outdated:
@@ -268,7 +294,7 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
     upgraded = list(out.names)
     for name in upgraded:
         for dependent in view.dependents_of([name]):
-            add(dependent, f"depends on {name}", cause.get(name, ()))
+            add(dependent, f"depends on {name}", cause.get(name, ()), upgraded=view.brew)
     for name in out.names:
         pkg = view.installed(name)
         if pkg is not None and pkg.pinned:
@@ -276,54 +302,210 @@ def upgrades(view: TargetView, targets: dict[str, list[str]], reinstalled: Seque
     return out
 
 
-def every_upgrade(view: TargetView, host_arch: str, ups: Upgrades, outdated_versions: dict[str, str],
-                  cask_versions: dict[str, str]) -> None:
-    """Add every other outdated package of the target to the upgrades, as `--upgrade-all` asks
+def command(view: TargetView, host_arch: str, *args: str) -> str:
+    """Return a `brew` or `port` command of the target for the user to run, as they would type it
 
-    A pinned formula, a formula that a pinned one uses and a cask that asks for the password stay as they are:
-    an upgrade under a pinned formula can break it, and `brew upgrade --cask` then stops at sudo's prompt.
+    @param view       the target's installed packages
+    @param host_arch  the host's architecture
+    @param args       the arguments after the binary
+    @returns          the command; a `port` command under sudo
+    """
+    if view.brew:
+        return brew_actions.typed_line(view.target, args, host_arch)
+    return typed([view.target.binary or os.path.join(view.target.prefix, "bin", "port"), *args], True)
+
+
+def unpin_commands(view: TargetView, host_arch: str, name: str, cask: bool = False, upgrade: bool = True) -> str:
+    """Return what the user runs to remove a pin and upgrade the package, as a sentence of the plan report
+
+    @param view       the Homebrew target's installed packages
+    @param host_arch  the host's architecture
+    @param name       the pinned formula, or the pinned cask's token
+    @param cask       whether the package is a cask
+    @param upgrade    whether the package has a newer version
+    @returns          `To upgrade it:` and the two commands, each in backticks; `To remove the pin:` and the
+                      first of them for a package without a newer version
+    """
+    unpin = f"`{command(view, host_arch, 'unpin', *(['--cask'] if cask else []), name)}`"
+    if not upgrade:
+        return f"To remove the pin: {unpin}"
+    newest = command(view, host_arch, "upgrade", "--cask" if cask else "--formula", name)
+    return f"To upgrade it: {unpin}, then `{newest}`"
+
+
+def unpinned(view: TargetView, ups: Upgrades, name: str) -> None:
+    """Take a pinned blocker out of the way, as the user answered: its pin goes, and a newer version is installed
+
+    @param view  the target's installed packages
+    @param ups   the upgrades the replacements cause
+    @param name  a key of `ups.pinned`
+    """
+    del ups.pinned[name]
+    ups.unpin[name] = ups.versions.get(name, "")
+    pkg = view.installed(name)
+    if pkg is not None and pkg.outdated and name not in ups.explicit:
+        ups.explicit.append(name)
+
+
+def _why_left(view: TargetView, host_arch: str, ups: Upgrades, pkg: Package, trace: bool = False) -> str | None:
+    """Return why `--upgrade-all` leaves an outdated formula or port as it is, with the command that upgrades it
+
+    Nothing changes under a pin that stays: an upgrade can break the pinned formula that uses the package, and
+    Homebrew refuses a formula that needs the newest version of a pinned one. `port upgrade` puts the successor
+    of a replaced port in its place, which the checks of the move would take for a loss.
+
+    @param view       the target's installed packages and catalogue
+    @param host_arch  the host's architecture, for the command
+    @param ups        the upgrades so far, with the pins the user answered to remove
+    @param pkg        an outdated formula or port of the target that is not pinned itself
+    @param trace      whether a Homebrew stays after the move, so that the `port` command builds in trace mode
+    @returns          the reason and the command, as the words that follow the package's name; None for a
+                      package to upgrade
+    """
+    name = view.key(pkg.name)
+    if not view.brew:
+        if not pkg.renamed_to:
+            return None
+        replace = command(view, host_arch, *(["-t"] if trace else []), "upgrade", pkg.name)
+        return f"MacPorts replaced it with {pkg.renamed_to}. To make that change: `{replace}`"
+
+    def pinned(other: str) -> bool:
+        found = view.installed(other)
+        return found is not None and found.pinned and other not in ups.unpin
+
+    def users(other: str) -> list[str]:
+        return [d for d in view.dependents_of([other]) if pinned(d)]
+
+    def outdated(other: str) -> bool:
+        found = view.installed(other)
+        return found is not None and found.outdated
+
+    upgrade = command(view, host_arch, "upgrade", "--formula", name)
+    held = users(name)
+    if held:
+        return (f"{series(held)}, which {'is' if len(held) == 1 else 'are'} pinned, "
+                f"{'uses' if len(held) == 1 else 'use'} it. To upgrade it all the same: `{upgrade}`")
+    needed = [d for d in view.closure([name])[1:] if outdated(d)]
+    pins = [d for d in needed if pinned(d)]
+    if pins:
+        return (f"it needs the newest {series(pins)}, which {'is' if len(pins) == 1 else 'are'} pinned. To upgrade "
+                f"it: `{command(view, host_arch, 'unpin', *pins)}`, then `{upgrade}`")
+    under = [d for d in needed if users(d)]
+    if under:
+        return (f"its upgrade would also upgrade {series(under)}, which a pinned formula uses. To upgrade it all "
+                f"the same: `{upgrade}`")
+    return None
+
+
+# Asks whether to remove a pin: the package's name, its version change, whether it is a cask, and the formulae
+# that the pin alone keeps from an upgrade.
+Unpin = Callable[[str, str, bool, Sequence[str]], bool]
+
+
+def _formula_pins(view: TargetView, host_arch: str, ups: Upgrades, outdated_versions: dict[str, str],
+                  unpin: Unpin) -> None:
+    """Put each pinned formula that `--upgrade-all` would upgrade, or that keeps others from an upgrade, to the user
+
+    A pinned formula at its newest version is asked about when a formula that it uses has a newer one: the
+    option leaves those as they are while the pin stays. A plan that is refused already asks nothing.
 
     @param view               the target's installed packages and catalogue
     @param host_arch          the host's architecture, for the commands printed for the user
-    @param ups                the upgrades the replacements cause, which gain the others
+    @param ups                the upgrades so far, which gain the pins to remove and the pins that stay
     @param outdated_versions  the version each outdated formula upgrades to, as `brew outdated` names it
-    @param cask_versions      the version each outdated cask upgrades to
+    @param unpin              asks whether to remove a pin
     """
-    def pinned(name: str) -> bool:
-        found = view.installed(name)
-        return found is not None and found.pinned
-
-    def brew(*args: str) -> str:
-        return typed(brew_actions.manual(view.target, "3.upgrade.manual", args, "", host_arch).argv, intel=True)
-
     for pkg in sorted(view.formulae.values(), key=lambda p: p.name):
         name = view.key(pkg.name)
-        if not pkg.outdated or name in ups.pinned:
+        if not pkg.pinned or name in ups.unpin or name in ups.pinned:
             continue
-        if name in ups.names:
-            if name not in ups.explicit:
-                ups.explicit.append(name)
-            continue
-        held = [d for d in view.dependents_of([name]) if pinned(d)]
-        if pkg.pinned:
-            ups.left[name] = (f"you pinned it. To upgrade it: `{brew('unpin', name)}`, then "
-                              f"`{brew('upgrade', '--formula', name)}`")
-        elif held:
-            ups.left[name] = (f"{series(held)}, which you pinned, {'uses' if len(held) == 1 else 'use'} it. To "
-                              f"upgrade it all the same: `{brew('upgrade', '--formula', name)}`")
+        held: list[str] = []
+        if pkg.outdated:
+            change = view.version_change(name, outdated_versions)
         else:
-            ups.names.append(name)
-            ups.explicit.append(name)
-            ups.others.append(name)
-            ups.reasons[name] = "--upgrade-all"
-            ups.versions[name] = view.version_change(name, outdated_versions)
+            change = pkg.version or "?"
+            held = [d for d in view.closure([name])[1:] if (dep := view.installed(d)) is not None and dep.outdated]
+            if not held:
+                continue
+        if ups.asking and unpin(name, change, False, held):
+            ups.unpin[name] = change
+        else:
+            how = unpin_commands(view, host_arch, name, upgrade=pkg.outdated)
+            ups.kept_pins[name] = (change, how, ups.asking)
+
+
+def _casks(view: TargetView, host_arch: str, ups: Upgrades, versions: dict[str, str], unpin: Unpin) -> None:
+    """Add the outdated casks of the target to the upgrades of `--upgrade-all`, or to what it leaves
+
+    A cask that asks for the password stays as it is: brew-ports turns sudo off for every `brew` command it
+    runs. A pinned cask is put to the user.
+
+    @param view       the target's installed packages
+    @param host_arch  the host's architecture, for the commands printed for the user
+    @param ups        the upgrades so far, which gain the casks
+    @param versions   the version each outdated cask upgrades to
+    @param unpin      asks whether to remove a pin
+    """
     for token, cask in sorted(view.casks.items()):
         if not cask.outdated:
             continue
+        change = f"{cask.version or '?'} -> {versions.get(token) or NEWEST}"
         if cask.privileged_install or cask.privileged_uninstall:
-            ups.left_casks[token] = f"it asks for your password. To upgrade it: `{brew('upgrade', '--cask', token)}`"
+            if cask.pinned:
+                why = "it is pinned, and Homebrew asks for your password for its upgrade. "
+                ups.left_casks[token] = why + unpin_commands(view, host_arch, token, cask=True)
+            else:
+                ups.left_casks[token] = ("Homebrew asks for your password for its upgrade. To upgrade it: "
+                                         f"`{command(view, host_arch, 'upgrade', '--cask', token)}`")
+        elif cask.pinned and not (ups.asking and unpin(token, change, True, ())):
+            ups.kept_pins[f"{token} (app)"] = (change, unpin_commands(view, host_arch, token, cask=True), ups.asking)
         else:
-            ups.casks[token] = f"{cask.version or '?'} -> {cask_versions.get(token) or 'the newest version'}"
+            if cask.pinned:
+                ups.unpin_casks[token] = change
+            ups.casks[token] = change
+
+
+def every_upgrade(view: TargetView, host_arch: str, ups: Upgrades, versions: tuple[dict[str, str], dict[str, str]],
+                  unpin: Unpin, *, trace: bool = False) -> None:
+    """Add every other outdated package of the target to the upgrades, as `--upgrade-all` asks
+
+    The pinned packages are put to the user first.
+
+    @param view       the target's installed packages and catalogue
+    @param host_arch  the host's architecture, for the commands printed for the user
+    @param ups        the upgrades the replacements cause, which gain the others
+    @param versions   the version each outdated formula upgrades to, as `brew outdated` names it, then the
+                      same for the casks
+    @param unpin      asks whether to remove the pin of a package
+    @param trace      whether a Homebrew stays after the move, for the `port` commands printed for the user
+    """
+    _formula_pins(view, host_arch, ups, versions[0], unpin)
+    for pkg in sorted(view.formulae.values(), key=lambda p: p.name):
+        name = view.key(pkg.name)
+        if not pkg.outdated or name in ups.explicit or name in ups.pinned or name in ups.kept_pins:
+            continue
+        # A yes to the question about its pin is a yes to its upgrade, whatever else uses the package.
+        why = None if name in ups.unpin else _why_left(view, host_arch, ups, pkg, trace)
+        if name in ups.names and name not in ups.checked:
+            if why is None:
+                ups.also.append(name)
+            elif ups.reasons.get(name, "").startswith("depends on "):
+                # Homebrew would upgrade it after the formula it uses. The commands of a plan with the option
+                # keep Homebrew from that, so it is only checked.
+                ups.checked.append(name)
+                ups.versions[name] = pkg.version or "?"
+                ups.left[name] = why
+        elif why is not None:
+            ups.left[name] = why
+        else:
+            if name in ups.checked:     # a port that uses an upgraded one: only the option upgrades it
+                ups.checked.remove(name)
+            else:
+                ups.names.append(name)
+            ups.also.append(name)
+            ups.others.append(name)
+            ups.versions[name] = view.version_change(name, versions[0])
+    _casks(view, host_arch, ups, versions[1], unpin)
 
 
 # Phase 2 -----------------------------------------------------------------------------------------
@@ -459,27 +641,40 @@ def _pipx(target: Instance, host_arch: str, project: str) -> Action:
 
 
 def phase3_brew(view: TargetView, host_arch: str, items: Sequence[Install], *, projects: Sequence[str],
-                explicit: Sequence[str], rebuilds: Sequence[str], casks: Sequence[str] = ()) -> list[Action]:
+                ups: Upgrades, rebuilds: Sequence[str], named_only: bool = False) -> list[Action]:
     """Return the phase 3 actions of a Homebrew target
 
-    The upgrades of mapped targets and companions in `target_upgrades` come first, then the installs,
-    one adoption per cask, the requested marks, pipx and the rebuilds.
+    The pins the user answered to remove go first; then the upgrades the replacements need, those that
+    `--upgrade-all` adds, formulae before casks, the installs, one adoption per cask, the requested marks,
+    pipx and the rebuilds. The upgrades that the option adds are a command of their own, so that a failure
+    in it is not one of the upgrades the replacements need.
 
-    @param view       the target's installed packages and catalogue
-    @param host_arch  the host's architecture
-    @param items      the target packages of the accepted mappings and companions
-    @param projects   the PyPI projects pipx installs
-    @param explicit   the formulae to upgrade
-    @param rebuilds   the target formulae to reinstall
-    @param casks      the casks that `--upgrade-all` upgrades
-    @returns          the actions
+    @param view        the target's installed packages and catalogue
+    @param host_arch   the host's architecture
+    @param items       the target packages of the accepted mappings and companions
+    @param projects    the PyPI projects pipx installs
+    @param ups         the upgrades of the plan and the pins it removes
+    @param rebuilds    the target formulae to reinstall
+    @param named_only  whether the plan was made with `--upgrade-all`: its upgrade commands name every formula
+                       to upgrade, so Homebrew must add none of the formulae that use one of them, which the
+                       plan upgrades by name or leaves as they are
+    @returns           the actions
     """
     target = view.target
     out: list[Action] = []
-    if explicit:
-        out.append(brew_actions.upgrade_formulae(target, host_arch, "3.upgrade.formulae", explicit))
-    if casks:
-        out.append(brew_actions.upgrade_casks(target, host_arch, "3.upgrade.casks", casks))
+    profile = BREW_NAMED_ONLY if named_only else "brew"
+    if ups.unpin:
+        out.append(brew_actions.unpin(target, host_arch, "3.unpin.formulae", list(ups.unpin)))
+    if ups.unpin_casks:
+        out.append(brew_actions.unpin(target, host_arch, "3.unpin.casks", list(ups.unpin_casks), casks=True))
+    if ups.explicit:
+        needed = brew_actions.upgrade_formulae(target, host_arch, "3.upgrade.formulae", ups.explicit)
+        out.append(dataclasses.replace(needed, env_profile=profile))
+    if ups.also:
+        others = brew_actions.upgrade_formulae(target, host_arch, "3.upgrade.others", ups.also)
+        out.append(dataclasses.replace(others, env_profile=profile))
+    if ups.casks:
+        out.append(brew_actions.upgrade_casks(target, host_arch, "3.upgrade.casks", list(ups.casks)))
     formulae = [i.name for i in items if i.kind in ("formula", "") and view.installed(i.name) is None]
     bottled = [n for n in formulae if view.catalogue is not None and view.catalogue.has_bottle(n)]
     built = [n for n in formulae if n not in bottled]
@@ -518,19 +713,23 @@ def phase3_ports(view: TargetView, host_arch: str, items: Sequence[Install], *, 
     @param projects          the PyPI projects pipx installs
     @param homebrew_present  whether a Homebrew prefix exists, which puts builds in trace mode
     @param rebuilds          the target ports to rebuild
-    @param others            the ports that `--upgrade-all` upgrades beside those the replacements need
+    @param others            the ports that `--upgrade-all` upgrades by name
     @returns                 the actions
     """
     target = view.target
     out: list[Action] = []
     ports = [i for i in items if i.kind in ("port", "")]
     upgraded: list[str] = []
-    for name in [item.name for item in ports] + list(others):
+    mapped = [item.name for item in ports]
+    for name in mapped + list(others):
         pkg = view.installed(name)
         if pkg is not None and pkg.outdated and pkg.name not in upgraded:
             upgraded.append(pkg.name)
+            # An upgrade of the option must put no successor in the place of a replaced port, which the plan
+            # leaves as it is and the checks of the move would take for a loss.
             out.append(_probe_policy(mp_actions.upgrade(target, host_arch, f"3.upgrade.{pkg.name}", pkg.name,
-                                                        homebrew_present=homebrew_present)))
+                                                        homebrew_present=homebrew_present,
+                                                        no_replace=name not in mapped)))
     fresh = [i for i in ports if view.installed(i.name) is None]
     for item in sorted(fresh, key=lambda i: bool(i.variants)):
         out.append(mp_actions.install(target, host_arch, f"3.install.{item.name}", item.name, item.variants,
@@ -884,6 +1083,18 @@ def assemble(phase2_actions: list[Action], phase3_actions: list[Action], phase6_
     actions = {2: phase2_actions, 3: phase3_actions, 6: phase6_actions}
     return [Phase(number=n, name=PHASE_NAMES[n], actions=list(actions.get(n, [])), confirm=n in (1, 2, 3, 5, 6, 7))
             for n in range(9) if n != 6 or remove]
+
+
+def phase_name(plan: Plan, number: int) -> str:
+    """Return the name of a phase as the plan report and the run print it, in lower case
+
+    @param plan    the plan
+    @param number  the phase number
+    @returns       the name; phase 3 of a plan that upgrades more than the replacements need says so
+    """
+    if number == 3 and (plan.optional_upgrades or plan.optional_casks):
+        return PHASE_3_ALL
+    return PHASE_NAMES.get(number, "")
 
 
 def refresh_actions(target: Instance, host_arch: str) -> list[Action]:

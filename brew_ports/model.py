@@ -167,7 +167,7 @@ class Action:
     argv: list[str]                  # command: the program and its arguments, without sudo
     sudo: bool
     description: str
-    env_profile: str = "neutral"     # "brew", "ports" or "neutral"
+    env_profile: str = "neutral"     # "brew", "brew-named-only", "ports" or "neutral"
     on_failure: OnFailure = OnFailure.STOP
     retry_argv: list[str] = field(default_factory=list)  # RETRY_WITH: the alternative command
     split_order: list[str] = field(default_factory=list) # SPLIT: the names in retry order
@@ -270,9 +270,14 @@ class Plan:
     removal_set: dict[str, list[tuple[str, str]]]  # drivable source prefix -> (kind, name) pairs; every version of each
     path_removed: dict[str, list[tuple[str, str]]]  # undrivable source prefix -> pairs phase 6 deletes with the prefix
     manual_casks: list[str]          # cask tokens of a drivable instance whose uninstall needs Homebrew's own sudo
-    target_upgrades: list[str]       # target packages the installs will upgrade in place
+    target_upgrades: list[str]       # target packages that phase 3 upgrades in place, or that use one of those
     phases: list[Phase]
     options: dict[str, str]
+    # What `--upgrade-all` upgrades and the move does not need: the names of `target_upgrades` that are neither
+    # a replacement nor used by one, and the casks. A break of one of them, or of a package that only uses one,
+    # is a task for the user, where a break of what the move needs stops the run.
+    optional_upgrades: list[str] = field(default_factory=list)
+    optional_casks: list[str] = field(default_factory=list)
 
 
 PackageKey = tuple[str, str, str]   # (instance prefix, kind, name key)

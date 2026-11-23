@@ -50,6 +50,17 @@ class HelpTest(unittest.TestCase):
         self.assertIsNone(parser.parse_args(["scan"]).state_dir)
         self.assertTrue(parser.parse_args(["--quiet", "scan"]).quiet)
 
+    def test_upgrade_all_is_an_option_of_plan_alone(self):
+        parser = cli.build_parser()
+        self.assertFalse(planner.PlanOptions.from_args(parser.parse_args(["plan", "--target", "brew"])).upgrade_all)
+        given = parser.parse_args(["plan", "--target", "brew", "--upgrade-all"])
+        self.assertTrue(planner.PlanOptions.from_args(given).upgrade_all)
+        help_text = " ".join(run_cli(["plan", "--help"])[1].split())
+        self.assertIn("--upgrade-all upgrade every package that has a newer version in the installation the packages "
+                      "move into, not only those the replacements need; asks before it removes a pin, and lists "
+                      "what it leaves as it is", help_text)
+        self.assertEqual(run_cli(["apply", "plan.json", "--upgrade-all"])[0], 2)
+
 
 class RefusalTest(TempDirTest):
     """Tests of the refusals: the brew alias, root, usage errors, a held lock and an unknown run"""

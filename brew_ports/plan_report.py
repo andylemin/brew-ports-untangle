@@ -9,7 +9,7 @@ from typing import Any
 from . import doctor, plan_sets, report
 from .equiv import rules
 from .model import Confidence, Manager, Phase
-from .plan_phases import PHASE_NAMES
+from .plan_phases import NEWEST, OPEN_APPS, phase_name
 from .plan_sets import DROPPED, MIGRATED, UNMIGRATABLE
 from .report import COMMAND_OF, at, counted, manager_name, place, some, tilde
 
@@ -138,6 +138,38 @@ def medium_question(unit: Any, mapping: Any, target: Any) -> str:
             f"{replacement}: {difference(unit, mapping)}.\n"
             f"If you answer no, you choose next whether {unit.name} stays or is uninstalled.\n"
             f"Install {replacement} into {target.prefix} to replace it?")
+
+
+def pin_question(name: str, change: str, target: Any, *, needed: str = "", app: bool = False,
+                 held: Sequence[str] = ()) -> str:
+    """Return the question about a pinned package of the target: remove the pin and upgrade it, or keep it
+
+    @param name    the pinned formula, or the pinned cask's token
+    @param change  its installed version, and after ` -> ` the one it upgrades to when it has a newer one
+    @param target  the target installation
+    @param needed  what the replacements do to the package, as a sentence without its capital; empty for a
+                   package that only `--upgrade-all` touches
+    @param app     whether the package is a cask
+    @param held    the formulae that the pin alone keeps from an upgrade, for a formula at its newest version
+    @returns       the question: what there is, what each answer does, then yes or no
+    """
+    old, arrow, new = change.partition(" -> ")
+    known = bool(arrow) and new != NEWEST
+    pinned = f"{name + ' (app)' if app else name} in {at(target)} is pinned at {old}"
+    newest = f"; the newest version is {new}" if known else "; a newer version exists" if arrow else ""
+    yes = f"removes the pin and upgrades it{' to ' + new if known else ''}" if arrow else "removes the pin"
+    ask = f"Remove the pin and upgrade {name}?" if arrow else f"Remove the pin of {name}?"
+    if needed:
+        return (f"{pinned}{newest}. {needed[0].upper()}{needed[1:]}.\n"
+                f"If you answer yes, the move {yes}. If you answer no, it stays pinned and no plan is made.\n{ask}")
+    if held:
+        them, are = ("that package", "it is") if len(held) == 1 else ("those packages", "they are")
+        return (f"{pinned}, its newest version. --upgrade-all would upgrade {some(held)}, which it uses.\n"
+                f"If you answer yes, the move removes the pin and upgrades {them}. If you answer no, the pin stays "
+                f"and --upgrade-all leaves {them} as {are}.\n{ask}")
+    stays = "" if app else (" --upgrade-all then leaves what it uses as it is, and every package whose upgrade "
+                            f"needs a newer version of {name} or of something it uses.")
+    return f"{pinned}{newest}.\nIf you answer yes, the move {yes}. If you answer no, it stays as it is.{stays}\n{ask}"
 
 
 def unmigratable_question(unit: Any, note: str, target: Any, *, emptied: bool, forced: bool = False,
@@ -431,32 +463,87 @@ def _apps(draft: Any) -> list[str]:
 def _upgrades(draft: Any) -> list[str]:
     """Return the packages of the target that the move upgrades, with their versions
 
-    Those the replacements need come first, with the reason of each; then those that `--upgrade-all` adds, and
-    what it leaves as it is, with the command that upgrades each.
+    Those the replacements need come first, with the reason of each and the packages that are only checked
+    afterwards; then those that `--upgrade-all` adds, the pins the plan asked about, and what stays as it is,
+    with the command that upgrades each.
 
     @param draft  the planner's draft
-    @returns      the lines; none without upgrades
+    @returns      the lines; none for a plan that upgrades nothing and was not asked to
     """
     ups = draft.upgrades
     if ups is None:
         return []
+    where = at(draft.target)
     lines: list[str] = []
     rows = [(name, ups.versions.get(name, ""), ups.reasons.get(name, "") + (", pinned" if name in ups.pinned else ""))
-            for name in ups.names if name not in ups.others]
+            for name in ups.names if name not in ups.others and name not in ups.checked]
     if rows:
-        lines += ["", f"Upgrades in {at(draft.target)} that the replacements need"] + [
+        lines += ["", f"Upgrades in {where} that the replacements need"] + [
             "  " + line for line in report.table(rows, ["package", "versions", "why"])]
-    asked = ([(name, ups.versions.get(name, "")) for name in ups.others]
-             + [(f"{token} (app)", change) for token, change in ups.casks.items()])
+    if ups.checked:
+        lines.append(f"  Checked after the upgrades, and installed again if one lost a library: {some(ups.checked)}")
+    asked = [(name, ups.versions.get(name, "")) for name in ups.others if name not in ups.unpin]
+    asked += [(f"{token} (app)", change) for token, change in ups.casks.items() if token not in ups.unpin_casks]
     if asked:
-        lines += ["", f"Other upgrades in {at(draft.target)}, as --upgrade-all asks"] + [
+        lines += ["", f"Other upgrades in {where}, as --upgrade-all asks"] + [
             "  " + line for line in report.table(asked, ["package", "versions"])]
-    elif draft.upgrade_all:
-        lines += ["", f"--upgrade-all adds no upgrade: no other package of {at(draft.target)} has a newer version "
-                  "that it may install."]
+    elif draft.upgrade_all and not ups.others and not ups.casks:
+        lines += ["", f"--upgrade-all upgrades nothing more in {where}."]
+    notes = [] if draft.refusals else _upgrade_notes(draft, bool(rows))
+    if rows or asked:
+        lines, notes = lines + notes, []
+    lines += _pins(ups, where, bool(draft.refusals)) + notes
     left = list(ups.left.items()) + [(f"{token} (app)", why) for token, why in ups.left_casks.items()]
     if left:
-        lines += ["", f"Not upgraded in {at(draft.target)}"] + [f"  {name}: {why}" for name, why in left]
+        lines += ["", f"Not upgraded by --upgrade-all in {where}"] + [f"  {name}: {why}" for name, why in left]
+    return lines
+
+
+def _upgrade_notes(draft: Any, needed: bool) -> list[str]:
+    """Return what the user should know of the upgrades of a plan: open apps, and the old versions that stay
+
+    @param draft   the planner's draft
+    @param needed  whether the replacements need an upgrade
+    @returns       the lines, indented as the rows they follow
+    """
+    ups = draft.upgrades
+    notes = [OPEN_APPS] if ups.casks else []
+    if needed or ups.others:
+        notes.append("The old version of each upgraded formula stays installed; afterwards `brew-ports doctor` offers "
+                     "to delete those versions." if draft.target.manager is Manager.BREW
+                     else "The old version of each upgraded port stays stored, switched off; afterwards `brew-ports "
+                          "doctor` offers to uninstall those versions.")
+    return [f"  {note}" for note in notes]
+
+
+def _pins(ups: Any, where: str, refused: bool) -> list[str]:
+    """Return the pinned packages of the target that the plan asked about, with what happens to each
+
+    @param ups      the plan's upgrades, with the pins the user answered to remove and those that stay
+    @param where    the target installation, as the report names it
+    @param refused  whether no plan is made, so that no pin is removed
+    @returns        the lines; none without such a pin
+    """
+    done = list(ups.unpin.items())
+    done += [(f"{token} (app)", change) for token, change in ups.unpin_casks.items()]
+    if not done and not ups.kept_pins:
+        return []
+    lines = ["", f"Pinned in {where}"]
+    for name, change in done:
+        if refused:
+            lines.append(f"  {name} {change.partition(' -> ')[0]}: you answered yes; it stays pinned, as no plan is "
+                         "made")
+        else:
+            also = " and it is upgraded" if " -> " in change else ""
+            lines.append(f"  {name} {change}: the pin is removed{also}, as you answered")
+    for name, (change, how, answered) in ups.kept_pins.items():
+        old, arrow, new = change.partition(" -> ")
+        newest = f", newest {new}" if arrow and new != NEWEST else ""
+        lines.append(f"  {name} {old}{newest}: stays pinned{', as you answered' if answered else ''}. {how}")
+    if done and not refused:
+        lines.append("  `brew-ports rollback` does not put a removed pin back.")
+    if ups.kept_pins and not ups.asked:
+        lines.append("  On a terminal and without --yes, `brew-ports plan` asks whether to remove each pin.")
     return lines
 
 
@@ -580,7 +667,7 @@ def _steps(draft: Any, verbose: bool) -> list[str]:
             continue
         if number == 2 and not phase.actions:
             continue
-        name = f"Repair {at(draft.target)}" if number == 2 else PHASE_NAMES[number].capitalize()
+        name = f"Repair {at(draft.target)}" if number == 2 else phase_name(draft.plan, number).capitalize()
         running = [svc for svc in draft.stops if svc.loaded]
         if number == 5 and running:
             name += f", after stopping {counted(len(running), 'service')}"

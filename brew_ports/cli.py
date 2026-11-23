@@ -113,8 +113,9 @@ def _add_plan(sub: Any, common: argparse.ArgumentParser) -> None:
     p.add_argument("--start-services", action="store_true",
                    help="start the replacement of each service that was running")
     p.add_argument("--upgrade-all", action="store_true",
-                   help="also upgrade every other package that has a newer version in the installation the packages "
-                        "move into; a pinned formula and an app that asks for your password stay as they are")
+                   help="upgrade every package that has a newer version in the installation the packages move into, "
+                        "not only those the replacements need; asks before it removes a pin, and lists what it "
+                        "leaves as it is")
     p.add_argument("--keep-managers", action="store_true",
                    help="do not uninstall the old Homebrew or MacPorts that the move leaves empty")
     p.add_argument("--delete", action="append", metavar="PATH[,PATH...]",
@@ -127,8 +128,8 @@ def _add_plan(sub: Any, common: argparse.ArgumentParser) -> None:
     p.add_argument("--rescan", action="store_true",
                    help="scan the Mac again instead of using a scan taken in the last ten minutes")
     p.add_argument("--yes", action="store_true",
-                   help="do not ask: each question about a package takes its default, so no closest match is taken; "
-                        "the update of --refresh runs")
+                   help="do not ask: each question about a package takes its default, so no closest match is taken "
+                        "and no pin is removed; the update of --refresh runs")
     p.add_argument("--out", metavar="FILE", help="also save the plan as FILE, for `brew-ports apply FILE`")
 
 

@@ -129,9 +129,18 @@ The main `plan` options:
 | `--keep-managers` | Do not uninstall the old Homebrew or MacPorts that the move leaves empty. |
 | `--delete PATH,…` | After the move, delete an old installation whole, although its command cannot run. |
 | `--start-services` | Start the replacements of the services that were running. |
-| `--upgrade-all` | Also upgrade every other package that has a newer version in the installation the packages move into. A pinned formula and an app that asks for your password stay as they are; the plan lists them with the command that upgrades each. |
+| `--upgrade-all` | Upgrade every package that has a newer version in the installation the packages move into, not only those the replacements need. The plan lists what stays as it is, such as an app whose upgrade asks for your password, with the command that upgrades it. A package that the move does not need and that one of these upgrades breaks does not stop the move: `apply` lists it for you to repair. `rollback` does not undo these upgrades. |
 | `--repology` | Ask repology.org about packages the offline catalogs cannot match. |
 | `--refresh` | Update the target's catalog (`brew update`, `port sync`) first. |
+
+`plan` asks whether the move may remove a pin (`brew pin`) from a package of
+the installation the packages move into. It asks about a pin that is in the
+way of the move, and with `--upgrade-all` about each pinned package that the
+option would upgrade or that keeps other packages from an upgrade. After a
+yes, `apply` removes the pin in phase 3 and upgrades the package; `rollback`
+does not put the pin back. `--yes` does not answer these questions: a pin
+stays until you say otherwise, and a pin that is in the way of the move then
+refuses the plan.
 
 ## How a migration runs
 
@@ -143,8 +152,8 @@ uninstalls, or edits something, unless you give `--yes`.
 | 0 | Checks before starting: the blocking health findings, the tool checks, the disk check, and `sudo`. |
 | 1 | Save a record for undo: package lists, `Brewfile`, registry backup, services, shell files, and a local snapshot of the disk (see below). |
 | 2 | Repair the installation that stays, where the packages it installs need repair. |
-| 3 | Install the replacements, then rebuild packages that link into the old installation. |
-| 4 | Check the replacements: each must exist, provide its commands, and link cleanly. |
+| 3 | Remove the pins you agreed to, install the replacements, and upgrade what `--upgrade-all` adds; then rebuild packages that link into the old installation. |
+| 4 | Check the replacements: each must exist, provide its commands, and link cleanly. A package that the move does not need and that an upgrade of `--upgrade-all` broke is listed for you to repair, and the run goes on. The run stops if phase 3 tried to install a package again that uses such an upgrade, and that package is gone. |
 | 5 | Uninstall the old packages, after stopping their services. |
 | 6 | Uninstall each old manager that is now empty, after archiving its data directories. Answering no leaves it installed, and the run goes on. A move with `--only` or `--keep-managers` has no phase 6. |
 | 7 | Clean up the shell files and `/etc/paths`. |

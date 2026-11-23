@@ -1,6 +1,7 @@
 """Tests of the model's JSON round trip"""
 
 import collections
+import dataclasses
 import json
 import unittest
 
@@ -48,6 +49,15 @@ class ModelRoundTripTest(unittest.TestCase):
         self.assertIs(back.mappings[0].confidence, model.Confidence.EXACT)
         self.assertIs(back.phases[0].actions[0].on_failure, model.OnFailure.RETRY_WITH)
         self.assertEqual(back.phases[0].actions[0].split_head, 2)
+
+    def test_a_plan_file_without_optional_upgrades_names_none(self):
+        # A plan file of a brew-ports that did not tell these upgrades apart has neither field.
+        data = json.loads(model.to_json(sample_plan()))
+        del data["optional_upgrades"], data["optional_casks"]
+        plan = model.from_dict(model.Plan, data)
+        self.assertEqual((plan.optional_upgrades, plan.optional_casks), ([], []))
+        named = dataclasses.replace(sample_plan(), optional_upgrades=["pkgconf"], optional_casks=["firefox"])
+        self.assertEqual(model.from_json(model.Plan, model.to_json(named)), named)
 
     def test_issue_blocks_round_trip(self):
         issue = model.Issue(code="brew-unwritable-prefix", severity=model.Severity.HIGH, title="t", subject=None,

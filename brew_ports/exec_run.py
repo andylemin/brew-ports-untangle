@@ -97,6 +97,7 @@ class Run:
         self.headings: set[int] = set()      # the indexes of the phase headings among `lines`
         self.heading: str | None = None      # the heading of the running phase, until its first line prints
         self.todo: list[str] = []            # what is left for the user to do, said once when the run ends
+        self.repairs: dict[str, str] = {}    # the tasks among them that a check found, by package
         self.declined = False                # a no at phase 6 in this start
         self.marking = True                  # whether a command that changes something touches the dirty marker
         self.touched = False
@@ -109,13 +110,18 @@ class Run:
         self._root_files: RootFiles | None = None
         self.entries = run_dir.journal.entries()
         self.results: dict[tuple[Any, str], str] = {}
+        # A Homebrew batch journals a listing before each attempt and a result when the attempt ends: the last
+        # listing of each batch, and the batches whose last attempt was cut short before its result.
         self.listings: dict[str, dict[str, Any]] = {}
+        self.unfinished: set[str] = set()
         for entry in self.entries:
             action_id = str(entry.get("action_id") or "")
             if "result" in entry:
                 self.results[(entry.get("phase"), action_id)] = entry["result"]
+                self.unfinished.discard(action_id)
             if entry.get("kind") == "listing" and entry.get("of"):
-                self.listings.setdefault(str(entry["of"]), entry)
+                self.listings[str(entry["of"])] = entry
+                self.unfinished.add(str(entry["of"]))
         if not dry_run:
             self._hook()
 
@@ -316,7 +322,7 @@ class Run:
         phase = self.phase(number)
         if self.dry_run or phase is None or not phase.confirm:
             return True
-        question = question or apply_report.QUESTIONS[number]
+        question = question or apply_report.question(number, self.plan)
         if self.asks:
             self.say("  " + (stops or apply_report.stops_here(self.run_dir.run_id)))
         answer = self.ctx.confirm(question, default=False)

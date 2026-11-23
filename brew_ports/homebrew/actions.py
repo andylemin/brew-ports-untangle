@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from ..model import Action, Instance, OnFailure
+from ..report import typed
 from ..runner import arch_argv, require_names
 
 INVENTORY_TIMEOUT_S = 600   # info, outdated, deps and missing load every installed formula
@@ -235,7 +236,7 @@ def bundle_dump(instance: Instance, host_arch: str, action_id: str, path: str) -
 
 def install_formulae(instance: Instance, host_arch: str, action_id: str, names: Sequence[str], *,
                      as_dependency: bool = False, on_failure: OnFailure = OnFailure.SPLIT) -> Action:
-    """Install formulae: `brew install --formula -y [--as-dependency] <names...>`
+    """Install formulae: `brew install --formula [--as-dependency] <names...>`
 
     Phase 3 installs the bottled and the source-built targets as two such batches.
 
@@ -328,9 +329,10 @@ def upgrade_formulae(instance: Instance, host_arch: str, action_id: str, names: 
 
 def upgrade_casks(instance: Instance, host_arch: str, action_id: str, tokens: Sequence[str],
                   on_failure: OnFailure = OnFailure.SPLIT) -> Action:
-    """Upgrade casks without `privileged_install`: `brew upgrade --cask <tokens...>`
+    """Upgrade casks that need no password: `brew upgrade --cask <tokens...>`
 
-    Never without tokens: a bare `brew upgrade --cask` upgrades every outdated cask.
+    Never without tokens: a bare `brew upgrade --cask` upgrades every outdated cask. Homebrew quits an app
+    that is open for its upgrade and opens it again.
 
     @param instance    the Homebrew instance
     @param host_arch   the host's architecture, which decides the `arch` prefix
@@ -341,6 +343,24 @@ def upgrade_casks(instance: Instance, host_arch: str, action_id: str, tokens: Se
     """
     return _batch(instance, host_arch, action_id, ["upgrade", "--cask"], tokens, description="upgrade casks",
                   on_failure=on_failure)
+
+
+def unpin(instance: Instance, host_arch: str, action_id: str, names: Sequence[str], *, casks: bool = False) -> Action:
+    """Remove the pins of formulae or casks: `brew unpin [--cask] <names...>`
+
+    Formulae go without `--formula`, which a Homebrew that pins formulae alone does not know. A failure is left
+    to the upgrade that follows, which Homebrew refuses for a package that is still pinned.
+
+    @param instance   the Homebrew instance
+    @param host_arch  the host's architecture, which decides the `arch` prefix
+    @param action_id  the action's `<phase>.<subject>.<step>` id
+    @param names      the pinned formulae, or the pinned cask tokens
+    @param casks      whether the names are casks
+    @returns          the action
+    """
+    return _batch(instance, host_arch, action_id, ["unpin", "--cask"] if casks else ["unpin"], names,
+                  description="remove the pins of casks" if casks else "remove the pins of formulae",
+                  on_failure=OnFailure.PROBE)
 
 
 def uninstall_formulae(instance: Instance, host_arch: str, action_id: str, names: Sequence[str], *,
@@ -476,12 +496,37 @@ def link(instance: Instance, host_arch: str, action_id: str, name: str) -> Actio
     return _action(instance, action_id, argv, f"link {name}")
 
 
+def _user_argv(instance: Instance, args: Sequence[str], host_arch: str | None) -> list[str]:
+    """Return a `brew` command for the user to run
+
+    The `brew` of an Intel Homebrew on an Apple Silicon Mac goes behind `arch -x86_64`: started without it,
+    Homebrew refuses to install into `/usr/local`.
+
+    @param instance   the Homebrew instance whose binary the command names
+    @param args       the arguments after the binary
+    @param host_arch  the host's architecture; None leaves `arch` out
+    @returns          the argv
+    """
+    argv = [instance.binary or f"{instance.prefix}/bin/brew"] + list(args)
+    if host_arch == "arm64" and instance.arch == "x86_64":
+        argv = arch_argv(instance.arch, host_arch, argv)
+    return argv
+
+
+def typed_line(instance: Instance, args: Sequence[str], host_arch: str | None = None) -> str:
+    """Return a `brew` command for the user to run, as they would type it
+
+    @param instance   the Homebrew instance whose binary the command names
+    @param args       the arguments after the binary
+    @param host_arch  the host's architecture; None leaves `arch` out
+    @returns          the shell-quoted command: `brew` by its bare name only where typing that runs this binary
+    """
+    return typed(_user_argv(instance, args, host_arch), intel=True)
+
+
 def manual(instance: Instance, action_id: str, args: Sequence[str], description: str,
            host_arch: str | None = None) -> Action:
     """Build a `brew` line that is printed for the user and never run, such as `brew link --overwrite --dry-run <f>`
-
-    It names the instance's binary as the user would type it. The `brew` of an Intel Homebrew on an Apple Silicon
-    Mac goes behind `arch -x86_64`: started without it, Homebrew refuses to install into `/usr/local`.
 
     @param instance     the Homebrew instance whose binary the line names
     @param action_id    the action's `<phase>.<subject>.<step>` id
@@ -490,8 +535,5 @@ def manual(instance: Instance, action_id: str, args: Sequence[str], description:
     @param host_arch    the host's architecture; None leaves `arch` out
     @returns            the action
     """
-    argv = [instance.binary or f"{instance.prefix}/bin/brew"] + list(args)
-    if host_arch == "arm64" and instance.arch == "x86_64":
-        argv = arch_argv(instance.arch, host_arch, argv)
-    return Action(action_id=action_id, kind="command", argv=argv, sudo=False,
+    return Action(action_id=action_id, kind="command", argv=_user_argv(instance, args, host_arch), sudo=False,
                   description=description, env_profile="brew", manual=True, instance_prefix=instance.prefix)

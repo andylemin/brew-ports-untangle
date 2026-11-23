@@ -371,21 +371,24 @@ def mapping(source: model.Package, kind: str, name: str, *, version: str = "1.0"
 def plan(target: model.Instance, sources: Sequence[model.Instance], *, mappings: Sequence[model.Mapping] = (),
          removal: dict[str, list[tuple[str, str]]] | None = None, phase2: Sequence[model.Action] = (),
          phase3: Sequence[model.Action] = (), phase6: Sequence[model.Action] = (), upgrades: Sequence[str] = (),
-         remove: Sequence[str] = (), unmigratable: Sequence[model.Mapping] = (), **options: Any) -> model.Plan:
+         remove: Sequence[str] = (), unmigratable: Sequence[model.Mapping] = (), optional: Sequence[str] = (),
+         optional_casks: Sequence[str] = (), **options: Any) -> model.Plan:
     """Return a plan of the mappings, its phases assembled as the planner does
 
-    @param target        the target instance
-    @param sources       the source instances
-    @param mappings      the mappings, whose sources are the roots
-    @param removal       the removal set: the `(kind, name)` pairs of each source prefix
-    @param phase2        the repairs of phase 2
-    @param phase3        the actions of phase 3
-    @param phase6        the actions of phase 6
-    @param upgrades      the plan's `target_upgrades`
-    @param remove        the prefixes of the old installations the plan uninstalls
-    @param unmigratable  the mappings of packages that are not migrated
-    @param options       `PlanOptions` fields, such as `start_services=True`
-    @returns             the plan
+    @param target          the target instance
+    @param sources         the source instances
+    @param mappings        the mappings, whose sources are the roots
+    @param removal         the removal set: the `(kind, name)` pairs of each source prefix
+    @param phase2          the repairs of phase 2
+    @param phase3          the actions of phase 3
+    @param phase6          the actions of phase 6
+    @param upgrades        the plan's `target_upgrades`
+    @param remove          the prefixes of the old installations the plan uninstalls
+    @param unmigratable    the mappings of packages that are not migrated
+    @param optional        the plan's `optional_upgrades`, which join `target_upgrades`
+    @param optional_casks  the plan's `optional_casks`
+    @param options         `PlanOptions` fields, such as `start_services=True`
+    @returns               the plan
     """
     opts = planner.PlanOptions(target=target.manager, **options)
     return model.Plan(
@@ -394,9 +397,10 @@ def plan(target: model.Instance, sources: Sequence[model.Instance], *, mappings:
         roots=[m.source for m in mappings], kept=[], left_in_place=[], mappings=list(mappings),
         unmigratable=list(unmigratable), removal_set={k: list(v) for k, v in (removal or {}).items()},
         path_removed={}, manual_casks=[],
-        target_upgrades=list(upgrades),
+        target_upgrades=list(upgrades) + [name for name in optional if name not in upgrades],
         phases=plan_phases.assemble(list(phase2), list(phase3), list(phase6), bool(remove)),
-        options=opts.as_strings(target.prefix, list(remove)))
+        options=opts.as_strings(target.prefix, list(remove)),
+        optional_upgrades=list(optional), optional_casks=list(optional_casks))
 
 
 def write_plan(path: str, value: model.Plan) -> str:
@@ -634,12 +638,15 @@ class Responder:
 
 # Stand-ins for verify, envclean and remove_manager ------------------------------------------------
 
-def verify_module(failures: dict[bool, list[tuple[str, str, str]]] | None = None) -> types.SimpleNamespace:
+def verify_module(failures: dict[bool, list[tuple[str, str, str]]] | None = None,
+                  tasks: dict[bool, list[tuple[str, str, str, str]]] | None = None) -> types.SimpleNamespace:
     """Return a stand-in for `brew_ports.verify` whose `check` returns a real `VerifyResult`
 
-    `failures[gate]` lists the `(step, subject, text)` of each failure; `calls` records `gate` per call.
+    `failures[gate]` lists the `(step, subject, text)` of each failure, `tasks[gate]` the `(step, subject, text,
+    task)` of each package left for the user to repair; `calls` records `gate` per call.
 
     @param failures  the failures of the gate (True) and of phase 8 (False); None for none
+    @param tasks     the tasks of the gate (True) and of phase 8 (False); None for none
     @returns         the stand-in, for `sys.modules`
     """
     mod = types.SimpleNamespace(calls=[])
@@ -650,6 +657,8 @@ def verify_module(failures: dict[bool, list[tuple[str, str, str]]] | None = None
         result = real_verify.VerifyResult(gate=gate)
         for step, subject, text in (failures or {}).get(gate, []):
             result.fail(step, subject, text)
+        for step, subject, text, task in (tasks or {}).get(gate, []):
+            result.task(step, subject, text, task)
         return result
     mod.check = check
     return mod

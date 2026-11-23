@@ -13,6 +13,7 @@ from unittest import mock
 
 from brew_ports import (cli, doctor, envclean, exec_run, executor, model, plan_report, remove_manager, runner as r,
                         snapshot, state)
+from brew_ports.homebrew import actions as brew_actions
 from brew_ports.macports import actions as mp_actions
 from brew_ports.model import Blocks, Severity
 from tests.unit.fixtures.executor import builders as b
@@ -500,6 +501,171 @@ class GateTest(ApplyTest):
         self.assertFalse([k for k in self.results() if k[0] == 5])
 
 
+class UpgradeAllTest(ApplyTest):
+    """A plan made with `--upgrade-all`: phase 3 names the upgrades it adds, and a break among them is a task"""
+
+    TASK = ("Install pkgconf again, because its upgrade, which --upgrade-all asked for, left it uninstalled in "
+            "Homebrew at /opt/homebrew: brew install --formula pkgconf")
+    GATE = ("gate", "pkgconf", "is uninstalled in Homebrew at /opt/homebrew after its upgrade", TASK)
+    PASSED = "  Passed: every replacement is installed, provides commands and finds its libraries.\n"
+
+    def scenario(self, *more):
+        """Plan the move of scenario A with the upgrades of pkgconf and of the app firefox, which no replacement needs
+
+        The target's app docker-desktop has a newer version that the plan leaves.
+
+        @param more  further formulae that the plan upgrades with pkgconf
+        """
+        self.scenario_brew()
+        names = ["pkgconf", *more]
+        others = brew_actions.upgrade_formulae(self.target, "arm64", "3.upgrade.others", names)
+        apps = brew_actions.upgrade_casks(self.target, "arm64", "3.upgrade.casks", ["firefox"])
+        self.host.packages.append(make_package("docker-desktop", "cask", self.target.prefix, outdated=True))
+        self.save_plan(b.plan(self.target, [self.source], mappings=self.mappings, removal=self.removal,
+                              phase3=[others, apps, self.install], optional=names, optional_casks=["firefox"],
+                              upgrade_all=True))
+
+    def upgrades(self):
+        """Return the `brew upgrade` and `brew reinstall` commands of formulae that the last command ran
+
+        @returns  each command from its verb on, in order
+        """
+        return [tail[1:] for tail in self.responder.ran("brew")
+                if tail[1] in ("upgrade", "reinstall") and "--cask" not in tail]
+
+    def test_phase_3_asks_for_the_upgrades_and_says_what_follows(self):
+        self.scenario()
+        self.assertEqual(self.apply(yes=False, tty=True, answers=[True, True]), executor.EXIT_OK, self.out)
+        self.assertEqual(self.ctx.asked[0], "Install the replacements and upgrade the other packages?")
+        brew = self.target.binary
+        self.assertIn("\nPhase 3  Install the replacements and upgrade the other packages\n"
+                      f"  {brew} upgrade --formula pkgconf\n  {brew} upgrade --cask firefox\n"
+                      f"  {brew} install --formula dnsmasq jq\n"
+                      "  Then every package that uses an upgraded one is checked; one that lost a library is "
+                      "installed again.\n"
+                      "  Homebrew may close an app that is open for its upgrade, and then opens it again.\n"
+                      "  n stops the run here; ", self.out)
+        self.assertEqual([tail[1:] for tail in self.responder.ran("brew", "upgrade")],
+                         [["upgrade", "--formula", "pkgconf"], ["upgrade", "--cask", "firefox"]])
+
+    def test_the_closing_lines_count_what_is_still_to_upgrade(self):
+        self.scenario()
+        self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
+        self.assertIn(f"\n1 package of Homebrew at {self.target.prefix} still has a newer version, because the plan "
+                      "left it as it is or its upgrade failed: docker-desktop.\n"
+                      f"To upgrade it: {self.target.binary} upgrade\nNext: open a new Terminal window", self.out)
+
+    def test_a_package_that_an_added_upgrade_broke_is_a_task(self):
+        self.scenario()
+        self.modules["brew_ports.verify"] = b.verify_module(tasks={True: [self.GATE]})
+        self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
+        self.assertIn(f"\nPhase 4  Check the replacements\n{self.PASSED}  For you to do after the run: {self.TASK}\n",
+                      self.out)
+        self.assertEqual(len(self.responder.ran("port", "uninstall")), 1)       # the move went on
+        self.assertIn(f"\nFor you to do:\n  {self.TASK}\nUndo: brew-ports rollback", self.out)
+
+    def test_a_package_has_one_task_in_the_words_of_the_last_check(self):
+        self.scenario()
+        text = "bin/pkgconf references libgone.dylib, which does not exist"
+        again = "Install pkgconf again, because its upgrade left it without a library it needs: "
+        # Phase 6 uninstalled the Homebrew that came first on PATH, so by phase 8 the command is typed as `brew`.
+        early, late = again + "/opt/homebrew/bin/brew reinstall --formula pkgconf", again + "brew reinstall pkgconf"
+        self.modules["brew_ports.verify"] = b.verify_module(tasks={True: [("linkage", "pkgconf", text, early)],
+                                                                   False: [("linkage", "pkgconf", text, late)]})
+        self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
+        self.assertIn(f"  note pkgconf (clean linkage): {text} (for you to repair; the move does not need it)\n",
+                      self.out)
+        closing = self.out[self.out.index("\nFor you to do:\n"):]
+        self.assertEqual((closing.count(late), closing.count("Install pkgconf again")), (1, 1))
+
+    def test_a_failed_check_lists_the_task_once(self):
+        self.scenario()
+        self.modules["brew_ports.verify"] = b.verify_module({True: [("installed", "jq -> jq", "jq is not installed")]},
+                                                            tasks={True: [self.GATE]})
+        self.assertEqual(self.apply(), executor.EXIT_ACTION, self.out)
+        self.assertNotIn("For you to do after the run", self.out)
+        self.assertEqual(self.out.count(self.TASK), 1)
+        self.assertIn(f"\nFor you to do:\n  {self.TASK}\n", self.out)
+
+    def test_each_start_of_a_run_finds_its_tasks_again(self):
+        self.scenario()
+        self.modules["brew_ports.verify"] = b.verify_module(tasks={True: [self.GATE]})
+        self.assertEqual(self.apply(stop_after=4), executor.EXIT_OK, self.out)
+        self.assertTrue(self.out.endswith(f"For you to do:\n  {self.TASK}\n"), self.out)
+        first = self.run_dir.run_id
+        self.assertEqual(self.apply(resume=first, stop_after=5), executor.EXIT_OK, self.out)
+        self.assertTrue(self.out.endswith(f"For you to do:\n  {self.TASK}\n"), self.out)
+        # Once the package is repaired, the next start has no such task.
+        self.modules["brew_ports.verify"] = b.verify_module()
+        self.assertEqual(self.apply(resume=first), executor.EXIT_OK, self.out)
+        self.assertNotIn("Install pkgconf again", self.out)
+
+    def test_an_upgrade_that_failed_runs_again_as_it_is(self):
+        self.scenario("ddrescue")
+        self.responder.fail = {"ddrescue": 1}
+        self.assertEqual(self.apply(stop_after=3), executor.EXIT_OK, self.out)
+        self.assertEqual(self.results()[(3, "3.upgrade.others")], "failed")
+        self.responder.log.clear()
+        self.assertEqual(self.apply(resume=self.run_dir.run_id, stop_after=3), executor.EXIT_OK, self.out)
+        # The attempt ran to its end, so nothing is half installed: pkgconf is not installed a second time.
+        self.assertEqual(self.upgrades(), [["upgrade", "--formula", "pkgconf", "ddrescue"],
+                                           ["upgrade", "--formula", "pkgconf"], ["upgrade", "--formula", "ddrescue"]])
+        self.assertNotIn("did not finish", self.out)
+
+    def test_an_upgrade_that_was_cut_short_resumes_as_a_reinstall(self):
+        self.scenario("ddrescue")
+
+        def killed(tail):
+            if "--formula" in tail and "pkgconf" in tail:
+                self.responder.answer_brew([tail[0], "upgrade", "--formula", "pkgconf"], "upgrade")
+                self.runners[-1].note_sigint()
+                return r.FakeResponse(exit=130)
+            return None
+        self.responder.hooks["upgrade"] = killed
+        self.assertEqual(self.apply(), executor.EXIT_ACTION, self.out)
+        self.assertNotIn((3, "3.upgrade.others"), self.results())
+        del self.responder.hooks["upgrade"]
+        self.responder.log.clear()
+        self.assertEqual(self.apply(resume=self.run_dir.run_id, stop_after=3), executor.EXIT_OK, self.out)
+        self.assertEqual(self.upgrades(), [["reinstall", "--formula", "pkgconf"],
+                                           ["upgrade", "--formula", "ddrescue"]])
+
+    def test_a_failed_install_does_not_install_the_upgrades_again(self):
+        self.scenario("ddrescue")
+        self.responder.fail = {"jq": 1}
+        self.assertEqual(self.apply(stop_after=3), executor.EXIT_OK, self.out)
+        self.assertEqual(self.results()[(3, "3.install.bottled")], "failed")
+        self.responder.log.clear()
+        self.assertEqual(self.apply(resume=self.run_dir.run_id, stop_after=3), executor.EXIT_OK, self.out)
+        # Only the install that failed runs again, as planned: what the other commands upgraded is left alone.
+        ran = [tail[1:] for tail in self.responder.ran("brew") if tail[1] in ("install", "upgrade", "reinstall")]
+        self.assertEqual(ran, [["install", "--formula", "dnsmasq", "jq"], ["install", "--formula", "dnsmasq"],
+                               ["install", "--formula", "jq"]])
+        self.assertNotIn("did not finish", self.out)
+
+    def test_an_attempt_cut_short_after_a_failed_one_is_seen(self):
+        self.scenario("ddrescue")
+        self.responder.fail = {"ddrescue": 1}
+        self.assertEqual(self.apply(stop_after=3), executor.EXIT_OK, self.out)
+        first = self.run_dir.run_id
+        self.responder.fail = {}
+
+        def killed(tail):
+            if "--formula" in tail and "pkgconf" in tail:
+                self.runners[-1].note_sigint()
+                return r.FakeResponse(exit=130)
+            return None
+        self.responder.hooks["upgrade"] = killed
+        self.assertEqual(self.apply(resume=first), executor.EXIT_ACTION, self.out)
+        del self.responder.hooks["upgrade"]
+        self.responder.log.clear()
+        self.assertEqual(self.apply(resume=first, stop_after=3), executor.EXIT_OK, self.out)
+        # The result of the first attempt does not hide the second: it is resumed against its own listing, in
+        # which pkgconf was upgraded already, so nothing is installed a second time.
+        self.assertIn("did not finish", self.out)
+        self.assertEqual(self.upgrades(), [["upgrade", "--formula", "pkgconf", "ddrescue"]])
+
+
 class InterruptTest(ApplyTest):
     """A Ctrl-C during phase 5: the services come back while their packages are still installed"""
 
@@ -879,19 +1045,18 @@ class HelperTest(unittest.TestCase):
                                     "/usr/local/bin/brew uninstall --cask virtualbox"])
 
     @staticmethod
-    def finished_run(target, packages, upgrade_all="false", last=8):
+    def finished_run(target, packages, last=8, homebrew=False):
         """Return a run that has finished, as far as the count of newer versions reads it
 
-        @param target       the target installation
-        @param packages     the packages of the run's last scan
-        @param upgrade_all  the plan's `upgrade_all` option
-        @param last         the plan's last phase
-        @returns            the run
+        @param target    the target installation
+        @param packages  the packages of the run's last scan
+        @param last      the plan's last phase
+        @param homebrew  whether the run's last scan finds a Homebrew
+        @returns         the run
         """
-        plan = mock.Mock(phases=[model.Phase(3, "install", [], True), model.Phase(last, "last", [], False)],
-                         options={"upgrade_all": upgrade_all})
+        plan = mock.Mock(phases=[model.Phase(3, "install", [], True), model.Phase(last, "last", [], False)])
         return mock.Mock(plan=plan, target=target, bundle=mock.Mock(result=mock.Mock(packages=packages)),
-                         runner=mock.Mock(host_arch="arm64"))
+                         runner=mock.Mock(host_arch="arm64"), homebrew_present=homebrew)
 
     def test_what_still_has_a_newer_version_is_counted_after_the_run(self):
         brew = make_instance(model.Manager.BREW, "/opt/homebrew", binary="/opt/homebrew/bin/brew", arch="arm64")
@@ -900,10 +1065,11 @@ class HelperTest(unittest.TestCase):
                     make_package("wget", "formula", "/opt/homebrew"),
                     make_package("node", "formula", "/opt/homebrew", outdated=True, pinned=True),
                     make_package("curl", "port", "/opt/local", outdated=True)]
-        # Counted: what `brew upgrade` upgrades in the target. A pinned formula and another installation are not.
-        self.assertEqual(executor.newer(self.finished_run(brew, packages)), (2, "/opt/homebrew/bin/brew upgrade"))
-        # A plan made with --upgrade-all upgraded them itself, and a run without phase 8 took no count.
-        self.assertIsNone(executor.newer(self.finished_run(brew, packages, upgrade_all="true")))
+        # Named: what `brew upgrade` upgrades in the target. A pinned formula and another installation are not;
+        # the pin is told apart, as that command upgrades what the pinned formula uses.
+        self.assertEqual(executor.newer(self.finished_run(brew, packages)),
+                         (["jq", "firefox"], "/opt/homebrew/bin/brew upgrade", True))
+        # A run without phase 8 took no count, and a count of nothing is not said.
         self.assertIsNone(executor.newer(self.finished_run(brew, packages, last=5)))
         self.assertIsNone(executor.newer(self.finished_run(brew, packages[2:3])))
 
@@ -911,12 +1077,15 @@ class HelperTest(unittest.TestCase):
         intel = make_instance(model.Manager.BREW, "/usr/local", binary="/usr/local/bin/brew", arch="x86_64")
         outdated = [make_package("jq", "formula", "/usr/local", outdated=True)]
         self.assertEqual(executor.newer(self.finished_run(intel, outdated)),
-                         (1, "arch -x86_64 /usr/local/bin/brew upgrade"))
+                         (["jq"], "arch -x86_64 /usr/local/bin/brew upgrade", False))
         ports = make_instance(model.Manager.PORTS, "/opt/local", binary="/opt/local/bin/port")
         rows = [make_package("curl", "port", "/opt/local", outdated=True),
                 make_package("curl", "port", "/opt/local", outdated=True, active=False)]
         self.assertEqual(executor.newer(self.finished_run(ports, rows)),
-                         (1, "sudo /opt/local/bin/port upgrade outdated"))
+                         (["curl"], "sudo /opt/local/bin/port upgrade outdated", False))
+        # While a Homebrew is installed, MacPorts builds in trace mode, as the run's own builds do.
+        self.assertEqual(executor.newer(self.finished_run(ports, rows, homebrew=True)),
+                         (["curl"], "sudo /opt/local/bin/port -t upgrade outdated", False))
 
 
 if __name__ == "__main__":

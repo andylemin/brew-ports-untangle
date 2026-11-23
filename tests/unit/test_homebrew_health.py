@@ -384,8 +384,9 @@ class DependenciesAndTapsTest(HealthCase):
         issue = self.only("brew-pinned-formula")
         self.assertEqual((issue.severity, issue.title, issue.evidence),
                          (Severity.INFO, "wget is pinned: Homebrew does not upgrade it", ["a newer version exists"]))
-        self.assertEqual(self.fixes(issue), ["Nothing to do. A move that needs a newer version of a pinned formula "
-                                             "stops until you run `brew unpin` for it."])
+        self.assertEqual(self.fixes(issue), ["Nothing to do. `brew-ports plan` asks whether to remove the pin when it "
+                                             "is in the way of a move, and with --upgrade-all whenever the formula "
+                                             "has a newer version."])
 
     def test_unpinned_formula(self):
         self.formula("wget")

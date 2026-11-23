@@ -419,6 +419,50 @@ class LinkageTest(VerifyTest):
         result = self.check(plan)
         self.assertEqual(sorted(f.subject for f in result.failures if f.step == "linkage"), ["curl", "git"])
 
+    def upgrade(self, action_id, *words):
+        """Return a phase 3 upgrade of the target
+
+        @param action_id  the action's id
+        @param words      the words after `brew upgrade`
+        @returns          the action
+        """
+        assert self.brew.binary is not None
+        return Action(action_id=action_id, kind="command", sudo=False, description="upgrade",
+                      argv=[self.brew.binary, "upgrade", *words], instance_prefix=self.brew.prefix)
+
+    def test_an_upgraded_app_is_not_read_as_a_formula(self):
+        plan = self.plan(phases=[Phase(3, "install", [self.upgrade("3.upgrade.casks", "--cask", "firefox"),
+                                                      self.upgrade("3.upgrade.others", "--formula", "pkgconf")],
+                                       False)])
+        self.assertEqual(verify.rebuilt_names(plan, self.brew.prefix), ["pkgconf"])
+
+    def test_a_break_under_an_added_upgrade_is_a_task(self):
+        # curl uses openssl@3, which a replacement needs. Only --upgrade-all upgrades pkgconf, which gawk uses.
+        binaries = {name: os.path.join(vb.keg(self.brew.prefix, name, "1.0", exes=[name]), "bin", name)
+                    for name in ("curl", "pkgconf", "gawk")}
+        self.host.info = vb.info([vb.formula("curl", ["1.0"], runtime=["openssl@3"]), vb.formula("pkgconf", ["1.0"]),
+                                  vb.formula("gawk", ["1.0"], runtime=["pkgconf"])])
+        for path in binaries.values():
+            self.host.refs[path] = [("LC_LOAD_DYLIB", "/nonexistent-bpu/lib/libgone.dylib")]
+        plan = self.plan(target_upgrades=["openssl@3", "pkgconf"], optional_upgrades=["pkgconf"],
+                         phases=[Phase(3, "install", [self.upgrade("3.upgrade.others", "--formula", "pkgconf")],
+                                       False)])
+        gone = "references /nonexistent-bpu/lib/libgone.dylib, which does not exist"
+        left = "left it without a library it needs"
+        brew = self.brew.binary
+        for gate in (True, False):
+            result = self.check(plan, gate=gate)
+            self.assertEqual([(f.subject, f.text) for f in result.failures if f.step == "linkage"],
+                             [("curl", f"{binaries['curl']} {gone}")])
+            self.assertEqual(result.tasks, {
+                "pkgconf": f"Install pkgconf again, because its upgrade, which --upgrade-all asked for, {left}: "
+                           f"{brew} reinstall --formula pkgconf",
+                "gawk": f"Install gawk again, because --upgrade-all upgraded a package it uses, which {left}: "
+                        f"{brew} reinstall --formula gawk"})
+            self.assertIn(("gawk", f"{binaries['gawk']} {gone} (for you to repair; the move does not need it)"),
+                          self.reports(result, "linkage"))
+        self.assertEqual(result.lines()[-3:], ["For you to do:"] + [f"  {task}" for task in result.tasks.values()])
+
     def test_a_package_none_of_whose_binaries_otool_reads_fails(self):
         binary = self.wget()
         git = vb.keg(self.brew.prefix, "git", "2.47.0", exes=["git", "scalar"])
@@ -650,6 +694,59 @@ class GateTest(VerifyTest):
         self.assertIn(f"rollback {self.run_dir.run_id}", result.failures[0].text)
         self.assertEqual(result.lines()[0], "gate: 2 failures")
         self.assertFalse([a for a in self.fake.actions if a.argv[0] == verify.ENV])
+
+    def test_a_package_lost_to_an_added_upgrade_is_a_task(self):
+        self.snapshot_json({"formulae": [vb.formula("pkgconf", ["2.4.0"]), vb.formula("ddrescue", ["1.28"])],
+                            "casks": [vb.cask("firefox")]})
+        vb.keg(self.brew.prefix, "ddrescue", "1.29", exes=["ddrescue"])
+        self.host.info = vb.info([vb.formula("ddrescue", ["1.29"], linked=False)])
+        plan = self.plan(target_upgrades=["pkgconf", "ddrescue"], optional_upgrades=["pkgconf", "ddrescue"],
+                         optional_casks=["firefox"])
+        result = self.check(plan, gate=True)
+        self.assertEqual(result.lines()[0], "gate: passed")
+        brew, where = self.brew.binary, f"Homebrew at {self.brew.prefix}"
+        left = "because its upgrade, which --upgrade-all asked for, left it"
+        self.assertEqual(result.tasks, {
+            "pkgconf": f"Install pkgconf again, {left} uninstalled in {where}: {brew} install --formula pkgconf",
+            "ddrescue": f"Link ddrescue again, {left} installed, but not linked into {where}: {brew} link ddrescue",
+            "the app firefox": f"Install the app firefox again, {left} uninstalled in {where}: "
+                               f"{brew} install --cask firefox"})
+        self.assertEqual(self.reports(result, "gate")[0], (
+            "pkgconf", f"is uninstalled in {where} after its upgrade (for you to repair; the move does not need it)"))
+        # The same losses stop the run when the move needs the packages.
+        needed = self.check(self.plan(target_upgrades=["pkgconf", "ddrescue"]), gate=True)
+        self.assertEqual([f.subject for f in needed.failures], ["pkgconf", "ddrescue", "firefox", "pkgconf"])
+        self.assertEqual(needed.tasks, {})
+
+    def test_a_port_lost_to_an_added_upgrade_names_the_port_command(self):
+        target = eb.instance(self.tmp, Manager.PORTS, "opt/local-target")
+        assert target.portdbpath is not None
+        binary = vb.macho(os.path.join(target.prefix, "bin", "jq"))
+        mb.make_registry(target.portdbpath, files=[(2, binary, None, 1, 1)], deps=[(2, "oniguruma")],
+                         ports=[mb.port(1, "gawk", "5.3.1", state="imaged"), mb.port(2, "jq", "1.8"),
+                                mb.port(3, "oniguruma", "6.9.9")])
+        self.host.refs[binary] = [("LC_LOAD_DYLIB", "/nonexistent-bpu/lib/libonig.5.dylib")]
+        sub = snapshot.ports_dir(self.run_dir, target.prefix)
+        os.makedirs(sub)
+        with open(os.path.join(sub, snapshot.INSTALLED), "w") as fh:
+            fh.write(snapshot.INSTALLED_HEADER + "\ngawk\t5.3.0_0\ttrue\t\ttrue\t24\nzlib\t1.3_0\ttrue\t\ttrue\t24\n"
+                     "jq\t1.8_0\ttrue\t\ttrue\t24\n")
+        plan = self.plan(instances=[target, self.ul], target=target, target_upgrades=["gawk", "zlib", "oniguruma"],
+                         optional_upgrades=["gawk", "zlib", "oniguruma"])
+        result = self.check(plan, gate=True, bundle=self.bundle([target, self.ul]))
+        self.assertEqual(result.lines()[0], "gate: passed")
+        port, where = f"sudo {target.binary}", f"MacPorts at {target.prefix}"
+        asked = "because its upgrade, which --upgrade-all asked for, left it"
+        # jq only uses a port of the option. A Homebrew is still installed, so a build runs in trace mode.
+        self.assertEqual(result.tasks, {
+            "jq": "Install jq again, because --upgrade-all upgraded a package it uses, which left it without a "
+                  f"library it needs: {port} -n -t upgrade --force jq",
+            "gawk": f"Switch gawk on again, {asked} stored in {where}, but switched off: {port} activate gawk",
+            "zlib": f"Install zlib again, {asked} uninstalled in {where}: {port} -t install zlib"})
+        # Once the Homebrew is gone, the same build runs without trace mode.
+        alone = self.check(plan, gate=True, bundle=self.bundle([target]))
+        self.assertEqual(alone.tasks["zlib"],
+                         f"Install zlib again, {asked} uninstalled in {where}: {port} install zlib")
 
     def test_formulae_list_stands_in_for_installed_json(self):
         sub = snapshot.brew_dir(self.run_dir, self.brew.prefix)
