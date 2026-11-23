@@ -326,6 +326,23 @@ def upgrade_formulae(instance: Instance, host_arch: str, action_id: str, names: 
                   on_failure=on_failure)
 
 
+def upgrade_casks(instance: Instance, host_arch: str, action_id: str, tokens: Sequence[str],
+                  on_failure: OnFailure = OnFailure.SPLIT) -> Action:
+    """Upgrade casks without `privileged_install`: `brew upgrade --cask <tokens...>`
+
+    Never without tokens: a bare `brew upgrade --cask` upgrades every outdated cask.
+
+    @param instance    the Homebrew instance
+    @param host_arch   the host's architecture, which decides the `arch` prefix
+    @param action_id   the action's `<phase>.<subject>.<step>` id
+    @param tokens      the cask tokens to upgrade
+    @param on_failure  what a failure of the command does
+    @returns           the action
+    """
+    return _batch(instance, host_arch, action_id, ["upgrade", "--cask"], tokens, description="upgrade casks",
+                  on_failure=on_failure)
+
+
 def uninstall_formulae(instance: Instance, host_arch: str, action_id: str, names: Sequence[str], *,
                        split_order: Sequence[str] | None = None,
                        on_failure: OnFailure = OnFailure.SPLIT) -> Action:

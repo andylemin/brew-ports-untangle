@@ -15,6 +15,7 @@ from .apply_report import MAKE_NEW_PLAN, NEW_PLAN
 from .context import Context
 from .exec_run import (DECLINED, EXIT_ACTION, EXIT_OK, EXIT_PREFLIGHT, EXIT_USAGE, EXIT_VERIFY, PLAN_FILE, SOURCE_BIN,
                        START, Run, Stop, module, phase6_prefixes)
+from .homebrew import actions as brew_actions
 from .model import Instance, Manager, Plan, is_recorded_as
 from .report import COMMAND_OF, at, counted, series, some, tilde, typed
 from .runner import ActionFailed, BaseRunner, EscalationFailed, Interrupted, PreflightError, command_runner
@@ -414,6 +415,30 @@ def uninstalled(run: Run) -> list[str]:
     return [prefix for prefix in run.removed if run.fresh_instance(prefix) is None]
 
 
+def newer(run: Run) -> tuple[int, str] | None:
+    """Return how many packages of the target still have a newer version, and the command that upgrades them
+
+    A pinned formula does not count: the command leaves it as it is.
+
+    @param run  the run, after its last scan
+    @returns    the count and the command as the user types it; None when the plan upgraded them itself, when
+                none has a newer version, or when phase 8 took no inventory to count them in
+    """
+    target = run.target
+    if (target is None or run.bundle is None or 8 not in phase_numbers(run.plan)
+            or run.plan.options.get("upgrade_all") == "true"):
+        return None
+    count = sum(1 for pkg in run.bundle.result.packages
+                if pkg.instance_prefix == target.prefix and pkg.outdated and not pkg.pinned
+                and (pkg.kind != "port" or pkg.active))
+    if not count:
+        return None
+    if target.manager is Manager.BREW:
+        argv = brew_actions.manual(target, "8.upgrade.manual", ["upgrade"], "", run.runner.host_arch).argv
+        return count, typed(argv, intel=True)
+    return count, typed([target.binary or os.path.join(target.prefix, "bin", "port"), "upgrade", "outdated"], True)
+
+
 def verify_phase(run: Run) -> None:
     """Run phase 8: `verify` over a fresh inventory; exit 5 on a failure
 
@@ -478,7 +503,7 @@ def run_phases(run: Run) -> None:
     if run.dry_run:
         lines = apply_report.dry_finished(None if run.resumed else run.ctx.args.plan, run_id, run.todo)
     else:
-        lines = apply_report.finished(run.plan, uninstalled(run), run_id, run.todo)
+        lines = apply_report.finished(run.plan, uninstalled(run), run_id, run.todo, newer(run))
     for line in lines:
         run.say(line)
 

@@ -429,18 +429,35 @@ def _apps(draft: Any) -> list[str]:
 
 
 def _upgrades(draft: Any) -> list[str]:
-    """Return the packages of the target that the replacements upgrade, with their versions and reasons
+    """Return the packages of the target that the move upgrades, with their versions
+
+    Those the replacements need come first, with the reason of each; then those that `--upgrade-all` adds, and
+    what it leaves as it is, with the command that upgrades each.
 
     @param draft  the planner's draft
     @returns      the lines; none without upgrades
     """
     ups = draft.upgrades
-    if ups is None or not ups.names:
+    if ups is None:
         return []
+    lines: list[str] = []
     rows = [(name, ups.versions.get(name, ""), ups.reasons.get(name, "") + (", pinned" if name in ups.pinned else ""))
-            for name in ups.names]
-    return ["", f"Upgrades in {at(draft.target)} that the replacements need"] + [
-        "  " + line for line in report.table(rows, ["package", "versions", "why"])]
+            for name in ups.names if name not in ups.others]
+    if rows:
+        lines += ["", f"Upgrades in {at(draft.target)} that the replacements need"] + [
+            "  " + line for line in report.table(rows, ["package", "versions", "why"])]
+    asked = ([(name, ups.versions.get(name, "")) for name in ups.others]
+             + [(f"{token} (app)", change) for token, change in ups.casks.items()])
+    if asked:
+        lines += ["", f"Other upgrades in {at(draft.target)}, as --upgrade-all asks"] + [
+            "  " + line for line in report.table(asked, ["package", "versions"])]
+    elif draft.upgrade_all:
+        lines += ["", f"--upgrade-all adds no upgrade: no other package of {at(draft.target)} has a newer version "
+                  "that it may install."]
+    left = list(ups.left.items()) + [(f"{token} (app)", why) for token, why in ups.left_casks.items()]
+    if left:
+        lines += ["", f"Not upgraded in {at(draft.target)}"] + [f"  {name}: {why}" for name, why in left]
+    return lines
 
 
 def _services(draft: Any) -> list[str]:

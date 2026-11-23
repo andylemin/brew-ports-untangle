@@ -96,6 +96,88 @@ class PortsUpgradesTest(PlannerCase):
         self.assertIn("1.3_0 (epoch 0) -> 1.3_1 (epoch 1)", self.text(outcome))
 
 
+class UpgradeAllTest(PlannerCase):
+    """`--upgrade-all`: every other outdated package of the target, and what it leaves as it is"""
+
+    def brew_host(self):
+        """Make a move of wget into a Homebrew with outdated formulae and apps, some of which have to stay
+
+        openssl@3 is a dependency of the replacement, pkgconf is needed by nothing, gnu-sed is pinned and uses
+        ddrescue, firefox is an app, and docker-desktop is an app whose installer asks for the password.
+        """
+        self.ports_source(port("wget", self.local, "1.25.0"))
+        prefix = self.path("opt", "homebrew")
+        self.brew_target(formula("openssl@3", prefix, version="3.5.0", outdated=True, requested=False),
+                         formula("pkgconf", prefix, version="2.4.0", outdated=True),
+                         formula("ddrescue", prefix, version="1.28", outdated=True),
+                         formula("gnu-sed", prefix, version="4.9", outdated=True, pinned=True, deps=["ddrescue"]),
+                         cask("firefox", prefix, version="140.0", outdated=True),
+                         cask("docker-desktop", prefix, outdated=True, privileged_install=True),
+                         payload=PAYLOAD, outdated_casks={"firefox": "141.0"},
+                         outdated_formulae={"openssl@3": "3.6.0", "pkgconf": "2.5.1", "ddrescue": "1.29",
+                                            "gnu-sed": "4.10"})
+
+    def test_without_the_option_only_what_the_replacements_need(self):
+        self.brew_host()
+        outcome = self.plan()
+        self.assert_exit(outcome, 0)
+        self.assertEqual(outcome.plan.target_upgrades, ["openssl@3"])
+        self.assertEqual([i for i in ids(outcome.plan, 3) if i.startswith("3.upgrade")], [])
+        self.assertEqual(outcome.plan.options["upgrade_all"], "false")
+        self.assertNotIn("--upgrade-all", self.text(outcome))
+
+    def test_the_option_upgrades_every_other_formula_and_app(self):
+        self.brew_host()
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        plan, brew = outcome.plan, self.target.binary
+        acts = {a.action_id: a for a in actions(plan, 3)}
+        # The formulae go into the one upgrade command, whose packages are checked afterwards; the apps follow.
+        self.assertEqual(acts["3.upgrade.formulae"].argv[2:], [brew, "upgrade", "--formula", "openssl@3", "pkgconf"])
+        self.assertEqual(acts["3.upgrade.casks"].argv[2:], [brew, "upgrade", "--cask", "firefox"])
+        self.assertEqual(list(acts)[:2], ["3.upgrade.formulae", "3.upgrade.casks"])
+        self.assertEqual(plan.target_upgrades, ["openssl@3", "pkgconf"])
+        self.assertEqual(plan.options["upgrade_all"], "true")
+        at_target = f"Homebrew at {self.target.prefix}"
+        text = self.text(outcome)
+        self.assertIn(f"\nOther upgrades in {at_target}, as --upgrade-all asks\n", text)
+        self.assertRegex(text, r"\n  pkgconf +2\.4\.0 -> 2\.5\.1\n  firefox \(app\) +140\.0 -> 141\.0\n")
+        self.assertIn(f"\nNot upgraded in {at_target}\n"
+                      "  ddrescue: gnu-sed, which you pinned, uses it. To upgrade it all the same: "
+                      f"`{brew} upgrade --formula ddrescue`\n"
+                      f"  gnu-sed: you pinned it. To upgrade it: `{brew} unpin gnu-sed`, then `{brew} upgrade "
+                      "--formula gnu-sed`\n"
+                      "  docker-desktop (app): it asks for your password. To upgrade it: "
+                      f"`{brew} upgrade --cask docker-desktop`\n", text)
+        # What the replacements need keeps its own table, with the reason of each.
+        self.assertRegex(text, r"\n  openssl@3 +3\.5\.0 -> 3\.6\.0 +a dependency of wget\n")
+
+    def test_the_option_says_so_when_it_adds_nothing(self):
+        self.ports_source(port("wget", self.local, "1.25.0"))
+        self.brew_target(formula("pkgconf", self.path("opt", "homebrew"), version="2.5.1"), payload=PAYLOAD)
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        self.assertIn(f"\n--upgrade-all adds no upgrade: no other package of Homebrew at {self.target.prefix} has a "
+                      "newer version that it may install.\n", self.text(outcome))
+
+    def test_a_macports_target_upgrades_each_outdated_port(self):
+        self.brew_source(formula("wget", self.usr_local, version="1.25.0"))
+        self.ports_target(port("wget", self.local, "1.24.5", outdated=True),
+                          port("zlib", self.local, "1.3", outdated=True, requested=False),
+                          port("curl", self.local, "8.16.0", outdated=True), port("pipx", self.local, "1.18.11"))
+        upgrades = [i for i in ids(self.plan().plan, 3) if i.startswith("3.upgrade")]
+        self.assertEqual(upgrades, ["3.upgrade.wget"])
+        outcome = self.plan(upgrade_all=True)
+        self.assert_exit(outcome, 0)
+        acts = {a.action_id: a for a in actions(outcome.plan, 3)}
+        self.assertEqual([i for i in acts if i.startswith("3.upgrade")],
+                         ["3.upgrade.wget", "3.upgrade.curl", "3.upgrade.zlib"])
+        self.assertEqual(acts["3.upgrade.curl"].argv[-3:], ["upgrade", "--no-rev-upgrade", "curl"])
+        self.assertNotEqual(acts["3.upgrade.curl"].on_failure, OnFailure.STOP)
+        self.assertEqual(outcome.plan.target_upgrades, ["wget", "curl", "zlib"])
+        self.assertIn(f"\nOther upgrades in MacPorts at {self.local}, as --upgrade-all asks\n", self.text(outcome))
+
+
 class Phase3BrewTest(PlannerCase):
     """The phase 3 actions of a Homebrew target"""
 

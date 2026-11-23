@@ -77,6 +77,16 @@ class WordsTest(unittest.TestCase):
                                   "stay)")
         self.assertNotIn("For you to do:", kept)
 
+    def test_the_closing_lines_name_what_still_has_a_newer_version(self):
+        lines = apply_report.finished(self.plan, [], "r1", [], (12, "brew upgrade"))
+        self.assertEqual(lines[-2:], [
+            "12 packages of Homebrew at /opt/homebrew have a newer version, which this move did not install. To "
+            "upgrade them: brew upgrade",
+            "Next: open a new Terminal window, which finds the moved commands and reads any edited shell file."])
+        one = apply_report.finished(self.plan, [], "r1", [], (1, "brew upgrade"))
+        self.assertEqual(one[-2], "1 package of Homebrew at /opt/homebrew has a newer version, which this move did "
+                                  "not install. To upgrade it: brew upgrade")
+
     def test_a_run_that_ends_early_keeps_the_tasks_and_the_undo(self):
         self.assertEqual(apply_report.leftovers(self.plan, [], "r1", ["Start dbus yourself."]), [
             "For you to do:", "  Start dbus yourself.",

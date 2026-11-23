@@ -88,6 +88,7 @@ class PlanOptions:
     casks: str | None = None                            # keep, drop or map; None: the default keep, not given
     lang_packages: str = "report"                          # pipx with --pipx
     start_services: bool = False
+    upgrade_all: bool = False                              # upgrade every outdated package of the target
     keep_managers: bool = False                            # uninstall no old installation
     delete: list[str] = field(default_factory=list)        # the old installations to delete whatever their state
     repology: bool = False
@@ -106,6 +107,7 @@ class PlanOptions:
                    keep=split_names(args.keep), drop=split_names(args.drop), maps=list(args.map or []),
                    accept_medium=args.accept_medium, yes=args.yes, casks=args.casks,
                    lang_packages=args.lang_packages, start_services=args.start_services,
+                   upgrade_all=args.upgrade_all,
                    keep_managers=args.keep_managers, delete=split_names(args.delete), repology=args.repology,
                    refresh=args.refresh, out=args.out, rescan=args.rescan)
 
@@ -128,7 +130,8 @@ class PlanOptions:
                 "keep": ",".join(self.keep), "drop": ",".join(self.drop), "map": ",".join(self.maps),
                 "accept_medium": _flag(self.accept_medium), "yes": _flag(self.yes), "casks": self.cask_policy,
                 "casks_explicit": _flag(self.casks is not None), "lang_packages": self.lang_packages,
-                "start_services": _flag(self.start_services), "remove_manager": ",".join(removed),
+                "start_services": _flag(self.start_services), "upgrade_all": _flag(self.upgrade_all),
+                "remove_manager": ",".join(removed),
                 "keep_managers": _flag(self.keep_managers), "delete": ",".join(self.delete),
                 "repology": _flag(self.repology), "refresh": _flag(self.refresh), "out": self.out or ""}
 
@@ -225,6 +228,7 @@ class Draft:
     only: bool = False                                      # --only: a move of the named packages
     accept_closest: bool = False                            # --accept-closest
     start_services: bool = False                            # --start-services
+    upgrade_all: bool = False                               # --upgrade-all
     pipx: bool = False                                      # --pipx
     nothing: list[str] = field(default_factory=list)        # why there is nothing to plan, which is no error
     installed: set[str] = field(default_factory=set)        # the names of the target's active packages
@@ -315,7 +319,8 @@ class _Composer:
         self.host_arch = runner.host_arch
         self.environ: dict[str, str] = dict(runner.environ)
         self.draft = Draft(only=bool(options.only), accept_closest=options.accept_medium,
-                           start_services=options.start_services, pipx=options.lang_packages == "pipx")
+                           start_services=options.start_services, pipx=options.lang_packages == "pipx",
+                           upgrade_all=options.upgrade_all)
         self.sources: list[Instance] = []
         self.graphs: dict[str, SourceGraph] = {}
         self.maps: dict[str, str] = {}
@@ -1007,14 +1012,15 @@ class _Composer:
         self.draft.notes += remaining
         return rebuild
 
-    def outdated(self) -> dict[str, str]:
-        """Return the target's outdated formulae with the versions `brew outdated` names
+    def outdated(self, casks: bool = False) -> dict[str, str]:
+        """Return the target's outdated formulae, or casks, with the versions `brew outdated` names
 
-        @returns  the version each formula upgrades to, by name; empty for a MacPorts target
+        @param casks  return the casks, not the formulae
+        @returns      the version each one upgrades to, by name; empty for a MacPorts target
         """
         for inst, _, inv in self.bundle.brew:
             if inst.prefix == self.target.prefix:
-                return dict(inv.outdated_formulae)
+                return dict(inv.outdated_casks if casks else inv.outdated_formulae)
         return {}
 
     def finish(self) -> None:
@@ -1026,6 +1032,8 @@ class _Composer:
         repaired = [i.subject for i in repairs if i.code in plan_phases.REINSTALL_CODES and i.subject]
         rebuild = [n for n in self.rebuilds() if view.key(n) not in {view.key(r) for r in repaired}]
         ups = plan_phases.upgrades(view, targets, repaired + rebuild, self.outdated())
+        if self.options.upgrade_all:
+            plan_phases.every_upgrade(view, self.host_arch, ups, self.outdated(), self.outdated(casks=True))
         self.draft.upgrades = ups
         refusals = list(self.sets.refusals) + self.refusals
         for name, roots in sorted(ups.pinned.items()):
@@ -1038,11 +1046,11 @@ class _Composer:
         items, projects = plan_phases.installs(mappings)
         if self.manager is Manager.BREW:
             phase3 = plan_phases.phase3_brew(view, self.host_arch, items, projects=projects, explicit=ups.explicit,
-                                             rebuilds=rebuild)
+                                             rebuilds=rebuild, casks=list(ups.casks))
         else:
             homebrew = any(i.manager is Manager.BREW for i in self.result.instances)
             phase3 = plan_phases.phase3_ports(view, self.host_arch, items, projects=projects, homebrew_present=homebrew,
-                                              rebuilds=rebuild)
+                                              rebuilds=rebuild, others=ups.others)
         survivors = [i for i in self.result.instances if i not in self.removed]
         phase6 = plan_phases.phase6(self.removed, self.target, self.result.services, self.environ, survivors)
         phases = plan_phases.assemble(plan_phases.phase2(repairs), phase3, phase6, bool(self.removed))

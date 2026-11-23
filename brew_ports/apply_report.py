@@ -175,13 +175,16 @@ def leftovers(plan: Plan, removed: Sequence[str], run_id: str, todo: Sequence[st
     return tasks(todo) + [undo, "Report: report.md in the run folder, with every command that ran in commands.log."]
 
 
-def finished(plan: Plan, removed: Sequence[str], run_id: str, todo: Sequence[str]) -> list[str]:
+def finished(plan: Plan, removed: Sequence[str], run_id: str, todo: Sequence[str],
+             newer: tuple[int, str] | None = None) -> list[str]:
     """Return the closing lines of a run that finished: what was done, what is left to the user, undo, next
 
     @param plan     the plan
     @param removed  the prefixes of the old installations phase 6 uninstalled
     @param run_id   the run's id
     @param todo     what is left for the user to do, each task once
+    @param newer    how many packages of the target have a newer version that the move did not install, with the
+                    command that upgrades them; None when there is nothing to say of that
     @returns        the lines
     """
     moved = len(plan.mappings)
@@ -192,8 +195,15 @@ def finished(plan: Plan, removed: Sequence[str], run_id: str, todo: Sequence[str
             done.append(f"{named(plan, [prefix])} uninstalled")
         elif kinds:
             done.append(f"{report.by_kind(kinds)} uninstalled from {named(plan, [prefix])}")
-    return ["", f"Finished: {'; '.join(done)}." if done else "Finished."] + leftovers(plan, removed, run_id, todo) + [
-        "Next: open a new Terminal window, which finds the moved commands and reads any edited shell file."]
+    upgrade = []
+    if newer is not None:
+        count, command = newer
+        upgrade = [f"{counted(count, 'package')} of {named(plan, [plan.target_prefix])} "
+                   f"{'has' if count == 1 else 'have'} a newer version, which this move did not install. To upgrade "
+                   f"{'it' if count == 1 else 'them'}: {command}"]
+    return (["", f"Finished: {'; '.join(done)}." if done else "Finished."] + leftovers(plan, removed, run_id, todo)
+            + upgrade
+            + ["Next: open a new Terminal window, which finds the moved commands and reads any edited shell file."])
 
 
 def dry_finished(plan_file: str | None, run_id: str | None, todo: Sequence[str] = ()) -> list[str]:

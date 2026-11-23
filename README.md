@@ -129,6 +129,7 @@ The main `plan` options:
 | `--keep-managers` | Do not uninstall the old Homebrew or MacPorts that the move leaves empty. |
 | `--delete PATH,…` | After the move, delete an old installation whole, although its command cannot run. |
 | `--start-services` | Start the replacements of the services that were running. |
+| `--upgrade-all` | Also upgrade every other package that has a newer version in the installation the packages move into. A pinned formula and an app that asks for your password stay as they are; the plan lists them with the command that upgrades each. |
 | `--repology` | Ask repology.org about packages the offline catalogs cannot match. |
 | `--refresh` | Update the target's catalog (`brew update`, `port sync`) first. |
 

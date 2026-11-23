@@ -878,6 +878,46 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(run.todo, ["Uninstall the app virtualbox yourself, because Homebrew asks for your password: "
                                     "/usr/local/bin/brew uninstall --cask virtualbox"])
 
+    @staticmethod
+    def finished_run(target, packages, upgrade_all="false", last=8):
+        """Return a run that has finished, as far as the count of newer versions reads it
+
+        @param target       the target installation
+        @param packages     the packages of the run's last scan
+        @param upgrade_all  the plan's `upgrade_all` option
+        @param last         the plan's last phase
+        @returns            the run
+        """
+        plan = mock.Mock(phases=[model.Phase(3, "install", [], True), model.Phase(last, "last", [], False)],
+                         options={"upgrade_all": upgrade_all})
+        return mock.Mock(plan=plan, target=target, bundle=mock.Mock(result=mock.Mock(packages=packages)),
+                         runner=mock.Mock(host_arch="arm64"))
+
+    def test_what_still_has_a_newer_version_is_counted_after_the_run(self):
+        brew = make_instance(model.Manager.BREW, "/opt/homebrew", binary="/opt/homebrew/bin/brew", arch="arm64")
+        packages = [make_package("jq", "formula", "/opt/homebrew", outdated=True),
+                    make_package("firefox", "cask", "/opt/homebrew", outdated=True),
+                    make_package("wget", "formula", "/opt/homebrew"),
+                    make_package("node", "formula", "/opt/homebrew", outdated=True, pinned=True),
+                    make_package("curl", "port", "/opt/local", outdated=True)]
+        # Counted: what `brew upgrade` upgrades in the target. A pinned formula and another installation are not.
+        self.assertEqual(executor.newer(self.finished_run(brew, packages)), (2, "/opt/homebrew/bin/brew upgrade"))
+        # A plan made with --upgrade-all upgraded them itself, and a run without phase 8 took no count.
+        self.assertIsNone(executor.newer(self.finished_run(brew, packages, upgrade_all="true")))
+        self.assertIsNone(executor.newer(self.finished_run(brew, packages, last=5)))
+        self.assertIsNone(executor.newer(self.finished_run(brew, packages[2:3])))
+
+    def test_the_upgrade_command_is_the_one_that_works_when_copied(self):
+        intel = make_instance(model.Manager.BREW, "/usr/local", binary="/usr/local/bin/brew", arch="x86_64")
+        outdated = [make_package("jq", "formula", "/usr/local", outdated=True)]
+        self.assertEqual(executor.newer(self.finished_run(intel, outdated)),
+                         (1, "arch -x86_64 /usr/local/bin/brew upgrade"))
+        ports = make_instance(model.Manager.PORTS, "/opt/local", binary="/opt/local/bin/port")
+        rows = [make_package("curl", "port", "/opt/local", outdated=True),
+                make_package("curl", "port", "/opt/local", outdated=True, active=False)]
+        self.assertEqual(executor.newer(self.finished_run(ports, rows)),
+                         (1, "sudo /opt/local/bin/port upgrade outdated"))
+
 
 if __name__ == "__main__":
     unittest.main()

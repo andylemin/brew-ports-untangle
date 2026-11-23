@@ -112,6 +112,9 @@ def _add_plan(sub: Any, common: argparse.ArgumentParser) -> None:
                         "pypi.org; by default they are only listed")
     p.add_argument("--start-services", action="store_true",
                    help="start the replacement of each service that was running")
+    p.add_argument("--upgrade-all", action="store_true",
+                   help="also upgrade every other package that has a newer version in the installation the packages "
+                        "move into; a pinned formula and an app that asks for your password stay as they are")
     p.add_argument("--keep-managers", action="store_true",
                    help="do not uninstall the old Homebrew or MacPorts that the move leaves empty")
     p.add_argument("--delete", action="append", metavar="PATH[,PATH...]",
