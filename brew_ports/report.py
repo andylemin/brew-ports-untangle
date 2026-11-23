@@ -8,6 +8,7 @@ import pwd
 import re
 import shlex
 import sys
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from typing import Any, TextIO
 
@@ -18,6 +19,7 @@ NAMES_SHOWN = 8                         # names of one list a sentence gives bef
 ARCH_NAMES = {"arm64": "Apple Silicon", "x86_64": "Intel"}
 COMMAND_OF = {model.Manager.BREW: "brew", model.Manager.PORTS: "port"}
 MANAGER_NAMES = {model.Manager.BREW: "Homebrew", model.Manager.PORTS: "MacPorts"}
+KIND_NOUNS = {"formula": ("formula", "formulae"), "cask": ("cask", "casks"), "port": ("port", "ports")}
 
 
 # The reader's words ---------------------------------------------------------------------
@@ -71,6 +73,16 @@ def counted(number: int, noun: str, plural: str | None = None) -> str:
     @returns       such as `1 port` or `1,240 files`
     """
     return f"{number:,} {noun if number == 1 else plural or noun + 's'}"
+
+
+def by_kind(kinds: Iterable[str]) -> str:
+    """Return how many packages a list holds, by kind
+
+    @param kinds  the kind of each package: `formula`, `cask` or `port`
+    @returns      such as `40 formulae, 2 casks`; empty for none
+    """
+    counts = Counter(kinds)
+    return ", ".join(counted(counts[kind], *nouns) for kind, nouns in KIND_NOUNS.items() if counts[kind])
 
 
 def some(names: Iterable[str], limit: int = NAMES_SHOWN) -> str:
@@ -140,6 +152,19 @@ def typed(argv: Sequence[str], sudo: bool = False, path: str | None = None) -> s
     if words and os.path.isabs(words[0]) and _on_path(words[0], os.environ.get("PATH", "") if path is None else path):
         words[0] = os.path.basename(words[0])
     return shlex.join((["sudo"] if sudo else []) + words)
+
+
+def cut(text: str, width: int) -> str:
+    """Return a command cut at a word when it is longer than a line shows
+
+    @param text   the command
+    @param width  how many characters a command may have
+    @returns      the command; a cut one ends with how many words were left out and what shows them
+    """
+    if len(text) <= width:
+        return text
+    words = text[:width].rsplit(" ", 1)[0]
+    return f"{words} ... ({counted(len(text.split()) - len(words.split()), 'more word')}; --verbose shows all)"
 
 
 class Redactor:
@@ -214,6 +239,7 @@ class Console:
         self.quiet = quiet
         self.verbose = verbose
         self.silenced = False
+        self.echo = True         # print each escalated command before it runs; `apply` prints it with its result
         self.json_mode = False   # with --json, stdout carries the JSON alone and progress goes to stderr
         self.activity: Any = None   # the `progress.Activity` drawn on the terminal, which each write clears first
         self._redact = (redactor or Redactor()) if redact else _identity
@@ -279,11 +305,12 @@ class Console:
         self._write(self.err, f"brew-ports: {text}")
 
     def command(self, argv: Sequence[str]) -> None:
-        """Print an escalated command before it runs
+        """Print an escalated command before it runs, unless the command's own lines show it; `--verbose` always does
 
         @param argv  the whole command, `sudo` included
         """
-        self._write(self.err, "+ " + shlex.join(list(argv)))
+        if self.echo or self.verbose:
+            self._write(self.err, "+ " + shlex.join(list(argv)))
 
     def json(self, obj: Any) -> None:
         """Print a value as JSON on the output stream

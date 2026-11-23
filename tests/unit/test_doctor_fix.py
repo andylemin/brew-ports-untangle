@@ -473,7 +473,7 @@ class RemovalTest(FixTest):
         self.assertEqual(code, doctor.EXIT_ACTION)
         self.assertFalse(self.ran(self.uninstall))
         self.assertTrue(os.path.exists(self.plist))
-        self.assertIn(f"launchd still holds gui/501/{LABEL}", self.output())
+        self.assertIn(f"the service {LABEL} did not stop within", self.output())
         self.assertEqual(len(self.clock.sleeps), 30)                 # exit_timeout_s 20 + 10
 
     def test_a_package_that_stays_gets_its_service_back(self):

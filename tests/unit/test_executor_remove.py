@@ -97,7 +97,7 @@ class ExpandTest(TempDirTest):
         removal = self.expand_one(b.brew(prefix), [("cask", "docker-desktop"), ("cask-adopted", "newterm")],
                                   rooms=rooms)
         self.assertEqual((removal.casks, removal.adopted), (["docker"], ["oldterm"]))
-        self.assertEqual(removal.items(), ["cask-adopted oldterm", "cask docker"])
+        self.assertEqual(removal.items(), ["the record of the app oldterm", "cask docker"])
         self.assertEqual(removal.keys(), {(prefix, "cask", "docker-desktop"), (prefix, "cask", "newterm")})
 
     def python_removal(self):
@@ -136,7 +136,9 @@ class ExpandTest(TempDirTest):
         inst.inventory_known = False
         with self.assertRaises(executor.Stop) as caught:
             exec_remove.expand(self.stub(inst, [("port", "jq")]))
-        self.assertIn("nothing was removed", caught.exception.lines[0])
+        self.assertEqual(caught.exception.lines, [
+            f"MacPorts at {inst.prefix} has lost its record of what is installed, so what is left in it is unknown",
+            "  `brew-ports doctor` says how to repair it."])
 
 
 class RemovalTest(ApplyTest):
@@ -146,8 +148,16 @@ class RemovalTest(ApplyTest):
         self.scenario_brew()
         self.responder.keep = {"dnsmasq"}
         self.assertEqual(self.apply(), executor.EXIT_ACTION, self.out)
-        self.assertIn("phase 5 left 1 package(s) installed:", self.out)
-        self.assertIn(f"port dnsmasq @2.90_0 ({self.source.prefix})", self.out)
+        self.assertTrue(self.out.endswith(
+            "  Started the service org.macports.dnsmasq again.\n"
+            "brew-ports: 1 package could not be uninstalled\n"
+            f"    port dnsmasq @2.90_0 in MacPorts at {self.source.prefix}\n"
+            "  A package installed after the plan was made may need one of them, or an app may need your password to "
+            "be uninstalled.\n"
+            f"  Uninstall what holds them yourself, then continue with: brew-ports apply --resume "
+            f"{self.run_dir.run_id}\n"), self.out)
+        self.assertIn(f"  sudo {self.source.binary} -N uninstall dnsmasq @2.90_0 jq @1.7.1_0 oniguruma @6.9.9_0 ... "
+                      "failed (exit 1) for dnsmasq", self.out)
         uninstalls = self.responder.ran("port", "uninstall")
         self.assertEqual([u[3::2] for u in uninstalls], [["dnsmasq", "jq", "oniguruma"], ["dnsmasq"], ["jq"],
                                                           ["oniguruma"]])
@@ -155,14 +165,15 @@ class RemovalTest(ApplyTest):
         self.assertTrue(os.path.exists(self.plist))
         self.assertEqual(b.port_names(self.source.prefix), ["dnsmasq"])
         self.assertNotIn((5, "5.complete"), self.results())
-        self.assertIn("apply --resume", self.out)
+        self.assertEqual(self.out.count("apply --resume"), 1)
 
     def test_stuck_service_keeps_every_package(self):
         self.scenario_brew()
         self.responder.stuck = {"org.macports.dnsmasq"}
         self.assertEqual(self.apply(), executor.EXIT_ACTION, self.out)
-        self.assertIn("launchd still holds system/org.macports.dnsmasq after 30 s", self.out)
-        self.assertIn("a service did not stop: nothing was removed", self.out)
+        self.assertIn("brew-ports: the service org.macports.dnsmasq did not stop within 30 s\n"
+                      "  Nothing is uninstalled while it runs: stop it yourself, or quit what keeps it running.\n"
+                      f"  Continue with: brew-ports apply --resume {self.run_dir.run_id}\n", self.out)
         self.assertEqual(self.responder.ran("port", "uninstall"), [])
         self.assertEqual(b.port_names(self.source.prefix), ["dnsmasq", "jq", "oniguruma"])
 
@@ -200,8 +211,8 @@ class RemovalTest(ApplyTest):
                               removal={source: [("formula", "newname")]}))
         self.responder.keep = {"oldname"}
         self.assertEqual(self.apply(), executor.EXIT_ACTION, self.out)
-        self.assertIn("phase 5 left 1 package(s) installed:", self.out)
-        self.assertIn(f"formula oldname ({source})", self.out)
+        self.assertIn(f"brew-ports: 1 package could not be uninstalled\n    formula oldname in Homebrew at {source}\n",
+                      self.out)
         self.responder.keep = set()
         self.assertEqual(self.apply(resume=self.run_dir.run_id), executor.EXIT_OK, self.out)
         self.assertEqual(self.responder.ran("brew", "uninstall")[-1][1:],
@@ -220,8 +231,8 @@ class RemovalTest(ApplyTest):
         self.save_plan(b.plan(self.target, [self.source], removal={source: [("cask", "docker-desktop")]}))
         self.responder.keep = {"docker"}
         self.assertEqual(self.apply(), executor.EXIT_ACTION, self.out)
-        self.assertIn("phase 5 left 1 package(s) installed:", self.out)
-        self.assertIn(f"cask docker ({source})", self.out)
+        self.assertIn(f"brew-ports: 1 package could not be uninstalled\n    cask docker in Homebrew at {source}\n",
+                      self.out)
         self.responder.keep = set()
         self.assertEqual(self.apply(resume=self.run_dir.run_id), executor.EXIT_OK, self.out)
         self.assertEqual(self.responder.ran("brew", "uninstall")[-1][1:], ["uninstall", "--cask", "--force", "docker"])
@@ -270,8 +281,8 @@ class AdoptedRecordTest(ApplyTest):
                               mappings=[b.mapping(docker, "cask", "docker-desktop", version="4.40.0", adopt=True)],
                               removal={source: [("cask-adopted", "docker")]}))
         self.assertEqual(self.apply(dry_run=True), executor.EXIT_OK, self.out)
-        self.assertIn(f"5.adopted.docker: the target's Caskroom does not hold docker-desktop, so the record in "
-                      f"{source} stays", self.out)
+        self.assertIn(f"  The record of the app docker is deleted from Homebrew at {source} once the Homebrew that "
+                      "stays has taken the app over.\n", self.out)
         b.caskroom(target, "docker-desktop", "4.40.0")
         self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
         self.assertEqual(self.responder.ran("rm"), [[b.runner_mod.RM, "-rf", room]])
@@ -370,7 +381,10 @@ class LoginShellTest(ApplyTest):
     def test_missing_target_shell_stops_the_run(self):
         self.scenario_shell(executable=False)
         self.assertEqual(self.apply(), executor.EXIT_ACTION)
-        self.assertIn(f"the target has no executable {self.new_shell} to switch to: nothing was removed", self.out)
+        old = os.path.join(self.source.prefix, "bin", "zsh")
+        self.assertIn(f"brew-ports: your login shell {old} belongs to the package zsh that this run uninstalls, and "
+                      f"there is no {self.new_shell} to change to\n"
+                      "  Change your login shell yourself first, for example: chsh -s /bin/zsh\n", self.out)
         self.assertEqual(self.responder.ran("chsh"), [])
         self.assertEqual(self.responder.ran("port", "uninstall"), [])
         self.assertEqual(self.responder.ran("launchctl", "bootout"), [])

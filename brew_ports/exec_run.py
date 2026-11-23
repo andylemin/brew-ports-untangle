@@ -5,16 +5,16 @@ The journal is read as it stood when the start began, so the resume rule weighs 
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import Any
 
-from . import doctor, model, progress, report, scan, state, system
+from . import apply_report, model, plan_report, progress, report, scan, state, system
 from .context import Context
 from .model import Action, Instance, Manager, Phase, Plan, is_recorded_as
-from .plan_phases import PHASE_NAMES
 from .runner import ActionFailed, EscalationFailed, Interrupted, RootFiles
 
 EXIT_OK = 0
@@ -34,15 +34,18 @@ DECLINED = "6.declined"          # the journal's record of a no at phase 6: the 
 class Stop(Exception):
     """The run ends with `code` once `lines` are printed"""
 
-    def __init__(self, code: int, lines: Sequence[str]) -> None:
+    def __init__(self, code: int, lines: Sequence[str], error: bool = True) -> None:
         """Stop the run
 
         @param code   the exit code
-        @param lines  why the run stops, printed before it ends
+        @param lines  why the run stops, printed before it ends; an indented line continues the one above
+        @param error  whether something went wrong; False for a stop the user asked for, whose lines print as
+                      they are
         """
         super().__init__("; ".join(lines))
         self.code = code
         self.lines = list(lines)
+        self.error = error
 
 
 def phase6_prefixes(plan: Plan) -> list[str]:
@@ -91,6 +94,11 @@ class Run:
         self.environ = runner.environ
         self.home = self.environ.get("HOME") or os.path.expanduser("~")
         self.lines: list[str] = []
+        self.headings: set[int] = set()      # the indexes of the phase headings among `lines`
+        self.heading: str | None = None      # the heading of the running phase, until its first line prints
+        self.todo: list[str] = []            # what is left for the user to do, said once when the run ends
+        self.declined = False                # a no at phase 6 in this start
+        self.marking = True                  # whether a command that changes something touches the dirty marker
         self.touched = False
         self.bundle: Any = None              # the newest fresh scan
         self.bundles: list[Any] = []
@@ -121,10 +129,24 @@ class Run:
         original = self.runner.run
 
         def run(action: Action, defer_result: bool = False):
-            if not action.read_only:
+            if not action.read_only and self.marking:
                 self.touch()
             return original(action, defer_result=defer_result)
         self.runner.run = run
+
+    @contextlib.contextmanager
+    def unmarked(self) -> Iterator[None]:
+        """Let a block's commands run without touching the dirty marker
+
+        Phase 1 saves a record and changes nothing a plan describes, so a plan stays good after it.
+
+        @returns  a context manager for the block
+        """
+        self.marking = False
+        try:
+            yield
+        finally:
+            self.marking = True
 
     def touch(self) -> None:
         """Rewrite the dirty marker once per start, before the start's first change to the host"""
@@ -192,11 +214,25 @@ class Run:
 
     # Output -------------------------------------------------------------------------------------
 
+    def flush(self) -> None:
+        """Print the heading of the running phase, when it is still to come
+
+        A phase's heading comes with its first line, so a phase that has nothing to say prints nothing.
+        """
+        if self.heading is None:
+            return
+        heading, self.heading = self.heading, None
+        self.ctx.console.out("")
+        self.ctx.console.out(heading)
+        self.headings.add(len(self.lines) + 1)
+        self.lines += ["", heading]
+
     def say(self, text: str = "") -> None:
-        """Print a line and keep it for `report.md`
+        """Print a line, under its phase's heading, and keep it for `report.md`
 
         @param text  the line; empty for a blank line
         """
+        self.flush()
         self.ctx.console.out(text)
         self.lines.append(text)
 
@@ -208,50 +244,85 @@ class Run:
         self.ctx.console.warn(text)
         self.lines.append(text)
 
+    def error(self, text: str) -> None:
+        """Print an error under the tool's name and keep it for `report.md`
+
+        @param text  what went wrong
+        """
+        self.ctx.console.error(text)
+        self.lines.append(f"brew-ports: {text}")
+
     def header(self, number: int) -> None:
-        """Begin a phase: set the runner's phase and print the phase's heading
+        """Begin a phase: set the runner's phase and hold the phase's heading for its first line
 
         @param number  the phase number
         """
         self.runner.phase = number
-        self.say("")
-        self.say(f"== phase {number}: {PHASE_NAMES.get(number, '')}")
-        progress.step(f"phase {number}: {PHASE_NAMES.get(number, '')}")
+        self.heading = apply_report.heading(number, self.plan, self.removed)
+        progress.step(self.heading)
+
+    def command(self, action: Action) -> str:
+        """Return an action's command as the run shows it
+
+        @param action  the action
+        @returns       the command as the user would type it; a long one is cut unless `--verbose` is given
+        """
+        return plan_report.command(action, self.ctx.console.verbose)
 
     def show(self, action: Action, skipped: bool = False) -> None:
-        """Print an action's line, marked when an earlier attempt ran it with `ok`
+        """Print a command the phase is about to run, so that its question has something to ask about
+
+        A run under `--yes` asks nothing, so it prints each command once, with its result.
 
         @param action   the action
-        @param skipped  whether the resume rule skips the action
+        @param skipped  whether an earlier start ran the action, so this one does not
         """
-        mark = "  (ok in an earlier attempt: skipped)" if skipped else ""
-        self.say(f"  {action.action_id}: {doctor.describe(action)}{mark}")
+        if self.dry_run or not self.ctx.yes:
+            self.say(f"  {self.command(action)}{'   (done in an earlier attempt)' if skipped else ''}")
 
     def result_line(self, action: Action, result) -> None:
-        """Print an action's result: `ok`, or `failed` with the names that failed
+        """Print a command with its result: `ok`, or `failed` with the exit status, who failed and the error line
 
         @param action  the action
         @param result  its result
         """
         if result.ok:
-            self.say(f"  {action.action_id}: ok")
+            self.say(f"  {self.command(action)} ... ok")
             return
+        last = result.retry or result
         names = [n for n in result.failed if n != action.action_id]
-        failed = f" ({', '.join(names)})" if names else ""
-        self.say(f"  {action.action_id}: failed{failed}")
+        line = last.error_line()
+        self.say(f"  {self.command(action)} ... failed (exit {last.exit}){' for ' + ', '.join(names) if names else ''}"
+                 + (f": {line}" if line else ""))
 
-    def agreed(self, number: int, what: str = "") -> bool:
+    @property
+    def asks(self) -> bool:
+        """Return whether the run puts its questions to the user
+
+        @returns  False for a dry run, under `--yes` and without a terminal
+        """
+        return not self.dry_run and self.ctx.tty and not self.ctx.yes
+
+    def agreed(self, number: int, question: str = "", stops: str = "") -> bool:
         """Ask once before a phase marked `confirm` (`--yes` answers), and return the answer
 
-        @param number  the phase number
-        @param what    the text that follows the phase's name in the question
-        @returns       True for a yes, for a dry run and for a phase that asks nothing
+        The line above the question says what a no does.
+
+        @param number    the phase number
+        @param question  the question; empty for the phase's own
+        @param stops     what a no does; empty when it stops the run
+        @returns         True for a yes, for a dry run and for a phase that asks nothing
         """
         phase = self.phase(number)
         if self.dry_run or phase is None or not phase.confirm:
             return True
-        question = f"Run phase {number} ({phase.name or PHASE_NAMES.get(number, '')}){what}?"
-        if not self.ctx.confirm(question, default=False):
+        question = question or apply_report.QUESTIONS[number]
+        if self.asks:
+            self.say("  " + (stops or apply_report.stops_here(self.run_dir.run_id)))
+        answer = self.ctx.confirm(question, default=False)
+        if self.asks:
+            self.lines.append(f"{question} (y/n) [n] {'y' if answer else 'n'}")
+        if not answer:
             return False
         self.runner.check_interrupt()
         return True
@@ -260,28 +331,36 @@ class Run:
         """Return the stop of a phase that was not confirmed
 
         @param number  the phase number
-        @returns       the stop, exit 4
+        @returns       the stop, exit 4: the user's own no, or the error of a question nobody can answer
         """
-        why = "" if self.ctx.tty else " (no terminal: --yes answers every phase)"
-        return Stop(EXIT_ACTION, [f"phase {number} was not confirmed{why}; the run stops here"])
+        if self.ctx.tty:
+            return Stop(EXIT_ACTION, apply_report.declined(number, self.run_dir.run_id), error=False)
+        return Stop(EXIT_ACTION, apply_report.unanswered(number, self.run_dir.run_id))
 
-    def confirm(self, number: int, what: str = "") -> None:
+    def confirm(self, number: int) -> None:
         """Ask once before a phase marked `confirm` (`--yes` answers); a "no" stops the run
 
         @param number  the phase number
-        @param what    the text that follows the phase's name in the question
         @throws Stop   exit 4 when the answer is no
         """
-        if not self.agreed(number, what):
+        if not self.agreed(number):
             raise self.unconfirmed(number)
 
     @property
     def managers_stay(self) -> bool:
-        """Return whether an earlier start was told to leave the old managers installed (a no at phase 6)
+        """Return whether the user answered no at phase 6, in this start or an earlier one
 
-        @returns  True once the journal holds the answer
+        @returns  True once the answer is given; the journal keeps it for a later start
         """
-        return any(e.get("action_id") == DECLINED for e in self.entries)
+        return self.declined or any(e.get("action_id") == DECLINED for e in self.entries)
+
+    @property
+    def removed(self) -> list[str]:
+        """Return the prefixes of the old installations phase 6 uninstalls
+
+        @returns  the prefixes the plan names; none once the user answered no at phase 6
+        """
+        return [] if self.managers_stay else phase6_prefixes(self.plan)
 
     # The plan and the host ----------------------------------------------------------------------
 
@@ -424,9 +503,6 @@ class Run:
 
     def write_report(self) -> None:
         """Write `report.md`, always redacted"""
-        lines = [f"# brew-ports apply {self.run_dir.run_id}", "",
-                 f"plan: {self.plan_path}",
-                 f"target: {self.plan.target.value} {self.plan.target_prefix}"]
-        for line in self.lines:
-            lines.append("## " + line[3:] if line.startswith("== ") else line)
+        lines = [f"# brew-ports apply {self.run_dir.run_id}", "", f"Plan: {self.plan_path}", ""]
+        lines += ["## " + line if index in self.headings else line for index, line in enumerate(self.lines)]
         report.write_markdown(self.run_dir.sub(REPORT_FILE), lines, report.Redactor(home=self.home, user=self.user))

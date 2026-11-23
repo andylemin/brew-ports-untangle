@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import shlex
-from collections import Counter
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -16,7 +15,7 @@ from .report import COMMAND_OF, at, counted, manager_name, place, some, tilde
 
 EVIDENCE_LINES = 3
 COMMAND_WIDTH = 110                 # a command longer than this is cut in the default report
-KIND_NOUNS = {"formula": ("formula", "formulae"), "cask": ("cask", "casks"), "port": ("port", "ports")}
+PATHS_SHOWN = 4                     # paths of phase 6 that one line names before "and N more"
 INSTALL_KINDS = ("formula", "cask", "port")
 MATCH_WORDS = {Confidence.EXACT: "same package", Confidence.HIGH: "known equivalent",
                Confidence.MEDIUM: "closest match", Confidence.LOW: "similar name"}
@@ -35,9 +34,7 @@ def holdings(units: Iterable[Any], inst: Any, unreadable: Iterable[str] = ()) ->
     """
     if not inst.inventory_known or inst.prefix in unreadable:
         return "its packages are unknown"
-    kinds = Counter(u.kind for u in units if u.prefix == inst.prefix)
-    parts = [counted(kinds[kind], *KIND_NOUNS[kind]) for kind in INSTALL_KINDS if kinds[kind]]
-    return ", ".join(parts) or "no packages"
+    return report.by_kind(u.kind for u in units if u.prefix == inst.prefix) or "no packages"
 
 
 def overview(draft: Any) -> list[str]:
@@ -344,8 +341,7 @@ def _packages(pairs: Sequence[plan_sets.Pair]) -> str:
     @param pairs  `(kind, name)` pairs, without adopted casks
     @returns      such as `91 ports` or `40 formulae, 2 casks`
     """
-    kinds = Counter(kind for kind, _ in pairs)
-    return ", ".join(counted(kinds[kind], *KIND_NOUNS[kind]) for kind in INSTALL_KINDS if kinds[kind])
+    return report.by_kind(kind for kind, _ in pairs)
 
 
 def _by_kind(pairs: Iterable[plan_sets.Pair]) -> list[plan_sets.Pair]:
@@ -494,18 +490,15 @@ def _language(draft: Any) -> list[str]:
     return ["", title] + [f"  {tilde(path)}" for _, path in sorted(draft.language_files.items())]
 
 
-def _command(action: Any, whole: bool) -> str:
-    """Return a planned command as the report shows it
+def command(action: Any, whole: bool) -> str:
+    """Return a command as `plan` and `apply` show it
 
     @param action  the action
     @param whole   show the command whole, however long it is
     @returns       the command as the user would type it, cut at a word when it is long
     """
     text = doctor.describe(action)
-    if whole or len(text) <= COMMAND_WIDTH:
-        return text
-    words = text[:COMMAND_WIDTH].rsplit(" ", 1)[0]
-    return f"{words} ... ({counted(len(text.split()) - len(words.split()), 'more word')}; --verbose shows all)"
+    return text if whole else report.cut(text, COMMAND_WIDTH)
 
 
 def _uninstall_steps(draft: Any, phase: Phase) -> list[str]:
@@ -517,14 +510,36 @@ def _uninstall_steps(draft: Any, phase: Phase) -> list[str]:
     """
     lines = []
     for inst in draft.removed:
-        mine = [action for action in phase.actions if action.instance_prefix == inst.prefix]
-        saved =["/" + action.argv[-1] for action in mine if action.action_id.startswith("6.archive.")]
-        deleted = [action.argv[-1] for action in mine if action.action_id.startswith("6.delete.")]
-        steps = ([f"save {some(saved, 4)} in the run folder"] if saved else []) + (
-            [f"delete {some(deleted, 4)}"] if deleted else [])
-        lines.append(f"  6  Uninstall {at(inst)}" + (f": {', then '.join(steps)}" if steps else ""))
-        lines += [f"       {action.description}" for action in mine if ".skipped." in action.action_id]
+        steps, stays = uninstall_steps(phase.actions, inst.prefix)
+        lines.append(f"  6  Uninstall {at(inst)}" + (f": {steps}" if steps else ""))
+        lines += [f"       {line}" for line in stays]
     return lines
+
+
+def uninstall_steps(actions: Iterable[Any], prefix: str) -> tuple[str, list[str]]:
+    """Return what the plan's preview of phase 6 does to one old installation
+
+    @param actions  the actions of phase 6
+    @param prefix   the installation's prefix
+    @returns        what is saved and then deleted, as one phrase that is empty for neither, and a line for each
+                    path that stays
+    """
+    mine = [action for action in actions if action.instance_prefix == prefix]
+    saved, deleted = saved_and_deleted(mine)
+    steps = ([f"save {some(saved, PATHS_SHOWN)} in the run folder"] if saved else []) + (
+        [f"delete {some(deleted, PATHS_SHOWN)}"] if deleted else [])
+    return ", then ".join(steps), [action.description for action in mine if ".skipped." in action.action_id]
+
+
+def saved_and_deleted(actions: Iterable[Any]) -> tuple[list[str], list[str]]:
+    """Return the paths that a preview of phase 6 saves and the paths it deletes
+
+    @param actions  preview actions of phase 6
+    @returns        the saved paths, then the deleted ones, in plan order
+    """
+    actions = list(actions)
+    return (["/" + action.argv[-1] for action in actions if action.action_id.startswith("6.archive.")],
+            [action.argv[-1] for action in actions if action.action_id.startswith("6.delete.")])
 
 
 def _steps(draft: Any, verbose: bool) -> list[str]:
@@ -553,7 +568,7 @@ def _steps(draft: Any, verbose: bool) -> list[str]:
         if number == 5 and running:
             name += f", after stopping {counted(len(running), 'service')}"
         lines.append(f"  {number}  {name}")
-        commands = [_command(action, verbose) for action in phase.actions if action.kind == "command"]
+        commands = [command(action, verbose) for action in phase.actions if action.kind == "command"]
         lines += [f"       {command}" for command in dict.fromkeys(commands)]
         if number == 3 and not phase.actions:
             lines.append("       nothing to install")

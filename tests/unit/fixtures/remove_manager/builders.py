@@ -362,6 +362,7 @@ class Site:
         self.fake = FakeHost(tmp)
         self.free = 100 * GIB
         self.clock = doctor_builders.FakeClock()
+        self.quiet = False               # whether the phase runs under `--quiet`
         self.runner: runner_mod.FakeRunner | None = None
 
     def mkdir(self, *parts: str) -> str:
@@ -562,8 +563,10 @@ class Site:
         """
         env_vars = {"HOME": self.home, "USER": "alice"}
         env_vars.update(environ or {})
-        self.runner = runner_mod.FakeRunner(default=self.fake, console=doctor_builders.QuietConsole(),
-                                            environ=env_vars, run_dir=self.run_dir)
+        console = doctor_builders.QuietConsole()
+        console.quiet = self.quiet
+        self.runner = runner_mod.FakeRunner(default=self.fake, console=console, environ=env_vars,
+                                            run_dir=self.run_dir)
         return remove_manager.run(self.runner, self.run_dir, plan, bundle, ask or Ask(yes=True), resumed=resumed,
                                   host=self.host())
 

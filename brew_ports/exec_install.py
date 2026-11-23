@@ -14,6 +14,7 @@ from .env import linkage as env_linkage
 from .homebrew import actions as brew_actions, inventory as brew_inventory
 from .macports import actions as mp_actions, registry
 from .model import Action, Instance, Issue, Manager, OnFailure, Severity
+from .report import counted, some
 from .runner import ActionFailed
 
 BREW_BATCHES = ("3.upgrade.formulae", "3.install.bottled", "3.install.built", "3.install.casks")
@@ -69,22 +70,25 @@ def repair_one(run, group: Sequence[Action]) -> None:
         if run.ok(2, action.action_id):
             continue
         try:
-            ran.append((action, run.runner.run(action, defer_result=True)))
+            result = run.runner.run(action, defer_result=True)
         except ActionFailed as exc:
-            failure = str(exc)
+            run.result_line(action, exc.result)
+            failure = "the command failed"
             break
+        ran.append((action, result))
+        run.result_line(action, result)
     if failure is None:
         checked = doctor.verify(issue, run.runner, run.bundle)
         if checked is False:
-            failure = f"the post-check of {issue.code} found it unrepaired"
+            failure = "the problem is still there"
         elif checked is None and not all(result.ok for _, result in ran):
-            failure = f"a command of {issue.code} failed"
+            failure = "a command failed"
     for action, _ in ran:
         if not action.read_only:
             run.runner.record_result(action, failure is None)
-    label = f"{issue.code} {issue.subject or issue.instance_prefix or ''}"
-    outcome = "repaired" if failure is None else f"not repaired ({failure}); the gate decides"
-    run.say(f"  {label}: {outcome}")
+    if failure is not None:
+        run.say(f"  {issue.subject or issue.instance_prefix or 'It'} is not repaired ({failure}). Phase 4 checks "
+                "whether that matters.")
 
 
 def repair(run) -> None:
@@ -92,16 +96,12 @@ def repair(run) -> None:
 
     @param run  the run
     """
-    groups = findings(run.actions(2))
-    pending = []
-    for group in groups:
+    pending = [group for group in findings(run.actions(2)) if not all(run.ok(2, a.action_id) for a in group)]
+    if not pending:
+        return
+    for group in pending:
         for action in group:
             run.show(action, skipped=run.ok(2, action.action_id))
-        if not all(run.ok(2, a.action_id) for a in group):
-            pending.append(group)
-    if not pending:
-        run.say("  nothing to repair" if not groups else "  every repair passed in an earlier attempt")
-        return
     if run.dry_run:
         return
     run.confirm(2)
@@ -247,9 +247,8 @@ def resume_batch(run, target: Instance, action: Action, before: dict[str, Any]) 
                                            on_failure=_policy(tokens)))
     if rest:
         subs.append(_rest_action(target, host, action, rest))
-    run.say(f"  {action.action_id} did not finish in an earlier attempt: re-run as")
-    for sub in subs:
-        run.show(sub)
+    run.say(f"  An earlier attempt of `{run.command(action)}` did not finish: what it may have left half installed "
+            "is installed again.")
     results = [run.runner.run(sub, defer_result=True) for sub in subs]
     run.runner.record_result(action, all(r.ok for r in results))
     for sub, result in zip(subs, results):
@@ -310,10 +309,11 @@ def rebuild(run, target: Instance, action: Action, name: str) -> None:
     clean = rebuild_clean(run, target, name)
     run.runner.record_result(action, clean)
     if clean:
-        run.say(f"  {action.action_id}: ok")
+        run.say(f"  {run.command(action)} ... ok")
+    elif result.ok:
+        run.say(f"  {run.command(action)} ... done, but {name} still does not find a library it needs")
     else:
-        why = "the rescan still finds a broken reference" if result.ok else "the command failed"
-        run.say(f"  {action.action_id}: failed ({why})")
+        run.result_line(action, result)
 
 
 def rebuild_action(run, target: Instance, name: str, variants: Sequence[str]) -> Action:
@@ -358,7 +358,8 @@ def dependents(run, target: Instance, upgraded: set[str]) -> dict[str, tuple[lis
     try:
         reg = registry.Registry.open_copy(target.portdbpath)
     except REGISTRY_ERRORS as exc:
-        run.say(f"  the registry of {target.prefix} cannot be read ({exc}): no dependent is scanned")
+        run.say(f"  MacPorts' record of what is installed in {target.prefix} cannot be read ({exc}), so the packages "
+                "that use an upgraded one were not checked.")
         return out
     with reg:
         recorded = reg.dependencies()
@@ -393,11 +394,15 @@ def rescan(run, target: Instance, confirmed: bool) -> None:
         if not broken or name in run.rebuilt:
             continue
         action = rebuild_action(run, target, name, variants)
-        run.show(action, skipped=run.ok(3, action.action_id))
         if not run.ok(3, action.action_id):
             todo.append((name, action))
-    run.say(f"  dependents of upgraded packages: {len(found)} scanned, {len(todo)} to rebuild")
-    if todo and not confirmed:
+    if not todo:
+        return
+    run.say(f"  {counted(len(todo), 'package')} lost a library to an upgrade and will be installed again: "
+            f"{some(name for name, _ in todo)}")
+    if not confirmed:
+        for _, action in todo:
+            run.show(action)
         run.confirm(3)
     for name, action in todo:
         rebuild(run, target, action, name)
@@ -432,18 +437,14 @@ def install(run) -> None:
     @param run  the run
     """
     target = run.target
-    pending = []
-    for action in run.actions(3):
-        done = run.ok(3, action.action_id)
-        run.show(action, skipped=done)
-        if not done:
-            pending.append(action)
-    if run.plan.target_upgrades:
-        upgrades = ", ".join(run.plan.target_upgrades)
-        run.say(f"  then the linkage scan of the installed dependents of {upgrades}; each with a missing reference is "
-                "rebuilt")
-    elif not pending:
-        run.say("  nothing to install")
+    actions = run.actions(3)
+    pending = [action for action in actions if not run.ok(3, action.action_id)]
+    if pending:
+        for action in actions:
+            run.show(action, skipped=action not in pending)
+        if run.plan.target_upgrades and (run.dry_run or not run.ctx.yes):
+            run.say(f"  Then every package that uses the upgraded {some(run.plan.target_upgrades)} is checked; one "
+                    "that lost a library is installed again.")
     if run.dry_run or target is None:
         return
     if pending:

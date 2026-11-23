@@ -362,7 +362,7 @@ def main(argv: Sequence[str] | None = None, environ: dict[str, str] | None = Non
         console.error(str(exc))
         return EXIT_USAGE
     if system.running_as_root():
-        console.warn(system.ROOT_MESSAGE)
+        console.error(system.ROOT_MESSAGE)
         return EXIT_PREFLIGHT
     state = state_mod.StateDir(args.state_dir)
     ctx = Context(args, console, state, environ=env)

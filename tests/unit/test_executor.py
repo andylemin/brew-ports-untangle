@@ -11,12 +11,13 @@ import sys
 import unittest
 from unittest import mock
 
-from brew_ports import cli, doctor, envclean, exec_run, executor, model, remove_manager, runner as r, snapshot, state
+from brew_ports import (cli, doctor, envclean, exec_run, executor, model, plan_report, remove_manager, runner as r,
+                        snapshot, state)
 from brew_ports.macports import actions as mp_actions
 from brew_ports.model import Blocks, Severity
 from tests.unit.fixtures.executor import builders as b
 from tests.unit.fixtures.macports import builders as mb
-from tests.unit.helpers import TempDirTest, make_package
+from tests.unit.helpers import TempDirTest, make_instance, make_package
 
 
 class ApplyTest(TempDirTest):
@@ -44,6 +45,10 @@ class ApplyTest(TempDirTest):
         b.FakeRootFiles.writes = []
         self.issues = []
         b.patches(self, self.host)
+        # The temporary folder's length must not decide which commands are cut.
+        width = mock.patch.object(plan_report, "COMMAND_WIDTH", 10_000)
+        width.start()
+        self.addCleanup(width.stop)
 
     def factory(self, ctx, run_dir):
         """Make the runner of a command: the responder answers it, and `runners` keeps it
@@ -221,11 +226,21 @@ class DryRunTest(ApplyTest):
         self.assertFalse(os.path.exists(self.sd.dirty_path))
         self.assertFalse(os.path.exists(self.run_dir.sub("plan.json")))
         self.assertFalse(os.path.exists(snapshot.snapshot_dir(self.run_dir)))
-        for number in (0, 1, 2, 3, 4, 5, 7, 8):
-            self.assertIn(f"== phase {number}:", self.out)
-        for text in ("3.install.bottled", "5.uninstall.ports", "5.stop.org.macports.dnsmasq",
-                     "nothing was changed and no marker was touched"):
-            self.assertIn(text, self.out)
+        lines = self.out.splitlines()
+        self.assertEqual(lines[0], "Dry run: nothing will change.")
+        self.assertEqual([line for line in lines if line.startswith("Phase ")], [
+            "Phase 0  Checks before starting", "Phase 1  Save a record for undo", "Phase 3  Install the replacements",
+            "Phase 4  Check the replacements", "Phase 5  Uninstall the old packages",
+            "Phase 7  Clean up the shell files", "Phase 8  Final check"])
+        for text in (f"  {self.target.binary} install --formula dnsmasq jq",
+                     f"  sudo {self.source.binary} -N uninstall dnsmasq @2.90_0 jq @1.7.1_0 oniguruma @6.9.9_0",
+                     "  Services to stop first: org.macports.dnsmasq   (each service file is deleted once its package "
+                     "is gone)",
+                     "  The run will need your password (sudo) to uninstall ports and stop a system service."):
+            self.assertEqual(lines.count(text), 1, text)
+        self.assertEqual(lines[-2:], ["Dry run finished: nothing was changed.",
+                                      f"Next: brew-ports apply {self.plan_path}"])
+        self.assertFalse([line for line in lines if line.startswith(("Run folder", "+ "))])
         self.assertEqual(b.port_names(self.source.prefix), ["dnsmasq", "jq", "oniguruma"])
         self.assertEqual(self.modules["brew_ports.verify"].calls, [])
         self.assertFalse(self.runners[-1].sudo_ready)
@@ -236,7 +251,28 @@ class DryRunTest(ApplyTest):
         self.apply(dry_run=True)
         dry = self.run_dir.run_id
         self.assertEqual(self.apply(resume=dry), executor.EXIT_USAGE)
-        self.assertIn("is not an apply run", self.out)
+        self.assertEqual(self.out, f"brew-ports: run {dry} is a dry run, or no run of `brew-ports apply`: there is "
+                                   "nothing to continue\n  Start one with: brew-ports apply PLAN\n")
+
+    def test_the_shell_files_are_not_previewed_from_the_mac_as_it_is(self):
+        self.scenario_brew()
+        edit = envclean.Edit(path="/Users/alice/.zprofile", kind="rc", old_text="a\n", new_text="b\n",
+                             diff="--- /Users/alice/.zprofile\n+++ /Users/alice/.zprofile\n", ops=["an edit"])
+        self.modules["brew_ports.envclean"] = b.envclean_module([edit])
+        self.assertEqual(self.apply(dry_run=True), executor.EXIT_OK, self.out)
+        self.assertNotIn(".zprofile", self.out)
+        self.assertNotIn("survives", self.out)
+        self.assertEqual(self.modules["brew_ports.envclean"].bundles, [])
+        self.assertIn("  Not shown in a dry run: what changes in your shell files depends on what phases 5 and 6 "
+                      "leave.\n  The run shows each change before it makes any, and asks unless --yes is given.\n",
+                      self.out)
+
+    def test_a_long_command_is_cut_at_a_word(self):
+        self.scenario_brew()
+        with mock.patch.object(plan_report, "COMMAND_WIDTH", len(self.source.binary) + 30):
+            self.assertEqual(self.apply(dry_run=True), executor.EXIT_OK, self.out)
+        self.assertIn(f"  sudo {self.source.binary} -N uninstall dnsmasq ... (5 more words; --verbose shows all)\n",
+                      self.out)
 
 
 class StopAndResumeTest(ApplyTest):
@@ -248,13 +284,15 @@ class StopAndResumeTest(ApplyTest):
         first = self.run_dir
         self.assertEqual(self.results().get((3, "3.complete")), "ok")
         self.assertNotIn((4, "4.complete"), self.results())
-        self.assertIn(f"apply --resume {first.run_id}` continues", self.out)
+        self.assertTrue(self.out.endswith(f"\nStopped after phase 3 (--stop-after 3). Continue with: brew-ports apply "
+                                          f"--resume {first.run_id}\n"), self.out)
         self.assertEqual(sorted(os.listdir(os.path.join(self.source.prefix, "Cellar"))), ["libidn2", "wget"])
         self.responder.log.clear()
         self.assertEqual(self.apply(resume=first.run_id), executor.EXIT_OK, self.out)
         self.assertEqual(self.run_dir.path, first.path)
         self.assertEqual(self.responder.ran("port", "install"), [])
-        self.assertIn("(ok in an earlier attempt: skipped)", self.out)
+        self.assertTrue(self.out.startswith(f"Continuing run {first.run_id} after phase 3.\nRun folder: "), self.out)
+        self.assertNotIn("Phase 3 ", self.out)               # nothing is left of it, so it prints nothing
         self.assertEqual(len(self.responder.ran("brew", "uninstall")), 2)
         self.assertEqual(self.responder.ran("tmutil"), [])          # phase 1 is not taken again
 
@@ -270,7 +308,9 @@ class StopAndResumeTest(ApplyTest):
         self.responder.hooks["install"] = killed
         self.assertEqual(self.apply(), executor.EXIT_ACTION, self.out)
         first = self.run_dir
-        self.assertIn("was interrupted", self.out)
+        self.assertTrue(self.out.endswith(
+            "brew-ports: interrupted; a command that was running got the interrupt too, and the run waited for it to "
+            f"end\n  Continue with: brew-ports apply --resume {first.run_id}\n"), self.out)
         self.assertNotIn((3, "3.install.bottled"), self.results())
         self.assertEqual(self.entry("3.install.bottled")[0]["exit"], 130)
         self.assertEqual(self.responder.ran("port", "uninstall"), [])
@@ -281,6 +321,11 @@ class StopAndResumeTest(ApplyTest):
         self.assertEqual(brew, [["reinstall", "--formula", "jq", "oniguruma"],
                                 ["install", "--formula", "dnsmasq"]])
         self.assertEqual(self.results()[(3, "3.install.bottled")], "ok")
+        brew = self.target.binary
+        self.assertIn(f"  An earlier attempt of `{brew} install --formula dnsmasq jq` did not finish: what it may "
+                      "have left half installed is installed again.\n"
+                      f"  {brew} reinstall --formula jq oniguruma ... ok\n  {brew} install --formula dnsmasq ... ok\n",
+                      self.out)
 
     def test_resume_refused_after_another_command(self):
         self.scenario_ports()
@@ -290,8 +335,9 @@ class StopAndResumeTest(ApplyTest):
         later = os.stat(self.sd.dirty_path).st_mtime + 10
         os.utime(self.sd.dirty_path, (later, later))
         self.assertEqual(self.apply(resume=first), executor.EXIT_PREFLIGHT)
-        self.assertIn("re-plan", self.out)
-        self.assertIn("doctor --fix", self.out)
+        self.assertEqual(self.out, f"brew-ports: `brew-ports doctor --fix` (run 20261113-120000-bbbbbb) changed this "
+                                   f"Mac after run {first} started, so the run's plan may be out of date\n"
+                                   "  Make a new plan with `brew-ports plan`, then apply that.\n")
 
     def test_an_unknown_run_is_a_usage_error(self):
         self.scenario_ports()
@@ -305,8 +351,10 @@ class RefusalTest(ApplyTest):
         path = self.write_file("plan-refused.json", {"refused": {"exit": 1, "reasons": ["pinned jq"]}, "plan": None})
         self.plan_path = path
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
-        self.assertIn("re-plan", self.out)
-        self.assertIn("pinned jq", self.out)
+        self.assertTrue(self.out.startswith("brew-ports: "), self.out)
+        self.assertTrue(self.out.endswith(
+            "plan-refused.json is not a plan: it holds the reasons why no plan was made\n"
+            "    pinned jq\n  Settle them, then make a new plan with `brew-ports plan`.\n"), self.out)
         self.assertEqual(self.sd.run_ids(), [])
 
     def test_a_plan_older_than_the_marker_exits_3(self):
@@ -315,8 +363,9 @@ class RefusalTest(ApplyTest):
         old = os.stat(self.sd.dirty_path).st_mtime - 100
         os.utime(self.plan_path, (old, old))
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
-        self.assertIn("re-plan", self.out)
-        self.assertIn("rollback", self.out)
+        self.assertIn("plan.json was made before `brew-ports rollback` (run 20261113-110000-dddddd) changed this Mac, "
+                      "so it may be out of date\n  Make a new plan with `brew-ports plan`, then apply that.\n",
+                      self.out)
         self.assertEqual(self.sd.run_ids(), [])
 
     def write_file(self, name, data):
@@ -351,8 +400,9 @@ class PreflightTest(ApplyTest):
         self.scenario_brew()
         self.issues = [self.issue("ports-damaged-registry", self.source.prefix, (Blocks.UNINSTALL,))]
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
-        self.assertIn(f"this stops the move: ports-damaged-registry title ({self.source.prefix})\n    evidence\n"
-                      "    Fix: repair it\n", self.out)
+        self.assertIn("\nPhase 0  Checks before starting\n"
+                      f"brew-ports: this stops the move: ports-damaged-registry title ({self.source.prefix})\n"
+                      "    evidence\n    Fix: repair it\n", self.out)
         self.assertFalse(os.path.exists(self.sd.dirty_path))
         self.assertFalse(snapshot.is_complete(self.run_dir))
         self.assertFalse(self.runners[-1].sudo_ready)
@@ -388,16 +438,18 @@ class PreflightTest(ApplyTest):
         self.issues = [self.issue("ports-damaged-registry", self.source.prefix, ())]
         self.issues[0].confirm_each = True
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
-        self.assertIn(f"the source {self.source.prefix} cannot be driven (damaged-registry)", self.out)
-        self.assertIn("doctor --fix` repairs it (ports-damaged-registry)", self.out)
+        self.assertIn(f"brew-ports: MacPorts at {self.source.prefix}: its `port` command cannot run\n"
+                      "  `brew-ports doctor --fix` can repair it; make a new plan with `brew-ports plan` afterwards.\n",
+                      self.out)
 
     def test_a_refused_homebrew_target_exits_3(self):
         self.scenario_brew()
         self.host.catalogues[self.target.prefix].refusals["jq"] = {"date": "2026-11-01", "because": "unmaintained",
                                                                    "replacement_formula": "gojq"}
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
-        self.assertIn("Homebrew refuses to install formula jq: disabled since 2026-11-01 (unmaintained)", self.out)
-        self.assertIn("plan with `--replace jq=gojq`; re-plan", self.out)
+        self.assertIn("brew-ports: Homebrew has disabled formula jq (since 2026-11-01: unmaintained), which the plan "
+                      "installs\n  Make a new plan with `brew-ports plan`, then apply that. `--replace jq=gojq` takes "
+                      "the one Homebrew names instead.\n", self.out)
 
     def test_sudo_that_caches_nothing_exits_3(self):
         self.scenario_brew()
@@ -407,6 +459,27 @@ class PreflightTest(ApplyTest):
         self.assertFalse(os.path.exists(self.sd.dirty_path))
 
 
+class NotesOnceTest(ApplyTest):
+    """A note of the final check is given once, not after the check of the replacements as well"""
+
+    def test_a_note_of_both_checks_prints_once(self):
+        self.scenario_brew()
+        real = self.modules["brew_ports.verify"].check
+
+        def noted(*args, **kw):
+            result = real(*args, **kw)
+            result.report("language-packages", "gems.txt", "kept in the run folder")
+            return result
+        self.modules["brew_ports.verify"].check = noted
+        self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
+        self.assertEqual(self.modules["brew_ports.verify"].calls, [True, False])
+        self.assertEqual(self.out.count("kept in the run folder"), 1)
+        self.assertIn("\nPhase 4  Check the replacements\n  Passed: every replacement is installed, provides commands "
+                      "and finds its libraries.\n", self.out)
+        self.assertIn("\nPhase 8  Final check\n  Passed: the replacements are in place, and what the plan uninstalls "
+                      "is gone.\n  note gems.txt (language packages): kept in the run folder\n", self.out)
+
+
 class GateTest(ApplyTest):
     """Phase 4: a failed gate stops the run before any removal"""
 
@@ -414,9 +487,13 @@ class GateTest(ApplyTest):
         self.scenario_brew()
         self.modules["brew_ports.verify"] = b.verify_module({True: [("installed", "jq -> jq", "jq is not installed")]})
         self.assertEqual(self.apply(), executor.EXIT_ACTION)
-        for text in ("the gate failed: no source package was removed", "--leave jq", f"rollback {self.run_dir.run_id}",
-                     "FAIL jq -> jq (replacements installed): jq is not installed"):
-            self.assertIn(text, self.out)
+        run_id = self.run_dir.run_id
+        self.assertTrue(self.out.endswith(
+            "\nPhase 4  Check the replacements\n"
+            "  jq -> jq (replacements installed): jq is not installed\n"
+            "brew-ports: the check of the replacements failed, so no old package was uninstalled\n"
+            f"  Fix what the lines above name, then continue with: brew-ports apply --resume {run_id}\n"
+            "  Or leave those packages where they are: make the plan again with `--leave jq` added.\n"), self.out)
         self.assertEqual(self.responder.ran("port", "uninstall"), [])
         self.assertEqual(b.port_names(self.source.prefix), ["dnsmasq", "jq", "oniguruma"])
         self.assertFalse([k for k in self.results() if k[0] == 5])
@@ -440,9 +517,10 @@ class InterruptTest(ApplyTest):
         self.assertEqual(self.entry("5.uninstall.ports")[0]["exit"], 1)
         self.assertEqual(self.responder.ran("port", "uninstall")[1:], [])        # no retry after the interrupt
         self.assertEqual([t[-2:] for t in self.responder.ran("port", "load")], [["load", "dnsmasq"]])
-        self.assertIn("org.macports.dnsmasq started again", self.out)
-        self.assertIn("was interrupted", self.out)
-        self.assertIn(f"apply --resume {self.run_dir.run_id}` continues", self.out)
+        self.assertTrue(self.out.endswith(
+            "  Started the service org.macports.dnsmasq again.\n"
+            "brew-ports: interrupted; a command that was running got the interrupt too, and the run waited for it to "
+            f"end\n  Continue with: brew-ports apply --resume {self.run_dir.run_id}\n"), self.out)
         self.assertNotIn((5, "5.complete"), self.results())
         self.assertTrue(os.path.exists(self.plist))
 
@@ -473,21 +551,117 @@ class MarkerTest(ApplyTest):
         self.assertEqual([word for word, there in seen[:first] if there], [])
         self.assertIn("tmutil localsnapshot", [word for word, _ in seen[:first]])
 
-    def test_declined_phase_exits_4_and_keeps_plan(self):
+    def test_no_terminal_and_no_yes_stops_before_the_first_change(self):
         self.scenario_brew()
         self.assertEqual(self.apply(yes=False), executor.EXIT_ACTION)
-        self.assertIn("phase 1 was not confirmed (no terminal: --yes answers every phase)", self.out)
+        run_id = self.run_dir.run_id
+        self.assertTrue(self.out.endswith(
+            "brew-ports: phase 3 asks before it changes anything, and there is no terminal to ask on\n"
+            f"  Run it in a Terminal window, or answer yes to every question: brew-ports apply --resume {run_id} "
+            "--yes\n"), self.out)
+        self.assertIn(f"  {self.target.binary} install --formula dnsmasq jq\n", self.out)   # what it would have run
         self.assertFalse(os.path.exists(self.sd.dirty_path))
-        keepalive = (r.SUDO, "-n", "-v")                       # phase 0's first keepalive
-        self.assertEqual([c for c in self.runners[-1].calls if c != keepalive], [])
+        self.assertEqual(self.responder.ran("brew", "install"), [])
+        self.assertTrue(snapshot.is_complete(self.run_dir))    # the record for undo asks nothing
 
-    def test_a_no_at_a_later_phase_on_a_terminal(self):
+    def test_a_no_on_a_terminal_stops_before_its_phase(self):
         self.scenario_brew()
         self.assertEqual(self.apply(yes=False, tty=True, answers=[True, False]), executor.EXIT_ACTION)
-        self.assertEqual(len(self.ctx.asked), 2)
-        self.assertIn("Run phase 3 (install the replacements)?", self.ctx.asked[1])
-        self.assertEqual(self.responder.ran("brew", "install"), [])
-        self.assertIn("apply --resume", self.out)
+        self.assertEqual(self.ctx.asked, ["Install the replacements?", "Uninstall the old packages?"])
+        run_id = self.run_dir.run_id
+        port = f"  sudo {self.source.binary} -N uninstall dnsmasq @2.90_0 jq @1.7.1_0 oniguruma @6.9.9_0\n"
+        self.assertTrue(self.out.endswith(
+            port + f"  n stops the run here; `brew-ports apply --resume {run_id}` continues it.\n"
+            f"Stopped before phase 5, as you answered. Continue with: brew-ports apply --resume {run_id}\n"), self.out)
+        self.assertNotIn("brew-ports: ", self.out)             # the user's own answer is no error
+        self.assertEqual(len(self.responder.ran("brew", "install")), 1)
+        self.assertEqual(self.responder.ran("port", "uninstall"), [])
+
+    def test_a_question_shows_its_commands_and_then_their_results(self):
+        self.scenario_brew()
+        self.assertEqual(self.apply(yes=False, tty=True, answers=[True, True]), executor.EXIT_OK, self.out)
+        brew = f"  {self.target.binary} install --formula dnsmasq jq"
+        self.assertIn(f"\nPhase 3  Install the replacements\n{brew}\n  n stops the run here; `brew-ports apply "
+                      f"--resume {self.run_dir.run_id}` continues it.\n{brew} ... ok\n", self.out)
+        with open(self.run_dir.sub("report.md"), encoding="utf-8") as fh:
+            self.assertIn("\nInstall the replacements? (y/n) [n] y\n", fh.read())
+
+    def test_yes_prints_each_command_once_with_its_result(self):
+        self.scenario_brew()
+        self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
+        self.assertEqual(self.out.count("install --formula dnsmasq jq"), 1)
+        self.assertEqual(self.out.count(" -N uninstall dnsmasq"), 1)
+        self.assertNotIn("+ ", self.out)                       # the escalated commands are not echoed as well
+        self.assertNotIn("n stops the run here", self.out)
+
+
+class HandTasksTest(ApplyTest):
+    """What is left for the user to do is said whenever a run ends, also when it ends early"""
+
+    def hand_edit(self):
+        """Have phase 7 find a shell file that only the user can edit
+
+        @returns  the task's line in the closing lines
+        """
+        edit = envclean.Edit(path="/Users/alice/.bash_profile", kind="rc", old_text="a\n", new_text="b\n", diff="",
+                             manual="it belongs to root")
+        self.modules["brew_ports.envclean"] = b.envclean_module([edit])
+        return "  Make the change phase 7 showed for ~/.bash_profile, which brew-ports does not edit.\n"
+
+    def test_a_failed_final_check_keeps_the_tasks_and_the_undo(self):
+        self.scenario_brew()
+        task = self.hand_edit()
+        self.modules["brew_ports.verify"] = b.verify_module({False: [("removed", "jq", "jq is still installed")]})
+        self.assertEqual(self.apply(), executor.EXIT_VERIFY, self.out)
+        self.assertIn("\n  jq (sources removed): jq is still installed\nFor you to do:\n" + task
+                      + f"Undo: brew-ports rollback {self.run_dir.run_id}   (puts back", self.out)
+        self.assertIn("brew-ports: the final check found 1 failure, listed above\n", self.out)
+
+    def test_stop_after_gives_the_tasks_gathered_so_far(self):
+        self.scenario_brew()
+        task = self.hand_edit()
+        self.assertEqual(self.apply(stop_after=7), executor.EXIT_OK, self.out)
+        self.assertTrue(self.out.endswith("For you to do:\n" + task), self.out)
+
+    def test_a_dry_run_names_the_app_only_the_user_can_uninstall(self):
+        self.scenario_ports()
+        self.plan.manual_casks = ["iterm2"]
+        self.save_plan(self.plan)
+        self.assertEqual(self.apply(dry_run=True), executor.EXIT_OK, self.out)
+        self.assertIn("\nFor you to do after the run:\n  Uninstall the app iterm2 yourself, because Homebrew asks for "
+                      f"your password: {self.source.binary} uninstall --cask iterm2\nNext: brew-ports apply ", self.out)
+
+
+class RecordTest(ApplyTest):
+    """Phase 1: what it says about the record it saves for undo"""
+
+    def test_it_says_how_much_was_not_saved_and_where_that_is_named(self):
+        self.scenario_brew()
+        self.responder.hooks["tmutil"] = lambda tail: r.FakeResponse(exit=1, stderr="no snapshot\n")
+        self.assertEqual(self.apply(stop_after=1), executor.EXIT_OK, self.out)
+        with open(os.path.join(snapshot.snapshot_dir(self.run_dir), snapshot.NOTES), encoding="utf-8") as fh:
+            notes = {line.strip() for line in fh if line.strip()}
+        self.assertEqual(len(notes), 2, notes)                 # the disk snapshot, and one part of the record
+        self.assertIn("  Saved what is installed, your shell files and your service files in the run folder, for "
+                      "`brew-ports rollback`.\n  1 part of that record could not be saved: snapshot/notes.txt in the "
+                      "run folder names it.\n  macOS could not take a local snapshot of the disk. `brew-ports "
+                      "rollback` does not need one.\n", self.out)
+        self.assertNotIn("macOS also took", self.out)
+
+    def test_saving_the_record_leaves_the_plan_good(self):
+        self.scenario_brew()
+        self.source.features = tuple(self.source.features or ()) + ("snapshot",)
+        self.assertEqual(self.apply(yes=False, tty=True, answers=[False]), executor.EXIT_ACTION, self.out)
+        self.assertEqual(len(self.responder.ran("port", "snapshot")), 1)
+        self.assertFalse(os.path.exists(self.sd.dirty_path))   # a no at the first question changed nothing
+        self.assertEqual(self.apply(dry_run=True), executor.EXIT_OK, self.out)
+
+    def test_it_says_that_macos_took_a_snapshot_of_the_disk(self):
+        self.scenario_brew()
+        self.assertEqual(self.apply(stop_after=1), executor.EXIT_OK, self.out)
+        self.assertIn("  macOS also took a local snapshot of the disk, which it keeps for about a day or until it "
+                      "needs the space.\n", self.out)
+        self.assertEqual(self.ctx.asked, [])                   # saving the record asks nothing
 
 
 class PhaseSixTest(ApplyTest):
@@ -508,6 +682,7 @@ class PhaseSixTest(ApplyTest):
         self.assertEqual((call["resumed"], call["phase"], call["run_id"], call["yes"]),
                          (False, 6, self.run_dir.run_id, True))
         self.assertNotIn("phase 6 done", self.out)              # remove_manager prints its own lines
+        self.assertNotIn("This list is from the plan", self.out)   # nothing is asked, so no preview either
         with open(self.run_dir.sub("report.md"), encoding="utf-8") as fh:
             self.assertIn("phase 6 done", fh.read())
         self.assertEqual(self.results().get((6, "6.complete")), "ok")
@@ -516,31 +691,63 @@ class PhaseSixTest(ApplyTest):
         self.assertIsNot(survivors_bundle, call["bundle"])
         self.assertEqual(self.host.scans, 5)                 # phases 0, 4, 6, 7 and 8
 
+    def test_the_preview_of_phase_6_is_shown_as_the_plans_own(self):
+        self.scenario_brew()
+        prefix = self.source.prefix
+        steps = [model.Action(action_id="6.archive.x", kind="command", sudo=True, description="save", manual=True,
+                              argv=["/usr/bin/tar", "-czf", "-", "-C", "/", prefix.lstrip("/") + "/etc"],
+                              instance_prefix=prefix),
+                 model.Action(action_id="6.delete.y", kind="command", argv=["/bin/rm", "-rf", prefix], sudo=True,
+                              description="delete", manual=True, instance_prefix=prefix)]
+        self.save_plan(b.plan(self.target, [self.source], mappings=self.mappings, removal=self.removal,
+                              phase3=[self.install], phase6=steps, remove=[prefix]))
+        preview = (f"\nPhase 6  Uninstall MacPorts at {prefix}\n  Save in the run folder: {prefix}/etc\n"
+                   f"  Then delete: {prefix}\n  This list is from the plan. It is made again when the phase runs: "
+                   "what is gone by then is skipped.\n")
+        self.assertEqual(self.apply(dry_run=True), executor.EXIT_OK, self.out)
+        self.assertIn(preview, self.out)
+        self.assertEqual(self.apply(yes=False, tty=True, answers=[True, True, True]), executor.EXIT_OK, self.out)
+        self.assertIn(preview + "  To undo this later, reinstall it first; `brew-ports rollback` then puts its "
+                      "packages back.\n", self.out)
+        self.assertEqual(len(self.modules["brew_ports.remove_manager"].calls), 1)
+
     def test_a_no_leaves_the_manager_installed_and_the_run_goes_on(self):
         self.plan_with_phase6()
-        code = self.apply(yes=False, tty=True, answers=[True, True, True, False])
+        code = self.apply(yes=False, tty=True, answers=[True, True, False])
         self.assertEqual(code, executor.EXIT_OK, self.out)
-        self.assertEqual(len(self.ctx.asked), 4)
-        self.assertIn("Run phase 6 (uninstall the old managers)", self.ctx.asked[3])
         where = f"MacPorts at {self.source.prefix}"
-        self.assertIn(f"  a no leaves {where} installed, without its packages, and the run goes on\n", self.out)
-        self.assertIn(f"  {where} stays installed, as you answered; a new plan can uninstall it later\n", self.out)
+        self.assertEqual(self.ctx.asked[2:], [f"Uninstall {where}?"])
+        self.assertIn(f"\nPhase 6  Uninstall {where}\n"
+                      "  To undo this later, reinstall it first; `brew-ports rollback` then puts its packages back.\n"
+                      "  What is saved stays in the run folder, for you to copy back.\n"
+                      f"  n leaves {where} installed, without its packages, and the run goes on.\n"
+                      f"  {where} stays installed, as you answered; a new plan can uninstall it later.\n", self.out)
+        self.assertIn(f"\nFinished: 2 packages moved into Homebrew at {self.target.prefix}; 3 ports uninstalled from "
+                      f"{where}.\n", self.out)
         self.assertEqual(self.modules["brew_ports.remove_manager"].calls, [])
         self.assertEqual([e["prefixes"] for e in self.entry(executor.DECLINED)], [[self.source.prefix]])
         results = self.results()
         self.assertEqual([results.get((n, f"{n}.complete")) for n in (6, 7, 8)], ["ok", "ok", "ok"])
 
+    def test_a_no_to_one_deleted_whole_leaves_its_packages(self):
+        self.plan_with_phase6()
+        self.plan.path_removed = {self.source.prefix: [("port", "jq")]}
+        self.save_plan(self.plan)
+        self.assertEqual(self.apply(yes=False, tty=True, answers=[True, True, False]), executor.EXIT_OK, self.out)
+        self.assertIn(f"  n leaves MacPorts at {self.source.prefix} installed, with what is still in it, and the run "
+                      "goes on.\n", self.out)
+
     def test_a_resume_after_a_no_does_not_ask_again(self):
         self.plan_with_phase6()
-        code = self.apply(yes=False, tty=True, answers=[True, True, True, False], stop_after=6)
+        code = self.apply(yes=False, tty=True, answers=[True, True, False], stop_after=6)
         self.assertEqual(code, executor.EXIT_OK, self.out)
         # A finding that stops the uninstall of a manager is beside the point for one that stays.
         self.issues = [doctor._issue("ports-damaged-registry", Severity.HIGH, "title", None, self.source.prefix,
                                      evidence=[], remedies=[], blocks=(Blocks.REMOVE,))]
         code = self.apply(resume=self.run_dir.run_id, yes=False, tty=True, answers=[True])
         self.assertEqual(code, executor.EXIT_OK, self.out)
-        self.assertEqual([q.split(" (")[0] for q in self.ctx.asked], ["Run phase 5"])
-        self.assertIn(f"  MacPorts at {self.source.prefix} stays installed, as you answered\n", self.out)
+        self.assertEqual(self.ctx.asked, ["Uninstall the old packages?"])
+        self.assertIn(f"  MacPorts at {self.source.prefix} stays installed, as you answered.\n", self.out)
         self.assertEqual(self.modules["brew_ports.remove_manager"].calls, [])
 
     def test_no_terminal_and_no_yes_still_stops_at_phase_6(self):
@@ -551,7 +758,8 @@ class PhaseSixTest(ApplyTest):
         self.save_plan(b.plan(self.target, [self.source], phase6=[note], remove=[self.source.prefix]))
         self.assertEqual(self.apply(stop_after=1), executor.EXIT_OK, self.out)
         self.assertEqual(self.apply(resume=self.run_dir.run_id, yes=False), executor.EXIT_ACTION)
-        self.assertIn("phase 6 was not confirmed (no terminal: --yes answers every phase)", self.out)
+        self.assertIn("brew-ports: phase 6 asks before it changes anything, and there is no terminal to ask on\n",
+                      self.out)
         self.assertEqual(self.entry(executor.DECLINED), [])
         self.assertEqual(self.modules["brew_ports.remove_manager"].calls, [])
 
@@ -567,7 +775,11 @@ class PhaseSixTest(ApplyTest):
         failure = remove_manager.Stopped(r.Result("6.check.lsof.x", 1, None, None), "a process uses the prefix", lines)
         self.modules["brew_ports.remove_manager"] = b.remove_manager_module(error=failure)
         self.assertEqual(self.apply(), executor.EXIT_ACTION)
-        self.assertIn("phase 6 stopped: a process uses the prefix", self.out)
+        self.assertTrue(self.out.endswith(f"\nPhase 6  Uninstall MacPorts at {self.source.prefix}\n"
+                                          "brew-ports: a process uses the prefix\n"
+                                          f"  Continue with: brew-ports apply --resume {self.run_dir.run_id}\n"),
+                        self.out)
+        self.assertEqual(self.out.count("a process uses the prefix"), 1)
         self.assertNotIn((7, "7.complete"), self.results())
         with open(self.run_dir.sub("report.md"), encoding="utf-8") as fh:
             self.assertIn("pid 77 runs", fh.read())
@@ -590,7 +802,8 @@ class ReportTest(ApplyTest):
         self.assertIn("USER=<user>", text)
         self.assertNotIn("/Users/alice", text)
         self.assertTrue(text.startswith(f"# brew-ports apply {self.run_dir.run_id}"))
-        self.assertIn("## phase 5: uninstall the old packages", text)
+        self.assertIn("\n## Phase 5  Uninstall the old packages\n", text)
+        self.assertIn("  Edited ~/.zprofile; the file as it was is kept in the run folder.\n", text)
         self.assertEqual(self.modules["brew_ports.envclean"].applied, [[edit]])
 
 
@@ -615,8 +828,8 @@ class CliTest(ApplyTest):
         self.scenario_brew()
         code, text = self.main("apply", self.plan_path, "--dry-run", "--stop-after", "3")
         self.assertEqual(code, executor.EXIT_OK, text)
-        self.assertIn("apply --dry-run stopped after phase 3 (--stop-after 3)", text)
-        self.assertNotIn("== phase 4", text)
+        self.assertTrue(text.endswith("\nDry run stopped after phase 3 (--stop-after 3): nothing was changed.\n"), text)
+        self.assertNotIn("Phase 4 ", text)
         code, text = self.main("apply", self.plan_path, "--yes", "--stop-after", "0")
         self.assertEqual(code, executor.EXIT_OK, text)
         code, text = self.main("apply", "--resume", self.runners[-1].run_dir.run_id, "--yes")
@@ -645,15 +858,24 @@ class HelperTest(unittest.TestCase):
         plan = mock.Mock(phases=[model.Phase(8, "verify", [], False), model.Phase(3, "install", [], True)])
         self.assertEqual(executor.phase_numbers(plan), [0, 3, 8])
 
-    def test_the_summary_lists_what_stays_with_the_user(self):
+    def test_the_summary_lists_what_stays_and_the_hand_tasks(self):
         plan = mock.Mock(kept=[make_package("tcl", "port", "/opt/local"), make_package("tk", "port", "/opt/local")],
                          left_in_place=[make_package("git", "formula", "/usr/local")], manual_casks=["virtualbox"],
-                         target_upgrades=["openssl@3"], target_prefix="/opt/homebrew")
-        self.assertEqual(executor.summary_lines(plan), [
-            "still provided by /opt/local: tcl, tk",
-            "left in place in /usr/local, which cannot be driven: git",
-            "to run on a terminal after the migration (Homebrew calls sudo for it): `brew uninstall --cask virtualbox`",
-            "upgraded in place in /opt/homebrew: openssl@3"])
+                         source_prefixes=["/opt/local", "/usr/local"])
+        known = {"/opt/local": make_instance(model.Manager.PORTS, "/opt/local"),
+                 "/usr/local": make_instance(model.Manager.BREW, "/usr/local", binary="/usr/local/bin/brew")}
+        run = mock.Mock(plan=plan, todo=[], instance=known.get, fresh_prefix=str, bundle=None)
+        self.assertEqual(executor.summary_lines(run), [
+            "2 packages stay in MacPorts at /opt/local: tcl, tk",
+            "1 package stays in Homebrew at /usr/local, whose `brew` command cannot run: git"])
+        self.assertEqual(run.todo, ["Uninstall the app virtualbox yourself, because Homebrew asks for your password: "
+                                    "brew uninstall --cask virtualbox"])
+        # With the scan at hand the command names the Homebrew that holds the app, which plain `brew` may not be.
+        run.todo.clear()
+        run.bundle = mock.Mock(result=mock.Mock(packages=[make_package("virtualbox", "cask", "/usr/local")]))
+        executor.summary_lines(run)
+        self.assertEqual(run.todo, ["Uninstall the app virtualbox yourself, because Homebrew asks for your password: "
+                                    "/usr/local/bin/brew uninstall --cask virtualbox"])
 
 
 if __name__ == "__main__":

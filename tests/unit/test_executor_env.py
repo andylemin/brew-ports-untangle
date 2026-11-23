@@ -63,8 +63,22 @@ class Phase7Test(ApplyTest):
                          [("7.select.python3", ["select", "--set", "python3", "python313"], True)])
         self.assertEqual(actions[0].on_failure, model.OnFailure.PROBE)
         self.assertEqual(reported, [
-            f"not set: `sudo port select --set pip3 pip313` ({source} did not put pip3 on PATH)",
-            f"not set: `sudo port select --set gcc mp-gcc14` ({target} has no select files for gcc mp-gcc14)"])
+            f"pip313 is not made the default `pip3`, because {source} did not provide pip3 either. To do it yourself: "
+            "sudo port select --set pip3 pip313",
+            f"mp-gcc14 is not made the default `gcc`: MacPorts at {target} offers no such choice."])
+
+    def test_a_dry_run_lists_the_selections_without_judging_them(self):
+        target = b.ports_prefix(self.tmp, "opt/local")
+        source = b.brew_prefix(self.tmp, "opt/homebrew")
+        self.target, self.source = b.ports(target), b.brew(source)
+        self.host.instances = [self.target, self.source]
+        mapping = b.mapping(make_package("python@3.13", "formula", source), "port", "python313", version="3.13.1_0",
+                            selections=[("python3", "python313")])
+        self.save_plan(b.plan(self.target, [self.source], mappings=[mapping]))
+        self.assertEqual(self.apply(dry_run=True), executor.EXIT_OK, self.out)
+        self.assertIn(f"  sudo {self.target.binary} -N select --set python3 python313\n"
+                      "  A default is set only where the old installation provided the same commands.\n", self.out)
+        self.assertNotIn("is not made the default", self.out)
 
     def test_start_services_starts_the_replacements(self):
         self.scenario_brew()
@@ -86,8 +100,8 @@ class Phase7Test(ApplyTest):
         actions, manual = exec_env.starts(run)
         self.assertEqual([(a.action_id, a.argv[-3:], a.sudo) for a in actions],
                          [("7.start.sh.brew.redis", ["services", "start", "redis"], False)])
-        self.assertEqual(manual, ["`sudo brew services start dnsmasq` (a system-scope service: starting it runs brew "
-                                  "as root)"])
+        self.assertEqual(manual, ["Start the system service of dnsmasq yourself, because that runs Homebrew as root: "
+                                  "sudo brew services start dnsmasq"])
 
     def test_interpreter_and_language_notes(self):
         self.scenario_brew()
@@ -96,26 +110,51 @@ class Phase7Test(ApplyTest):
         catalogue.aliases["python"] = "python@3.13"
         catalogue.exes["python@3.12"] = ["python3.12", "pip3.12", "idle3"]
         python = make_package("python312", "port", self.source.prefix)
+        pip = make_package("py312-pip", "port", self.source.prefix)
         numpy = make_package("py312-numpy", "port", self.source.prefix)
         lang = b.mapping(numpy, "pip", "numpy")
         lang.evidence = ["language package: see language-pip.txt"]
         self.save_plan(b.plan(self.target, [self.source],
-                              mappings=[b.mapping(python, "formula", "python@3.12", version="3.12.8")],
+                              mappings=[b.mapping(python, "formula", "python@3.12", version="3.12.8"),
+                                        b.mapping(pip, "formula", "python@3.12", version="3.12.8")],
                               unmigratable=[lang]))
         run = self.make_run()
+        # Two packages become python@3.12: its note is given once.
         self.assertEqual(exec_env.interpreter_notes(run), [
-            "python@3.12: the unversioned python belongs to python@3.13; run python3.12, pip3.12, or the commands in "
-            f"{self.target.prefix}/opt/python@3.12/bin",
-            "port py312-numpy: language package: see language-pip.txt"])
+            "python@3.12 does not provide plain `python`: that name belongs to python@3.13. Use python3.12 and "
+            f"pip3.12, or the commands in {self.target.prefix}/opt/python@3.12/bin.",
+            "1 language package did not move, as the plan said: py312-numpy"])
 
     def test_failed_write_exits_4(self):
         self.scenario_brew()
         edit = envclean.Edit(path="/Users/alice/.zprofile", kind="rc", old_text="a\n", new_text="b\n", diff="")
         self.modules["brew_ports.envclean"] = b.envclean_module([edit], failed=[edit.path])
         self.assertEqual(self.apply(), executor.EXIT_ACTION)
-        self.assertIn("phase 7 did not finish: not written: /Users/alice/.zprofile", self.out)
+        self.assertTrue(self.out.endswith("brew-ports: phase 7 did not finish\n"
+                                          "    ~/.zprofile could not be written\n"
+                                          f"  Continue with: brew-ports apply --resume {self.run_dir.run_id}\n"),
+                        self.out)
         self.assertNotIn((7, "7.complete"), self.results())
         self.assertEqual(self.results()[(5, "5.complete")], "ok")
+
+    def test_hand_tasks_are_said_once_when_the_run_ends(self):
+        self.scenario_brew()
+        manual = envclean.Edit(path="/Users/alice/.bash_profile", kind="rc", old_text="a\n", new_text="b\n", diff="",
+                               manual="it belongs to root")
+        self.modules["brew_ports.envclean"] = b.envclean_module([manual])
+        self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
+        task = "  Make the change phase 7 showed for ~/.bash_profile, which brew-ports does not edit.\n"
+        self.assertIn("\nFor you to do:\n" + task, self.out)
+        self.assertEqual(self.out.count(task), 1)
+
+    def test_a_file_the_edit_creates_is_reported_as_created(self):
+        self.scenario_brew()
+        new = envclean.Edit(path="/Users/alice/.zprofile", kind="rc", old_text=None, new_text="b\n", diff="")
+        old = envclean.Edit(path="/Users/alice/.zshrc", kind="rc", old_text="a\n", new_text="b\n", diff="")
+        self.modules["brew_ports.envclean"] = b.envclean_module([new, old])
+        self.assertEqual(self.apply(), executor.EXIT_OK, self.out)
+        self.assertIn("  Created ~/.zprofile.\n  Edited ~/.zshrc; the file as it was is kept in the run folder.\n",
+                      self.out)
 
 
 if __name__ == "__main__":

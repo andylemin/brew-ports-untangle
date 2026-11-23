@@ -14,11 +14,12 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import env, plan_phases, servicectl, snapshot, state, system
+from . import apply_report, env, plan_phases, servicectl, snapshot, state, system
 from .context import Context
 from .homebrew import catalogue as brew_catalogue, inventory as brew_inventory, locate as brew_locate
 from .macports import locate as mp_locate, registry
 from .model import Action, Instance, Manager, OnFailure, Plan, Service, Usability
+from .report import Redactor, at, counted, some
 from .runner import RM, ActionFailed, Result, RootFiles
 
 TAR = system.TAR
@@ -40,6 +41,7 @@ LINK_DIRS = ("bin", "sbin", "lib", "include", "share", "etc", "opt", "Frameworks
 LINK_TARGETS = ("Cellar", "Caskroom", "opt")
 APP_KINDS = ("app", "suite")
 ARGV_BUDGET = 200000             # bytes of link names per `rm -f`, far below ARG_MAX
+SAVED_SHOWN = 4                  # archived paths one line names before "and N more"
 
 
 @dataclass
@@ -440,17 +442,6 @@ def _brief(paths: Sequence[str], limit: int = 3) -> str:
     return shown + (f" and {len(paths) - limit} more" if len(paths) > limit else "")
 
 
-def _plural(count: int, word: str, plural: str | None = None) -> str:
-    """Format a count with its noun, singular for one
-
-    @param count   the count
-    @param word    the singular
-    @param plural  the plural; None adds an s
-    @returns       the text, such as `2 ports`
-    """
-    return f"{count} {word if count == 1 else (plural or word + 's')}"
-
-
 def _same(a: Instance, b: Instance) -> bool:
     """Return whether two records are one instance: the same manager and a shared spelling of the prefix
 
@@ -528,6 +519,7 @@ class _Phase:
         named = str((plan.options or {}).get("remove_manager") or "").split(",")
         self.named = [p for p in dict.fromkeys(named) if p]
         self.target = self._target()
+        self.tilde = Redactor(home=self.home, user="")    # writes the home folder as `~` in the report lines
         self.kept: set[str] = set()       # named prefixes a "no" kept in this start
         self.skipped: set[str] = set()    # named prefixes left in place by a precondition
         self.emptied: set[str] = set()    # Homebrew prefixes whose enumerated list ran
@@ -558,7 +550,7 @@ class _Phase:
         for prefix in self.named:
             inst = next((i for i in self.instances if i.prefix == prefix), None)
             if inst is None:
-                self.say(f"phase 6: {prefix} is no instance of the plan; nothing done there")
+                self.say(f"  {prefix} stays, untouched: the plan knows no Homebrew or MacPorts there.")
                 continue
             removal = _MacPorts(self, inst) if inst.manager is Manager.PORTS else _Homebrew(self, inst)
             removal.run()
@@ -570,10 +562,14 @@ class _Phase:
     def say(self, text: str) -> None:
         """Add a report line and print it at once, so a listing comes before its question
 
+        `--quiet` does not hide it: the questions refer to these lines, and each says what was deleted. A path in
+        the home folder is written with `~`, as the other phases write it.
+
         @param text  the line
         """
+        text = self.tilde(text)
         self.lines.append(text)
-        self.runner.console.info(text)
+        self.runner.console.out(text)
 
     def record(self, action_id: str, **fields: Any) -> None:
         """Journal a phase 6 record of the tool's own; the command lines are the runner's
@@ -763,7 +759,7 @@ class _Phase:
         if not checked:
             why = self.unsafe(path, inst)
             if why:
-                self.say(f"  never deleted: {path} ({why})")
+                self.say(f"  {path} stays: {why}.")
                 return None
         action_id = f"6.delete.{state.slug(path)}"
         escalate = sudo if sudo is not None else not os.access(os.path.dirname(path) or "/", os.W_OK)
@@ -773,7 +769,7 @@ class _Phase:
             ok = self.rm(action_id + ".sudo", [RM, flags, path], True, what + " as root")
         gone = ok and not os.path.lexists(path)
         if not gone or not quiet:
-            self.say(("  deleted %s" if gone else "  could not delete %s") % path)
+            self.say(("  Deleted %s." if gone else "  Could not delete %s.") % path)
         return gone
 
     def caches(self) -> None:
@@ -788,16 +784,16 @@ class _Phase:
         defaults = {os.path.normpath(p) for p in shared}
         for inst in brews:
             if inst.cache_dir and os.path.normpath(inst.cache_dir) not in defaults:
-                self.say(f"Homebrew cache of {inst.prefix} left in place: {inst.cache_dir} (set by HOMEBREW_CACHE)")
+                self.say(f"  {inst.cache_dir} stays: it is the download folder you set with HOMEBREW_CACHE.")
         stays = [i for i in self.instances if i.manager is Manager.BREW
                  and (i.prefix not in self.named or i.prefix not in self.emptied)]
         present = [p for p in shared if os.path.lexists(p)]
         if not present:
             return
         if stays:
-            self.say(f"the shared Homebrew caches stay: Homebrew at {stays[0].prefix} survives")
+            self.say(f"  Homebrew's download folders stay: {at(stays[0])} uses them.")
             return
-        self.say("the shared Homebrew caches (no Homebrew instance survives)")
+        self.say("  No Homebrew is left, so its download folders go too.")
         for path in present:
             self.remove(path, brews[0])
 
@@ -806,8 +802,6 @@ class _Phase:
 
 class _Removal:
     """Phase 6 of one instance; the manager classes below supply the lists and the checks"""
-
-    title = ""
 
     def __init__(self, phase: _Phase, inst: Instance) -> None:
         """Gather the instance's services, index and earlier records for its removal
@@ -886,15 +880,16 @@ class _Removal:
         the first deletion a failure starts the booted-out services again before it stops the phase. Only a
         drivable instance gets the package check.
         """
-        self.p.say(f"phase 6: {self.title} at {self.prefix}")
+        if len(self.p.named) > 1:
+            self.p.say(f"  {at(self.inst)}:")
         target = self.p.target
         if _same(self.inst, target) or (system.identity(self.prefix) or ()) == tuple(target.identity or ()):
-            why: str | None = f"{self.prefix} is the target of this plan"
+            why: str | None = "it is where this plan moves the packages"
         else:
             why = self.precondition()
         if why:
             self.p.skipped.add(self.prefix)
-            self.p.say(f"  left in place, nothing archived or deleted: {why}")
+            self.p.say(f"  {at(self.inst)} stays, untouched: {why}.")
             return
         try:
             if not self.inst.drivable:
@@ -929,30 +924,27 @@ class _Removal:
         self.finish()
         if self.failures:
             raise Stopped(_result(f"6.delete.{self.subject}"),
-                          f"phase 6 could not delete {_brief(self.failures)}; fix the cause and run apply --resume",
-                          self.p.lines)
+                          f"{_brief(self.failures)} could not be deleted, so {at(self.inst)} is only partly "
+                          "uninstalled", self.p.lines)
 
     def failed_command(self, exc: ActionFailed) -> Stopped:
-        """Report a failed command and build the `Stopped` that ends the phase with it
+        """Build the `Stopped` that ends the phase with a failed command
 
         @param exc  the failure of a `STOP` action
-        @returns    the stop, with the command's result and the report so far
+        @returns    the stop, with the command's result and the report so far; `apply` prints its reason
         """
-        reason = f"{exc.result.action_id} failed with exit {exc.result.exit}"
-        self.p.say("  stopped: " + reason)
-        return Stopped(exc.result, reason, self.p.lines)
+        return Stopped(exc.result, apply_report.failed(exc.result), self.p.lines)
 
     def fail(self, result: Any, reason: str, details: Sequence[str] = ()) -> Stopped:
-        """Build a `Stopped` for a check, its details and reason put into the report first
+        """Build a `Stopped` for a check, its details put into the report first
 
         @param result   the check's result, or the action id of a check that ran no command
-        @param reason   why the phase stops
-        @param details  the report lines that come before the reason
+        @param reason   why the phase stops, which `apply` prints as its error
+        @param details  the report lines the reason refers to
         @returns        the stop, for the caller to raise
         """
         for line in details:
             self.p.say("    " + line)
-        self.p.say("  stopped: " + reason)
         return Stopped(result if isinstance(result, Result) else _result(str(result)), reason, self.p.lines)
 
     def stop_services(self) -> None:
@@ -969,19 +961,21 @@ class _Removal:
                               sleep=host.sleep, alive=host.alive)
         for svc in res.booted:
             self.booted.append(svc)
-            self.p.say(f"  booted out {svc.label} from {svc.domain}")
+            self.p.say(f"  Stopped the service {svc.label}.")
         if res.error is not None:
             raise res.error
         if res.still_running:
-            text = "; ".join(f"{svc.label}: {why}" for svc, why in res.still_running)
-            raise self.fail(f"6.stop.{res.still_running[0][0].label}", f"a service did not stop ({text})")
+            text = "; ".join(why for _, why in res.still_running)
+            raise self.fail(f"6.stop.{res.still_running[0][0].label}", f"{text}; nothing of {self.prefix} is deleted "
+                            "while it runs: stop it yourself, or quit what keeps it running")
 
     def restart(self) -> None:
         """Start the services this phase booted out again, while nothing is deleted"""
         if self.deleting or not self.booted:
             return
         for svc, ok in servicectl.restart(self.runner, self.booted, (), id_prefix=str(PHASE)):
-            self.p.say(("  started again: %s" if ok else "  could not start %s again: start it by hand") % svc.label)
+            self.p.say(("  Started the service %s again." if ok else
+                        "  Could not start the service %s again; start it yourself.") % svc.label)
         self.booted = []
 
     def check_processes(self) -> None:
@@ -997,15 +991,14 @@ class _Removal:
                         read_only=True)
         result = self.runner.run(action)
         if result.exit not in (0, 1):
-            raise self.fail(result, f"sudo lsof exited {result.exit}, so whether a process uses {self.prefix} "
-                            "is unknown")
+            raise self.fail(result, f"`sudo lsof` failed (exit {result.exit}), so it is unknown whether a program "
+                            f"still uses {self.prefix}")
         hits = processes_under(parse_lsof(result.stdout()), self.index)
         if hits:
-            details = [f"PID {proc.pid} {proc.program or '(program unknown)'}: {_brief(names)}"
-                       for proc, names in hits]
-            raise self.fail(result, f"{_plural(len(hits), 'process', 'processes')} still "
-                            f"{'uses' if len(hits) == 1 else 'use'} {self.prefix}: stop "
-                            f"{'it' if len(hits) == 1 else 'them'}, then run apply --resume", details)
+            details = [f"{proc.program or 'a program'} (pid {proc.pid}): {_brief(names)}" for proc, names in hits]
+            one = len(hits) == 1
+            raise self.fail(result, f"{counted(len(hits), 'program')} still {'uses' if one else 'use'} {self.prefix}, "
+                            f"listed above; quit {'it' if one else 'them'} first", details)
 
     def check_space(self) -> None:
         """Stop the phase unless the run directory's volume has room for all it still archives plus 1 GiB
@@ -1024,15 +1017,17 @@ class _Removal:
             sizes = parse_du(result.stdout())
             unknown = [p for p in paths if p not in sizes]
             if unknown:
-                raise self.fail(result, f"sudo du gave no size for {_brief(unknown)}")
+                raise self.fail(result, f"`sudo du` gave no size for {_brief(unknown)}, so the room its copy needs "
+                                "is unknown")
             total = sum(sizes[p] for p in paths) * 1024
         free = self.p.host.free_bytes(self.p.run_dir.path)
         if free is None or free < total + MARGIN:
             raise self.fail(result or f"6.check.du.{self.subject}",
-                            f"the run directory's volume has {'an unknown amount' if free is None else _size(free)} "
-                            f"free; the archives of {self.prefix} need {_size(total)} plus 1 GiB")
-        self.p.say(f"  checks passed: no process uses {self.prefix}; {_size(free)} free for {_size(total)} of "
-                   "archives plus 1 GiB")
+                            f"the disk of the run folder has {'an unknown amount' if free is None else _size(free)} "
+                            f"free; the settings and data of {self.prefix} to save need {_size(total)} plus 1 GiB. "
+                            "Free up space there first")
+        self.p.say(f"  Checked: no program uses {self.prefix}, and {_size(free)} is free for the {_size(total)} to "
+                   "save.")
 
     def to_archive(self) -> list[str]:
         """Return every path this phase still archives from the instance
@@ -1061,21 +1056,29 @@ class _Removal:
         @param archives       the archives, in order; their paths that are gone are left out
         @throws ActionFailed  when `tar` fails, a `STOP` action, which stops the phase
         """
-        for arc in archives:
-            dst = os.path.join(self.p.run_dir.path, ARCHIVES, arc.subject + ".tar.gz")
-            if self.kept_archive(arc):
-                self.archived.extend(arc.paths)
-                self.p.say(f"  kept from the first attempt: {dst}")
-                continue
-            paths = [p for p in arc.paths if os.path.lexists(p)]
-            if not paths:
-                continue
-            action = Action(action_id=f"6.archive.{arc.subject}", kind="command",
-                            argv=[TAR, "-czf", "-", "-C", "/"] + [p.lstrip("/") for p in paths], sudo=True,
-                            description=f"archive {', '.join(paths)} into {dst}", dst=dst)
-            self.runner.run(action)
-            self.archived.extend(paths)
-            self.p.say(f"  archived {_brief(paths)} as {dst}")
+        kept: list[str] = []
+        saved: list[str] = []
+        try:
+            for arc in archives:
+                dst = os.path.join(self.p.run_dir.path, ARCHIVES, arc.subject + ".tar.gz")
+                if self.kept_archive(arc):
+                    self.archived.extend(arc.paths)
+                    kept.extend(arc.paths)
+                    continue
+                paths = [p for p in arc.paths if os.path.lexists(p)]
+                if not paths:
+                    continue
+                action = Action(action_id=f"6.archive.{arc.subject}", kind="command",
+                                argv=[TAR, "-czf", "-", "-C", "/"] + [p.lstrip("/") for p in paths], sudo=True,
+                                description=f"archive {', '.join(paths)} into {dst}", dst=dst)
+                self.runner.run(action)
+                self.archived.extend(paths)
+                saved.extend(paths)
+        finally:
+            if kept:
+                self.p.say(f"  Saved by an earlier attempt: {some(kept, SAVED_SHOWN)}")
+            if saved:
+                self.p.say(f"  Saved in the folder {ARCHIVES} of the run folder: {some(saved, SAVED_SHOWN)}")
 
     def covered(self, path: str) -> bool:
         """Return whether `path` lies inside an archive this phase took, or kept, of the instance
@@ -1116,15 +1119,13 @@ class _Removal:
         The job itself is left alone.
         """
         for svc in self.services:
-            if not svc.owned:
-                self.p.say(f"  will stop working: {svc.plist} runs {svc.program or self.prefix}; edit or remove it "
-                           "by hand")
+            if not svc.owned and not os.path.lexists(svc.program or self.prefix):
+                self.p.say(f"  Your own service file {svc.plist} runs {svc.program or self.prefix}, which is gone: "
+                           "edit or delete it.")
 
 
 class _MacPorts(_Removal):
     """Phase 6 for a MacPorts instance: archive first, then delete"""
-
-    title = "MacPorts"
 
     def __init__(self, phase: _Phase, inst: Instance) -> None:
         """Start the removal of a MacPorts instance; `prepare` reads its configuration and files
@@ -1149,7 +1150,7 @@ class _MacPorts(_Removal):
         """
         if self.identity_record is not None or os.path.isfile(os.path.join(self.prefix, MACPORTS_CONF)):
             return None
-        return f"{self.prefix} holds no {MACPORTS_CONF}"
+        return f"it holds no {MACPORTS_CONF}, so nothing shows that it is MacPorts"
 
     def markers(self) -> list[str]:
         """Return the MacPorts marker file when the prefix holds it
@@ -1195,15 +1196,15 @@ class _MacPorts(_Removal):
         except registry.RegistryMissing:
             return set()
         except (registry.RegistryBusy, sqlite3.DatabaseError, OSError) as exc:
-            raise self.fail(action_id, f"the registry of {self.prefix} cannot be read ({type(exc).__name__}: {exc}), "
-                                       "so its unregistered files are unknown")
+            raise self.fail(action_id, f"MacPorts' record of what is installed in {self.prefix} cannot be read "
+                                       f"({exc}), so the files that no port installed are unknown")
         out: set[str] = set()
         try:
             rows = reg.files_below(self.root)
             if self.inst.applications_dir:
                 rows += reg.files_below(self.inst.applications_dir)
         except sqlite3.DatabaseError as exc:
-            raise self.fail(action_id, f"the registry backup of {self.prefix} cannot be read ({exc})")
+            raise self.fail(action_id, f"the saved copy of MacPorts' record of {self.prefix} cannot be read ({exc})")
         finally:
             reg.close()
         for _, row in rows:
@@ -1228,10 +1229,11 @@ class _MacPorts(_Removal):
         except registry.RegistryMissing:
             return
         except (registry.RegistryBusy, sqlite3.DatabaseError, OSError) as exc:
-            raise self.fail(action_id, f"the registry of {self.prefix} cannot be read ({type(exc).__name__}: {exc})")
+            raise self.fail(action_id, f"MacPorts' record of what is installed in {self.prefix} cannot be read "
+                                       f"({exc}), so whether a port is left is unknown")
         if rows:
-            raise self.fail(action_id, f"{self.prefix} still holds {_plural(len(rows), 'port')}, which phase 5 "
-                            "should have removed", [" ".join(r.spec_args) for r in rows[:20]])
+            raise self.fail(action_id, f"{self.prefix} still holds {counted(len(rows), 'port')}, listed above, which "
+                            "phase 5 should have uninstalled", [" ".join(r.spec_args) for r in rows[:20]])
 
     def archives(self) -> list[_Archive]:
         """Return one archive per path of the MacPorts archive list
@@ -1259,18 +1261,25 @@ class _MacPorts(_Removal):
         found = self.unregistered
         if not found.units:
             return
-        self.p.say(f"  {_plural(found.count, 'unregistered entry', 'unregistered entries')} in {self.prefix}, "
-                   "neither base's nor under var/macports nor registered to a port:")
+        one = len(found.units) == 1
+        self.p.say(f"  {counted(len(found.units), 'item')} in {self.prefix} ({counted(found.count, 'file')}) "
+                   f"{'was' if one else 'were'} not installed by a port:")
         for unit in found.units:
             self.p.say(f"    {unit}{'/' if os.path.isdir(unit) and (not os.path.islink(unit)) else ''}")
-        question = (f"Delete {self.prefix} with these unregistered entries? Each is archived under "
-                    f"{os.path.join(self.p.run_dir.path, ARCHIVES)} first.")
-        if self.p.confirm(question):
+        them = "it" if one else "them"
+        if self.p.ask.yes:
+            self.p.say(f"  --yes answers for you: {'it is' if one else 'they are'} saved in the run folder, then "
+                       f"deleted with {self.prefix}.")
+        else:
+            self.p.say(f"  y saves {them} in the run folder, then deletes {them} with {self.prefix}.")
+            self.p.say(f"  n keeps {self.prefix} with everything in it; what MacPorts put outside it is still "
+                       "deleted.")
+        if self.p.confirm(f"Delete {self.prefix} with {'this item' if one else 'these items'}?"):
             self.take([_Archive(u, [u]) for u in found.units if not self.covered(u)])
             return
         self.keep = True
         self.p.kept.add(self.prefix)
-        self.p.say(f"  kept: {self.prefix} stays with its unregistered entries; the rest of its delete list goes")
+        self.p.say(f"  {self.prefix} stays with everything in it, as you answered.")
 
     def delete(self) -> None:
         """Delete the `macports` user and group, the delete list, then the installer receipt once the prefix is gone
@@ -1305,14 +1314,14 @@ class _MacPorts(_Removal):
             return
         if self.keep and system.text_names_prefix(path, [self.prefix], False):
             if os.path.normpath(path) != os.path.normpath(self.prefix):
-                self.p.say(f"  kept with {self.prefix}: {path}")
+                self.p.say(f"  {path} stays with {self.prefix}.")
             return
         why = self.p.unsafe(path, self.inst)
         apps = self.inst.applications_dir
         if why is None and apps and os.path.normpath(path) == os.path.normpath(apps):
             why = self.apps_refusal(path)
         if why:
-            self.p.say(f"  never deleted: {path} ({why})")
+            self.p.say(f"  {path} stays: {why}.")
             return
         if home and os.path.normpath(home) != os.path.normpath(path) and system.text_names_prefix(home, [path], False):
             self.remove_around(path, home)
@@ -1329,7 +1338,7 @@ class _MacPorts(_Removal):
         """
         strays = [p for p in _files_below(apps) if system.normalise_text_path(p, False) not in self.registered]
         if strays:
-            return f"it holds entries no port of this instance registered: {_brief(strays)}"
+            return f"it holds files that no port of {self.prefix} installed: {_brief(strays)}"
         return None
 
     def remove_around(self, path: str, keep: str) -> None:
@@ -1345,7 +1354,7 @@ class _MacPorts(_Removal):
             names = _entries(current)
             if names is None:
                 self.failures.append(current)
-                self.p.say(f"  could not list {current}")
+                self.p.say(f"  Could not list {current}.")
                 return
             following = None
             for name in names:
@@ -1357,7 +1366,7 @@ class _MacPorts(_Removal):
             if following is None:
                 break
             current = following
-        self.p.say(f"  left in place: {keep}, the home of the {self.user} user, which stays")
+        self.p.say(f"  {keep} stays: it is the home of the user {self.user}, who stays.")
 
     def deleted_roots(self) -> list[str]:
         """Return the paths of the delete list a user's home may lie under, where the safety rules let them go
@@ -1390,18 +1399,18 @@ class _MacPorts(_Removal):
         if not home or not any(system.text_names_prefix(home, [p], False) for p in self.deleted_roots()):
             return None
         if self.user != MACPORTS_USER:
-            self.p.say(f"  the MacPorts user is {self.user} (macportsuser in macports.conf), which phase 6 never "
-                       "deletes")
+            self.p.say(f"  The user {self.user} stays: macports.conf names it as MacPorts' user (macportsuser), and "
+                       "brew-ports deletes only the user macports.")
             return home
         if others:
-            self.p.say("  the macports user stays, because another MacPorts instance survives")
+            self.p.say("  The user macports stays: another MacPorts uses it.")
             return home
         user_gone = self.dscl_delete("/Users/macports")
         group_gone = self.dscl_delete("/Groups/macports")
         if not user_gone:
-            self.p.say("  could not delete the macports user")
+            self.p.say("  Could not delete the user macports.")
             return home
-        self.p.say(f"  deleted the macports user{' and group' if group_gone else '; the macports group stays'}")
+        self.p.say(f"  Deleted the user macports{' and its group' if group_gone else '; its group stays'}.")
         return None
 
     def dscl_delete(self, record: str) -> bool:
@@ -1428,7 +1437,7 @@ class _MacPorts(_Removal):
             pattern = os.path.join(glob.escape(os.path.join(self.p.host.library, sub)), "org.macports.*.plist")
             for path in sorted(glob.glob(pattern)):
                 if path not in owned and path not in elsewhere:
-                    self.p.say(f"  never deleted: {path} (no plist MacPorts owns, or one the tool could not read)")
+                    self.p.say(f"  {path} stays: it is not a service file of MacPorts, or it could not be read.")
 
     def forget(self) -> None:
         """Forget the MacPorts installer receipt with `sudo pkgutil --forget` when its files lie under this prefix
@@ -1439,13 +1448,14 @@ class _MacPorts(_Removal):
         if not receipt:
             return
         if not receipt_under(receipt, self.inst):
-            self.p.say(f"  the MacPorts installer receipt names files outside {self.prefix}: it stays")
+            self.p.say("  The record macOS keeps of the MacPorts installer stays: it names files outside "
+                       f"{self.prefix}.")
             return
         action = Action(action_id=f"6.pkgutil.{PKG_ID}", kind="command", argv=[PKGUTIL, "--forget", PKG_ID],
                         sudo=True, description="forget the MacPorts installer receipt", on_failure=OnFailure.PROBE)
         ok = self.runner.run(action).exit == 0
-        self.p.say(("  forgot the installer receipt %s" if ok else "  could not forget the installer receipt %s")
-                   % PKG_ID)
+        self.p.say(("  Deleted the record macOS keeps of the MacPorts installer (%s)." if ok else
+                    "  Could not delete the record macOS keeps of the MacPorts installer (%s).") % PKG_ID)
 
     def finish(self) -> None:
         """List the users' own jobs, then journal the prefix a "no" keeps with its unregistered entries
@@ -1459,8 +1469,6 @@ class _MacPorts(_Removal):
 
 class _Homebrew(_Removal):
     """Phase 6 for a source Homebrew instance; the target prefix is never touched"""
-
-    title = "Homebrew"
 
     def __init__(self, phase: _Phase, inst: Instance) -> None:
         """Start the removal of a Homebrew instance; `prepare` reads its repository's state
@@ -1484,12 +1492,12 @@ class _Homebrew(_Removal):
         snap = snapshot.brew_dir(self.p.run_dir, self.prefix)
         missing = [n for n in (snapshot.FORMULAE, snapshot.CASKS) if not os.path.isfile(os.path.join(snap, n))]
         if missing:
-            return f"the phase 1 snapshot of {self.prefix} lacks {', '.join(missing)}"
+            return f"the record saved for undo lacks {apply_report.series(missing)}"
         if not self.p.origin_ok(self.inst):
-            return (f"{self.prefix} is not /opt/homebrew, /usr/local, HOMEBREW_PREFIX or a prefix found through "
-                    "its own brew")
+            return ("it is not /opt/homebrew, /usr/local, HOMEBREW_PREFIX or a folder found through its own `brew`, "
+                    "so nothing shows that Homebrew made it")
         if self.identity_record is None and not self.markers():
-            return f"{self.prefix} holds neither bin/brew nor Cellar"
+            return "it holds neither bin/brew nor Cellar, so nothing shows that it is Homebrew"
         return None
 
     def markers(self) -> list[str]:
@@ -1526,7 +1534,8 @@ class _Homebrew(_Removal):
             left += [f"{sub}/{name}" for name in sorted(found)]
         if left:
             raise self.fail(f"6.check.packages.{self.subject}", f"{self.prefix} still holds "
-                            f"{_plural(len(left), 'package')}, which phase 5 should have removed", left[:20])
+                            f"{counted(len(left), 'package')}, listed above, which phase 5 should have uninstalled",
+                            left[:20])
 
     def repository_state(self) -> list[str] | None:
         """Return the `.git` and every existing path `status` lists when the repository holds local state
@@ -1554,19 +1563,20 @@ class _Homebrew(_Removal):
         if status.exit != 0:
             reasons.append(f"git status exited {status.exit}")
         elif changed:
-            reasons.append(_plural(len(changed), "changed path"))
+            reasons.append(counted(len(changed), "changed path"))
         count = commits.stdout().strip()
         if commits.exit != 0:
             reasons.append(f"git rev-list exited {commits.exit}")
         elif count.isdigit() and int(count) > 0:
-            reasons.append(_plural(int(count), "local commit"))
+            reasons.append(counted(int(count), "local commit"))
         if stash.exit == 0:
             reasons.append("a stash")
         elif stash.exit != 1:
             reasons.append(f"git rev-parse exited {stash.exit}")
         if not reasons:
             return None
-        self.p.say(f"  the repository {repo} holds local state ({', '.join(reasons)})")
+        self.p.say(f"  Homebrew's own files in {repo} hold changes of yours ({', '.join(reasons)}); they are saved "
+                   "too.")
         paths = [git_dir]
         for rel in changed:
             path = os.path.normpath(os.path.join(repo, rel))
@@ -1632,7 +1642,7 @@ class _Homebrew(_Removal):
         self.p.emptied.add(self.prefix)
         self.remaining()
         for token, path in trash:
-            self.p.say(f"  move to the Trash by hand: {path} (cask {token})")
+            self.p.say(f"  {path} stays: move the app of the cask {token} to the Trash yourself.")
 
     def cellar_links(self) -> dict[str, list[str]]:
         """Find the links into the prefix's `Cellar`, `Caskroom` or `opt`, before the Cellar goes
@@ -1675,12 +1685,12 @@ class _Homebrew(_Removal):
                 continue
             why = self.p.unsafe(directory, self.inst)
             if why:
-                self.p.say(f"  never deleted: the links into the Cellar in {directory} ({why})")
+                self.p.say(f"  The links in {directory} to Homebrew's packages stay: {why}.")
                 continue
             escalate = not os.access(directory, os.W_OK)
             for number, chunk in enumerate(_chunks(names, ARGV_BUDGET)):
                 action_id = f"6.links.{state.slug(directory)}{'' if number == 0 else f'.{number + 1}'}"
-                what = f"delete {_plural(len(chunk), 'link')} into the Cellar in {directory}"
+                what = f"delete {counted(len(chunk), 'link')} into the Cellar in {directory}"
                 self.p.rm(action_id, [RM, "-f"] + chunk, escalate, what)
                 rest = [link for link in chunk if os.path.lexists(link)]
                 if rest and not escalate:
@@ -1688,10 +1698,10 @@ class _Homebrew(_Removal):
                     rest = [link for link in rest if os.path.lexists(link)]
                 for link in rest:
                     self.failures.append(link)
-                    self.p.say(f"  could not delete {link}")
+                    self.p.say(f"  Could not delete {link}.")
                 count += len(chunk) - len(rest)
         if count:
-            self.p.say(f"  deleted {_plural(count, 'link')} into the Cellar")
+            self.p.say(f"  Deleted {counted(count, 'link')} to Homebrew's packages.")
 
     def remove_emptied(self, directories: Iterable[str]) -> None:
         """Remove the directories the link removal and the enumerated list left empty, deepest first
@@ -1718,7 +1728,7 @@ class _Homebrew(_Removal):
             if self.remove(directory, flags="-d", quiet=True):
                 removed += 1
         if removed:
-            self.p.say(f"  deleted {_plural(removed, 'directory', 'directories')} the links left empty")
+            self.p.say(f"  Deleted {counted(removed, 'folder')} the links left empty.")
 
     def paths_d(self) -> None:
         """Delete `/etc/paths.d/homebrew` when its only line is `<prefix>/bin`
@@ -1732,7 +1742,7 @@ class _Homebrew(_Removal):
         except FileNotFoundError:
             return
         except OSError as exc:
-            self.p.say(f"  left in place: {path} ({exc.strerror or exc})")
+            self.p.say(f"  {path} stays: it cannot be read ({exc.strerror or exc}).")
             return
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         fold = env.fold_case_for(self.inst)
@@ -1740,11 +1750,11 @@ class _Homebrew(_Removal):
                 for s in (self.prefix,) + tuple(self.inst.spellings or ())}
         if len(lines) != 1 or system.normalise_text_path(lines[0], fold) not in bins:
             if any(system.normalise_text_path(line, fold) in bins for line in lines):
-                self.p.say(f"  left in place: {path}, which names more than {self.prefix}/bin")
+                self.p.say(f"  {path} stays: it names more than {self.prefix}/bin.")
             return
         why = self.p.unsafe(path, self.inst)
         if why:
-            self.p.say(f"  never deleted: {path} ({why})")
+            self.p.say(f"  {path} stays: {why}.")
             return
         # The readable original that `rollback` replays; root's own copy goes to the store.
         self.p.run_dir.etc_copy(path, "paths.d/homebrew")
@@ -1752,7 +1762,8 @@ class _Homebrew(_Removal):
             self.p.root_files().backup(path)
         except ActionFailed as exc:
             self.failures.append(path)
-            self.p.say(f"  not deleted: {path}, whose copy into the root backup store failed (exit {exc.result.exit})")
+            self.p.say(f"  Could not delete {path}: the copy that undo needs could not be made (exit "
+                       f"{exc.result.exit}).")
             return
         self.remove(path, flags="-f", sudo=True, checked=True)
 
@@ -1814,18 +1825,27 @@ class _Homebrew(_Removal):
         """
         names = _entries(self.prefix)
         if names is None:
-            self.p.say(f"  left in place: {self.prefix}, which cannot be listed")
+            self.p.say(f"  {self.prefix} stays: it cannot be listed.")
             return
         if self.usr_local:
             if names:
-                self.p.say(f"  left in {self.prefix} for its other installers: {', '.join(names)}")
+                self.p.say(f"  {self.prefix} stays, because other installers use it too. It still holds: "
+                           f"{', '.join(names)}")
             return
         if names:
-            self.p.say(f"  {self.prefix} still holds {', '.join(names)}")
-            question = (f"Delete these remaining entries and {self.prefix} itself? Each is archived under "
-                        f"{os.path.join(self.p.run_dir.path, ARCHIVES)} first.")
-            if not self.p.confirm(question):
-                self.p.say(f"  left in place: {self.prefix} with {', '.join(names)}")
+            one = len(names) == 1
+            self.p.say(f"  {self.prefix} still holds {counted(len(names), 'item')} that Homebrew's own uninstall "
+                       f"leaves: {', '.join(names)}")
+            them = "it" if one else "them"
+            if self.p.ask.yes:
+                self.p.say(f"  --yes answers for you: {'it is' if one else 'they are'} saved in the run folder, then "
+                           f"deleted with {self.prefix}.")
+            else:
+                self.p.say(f"  y saves {them} in the run folder, then deletes {them} and {self.prefix} itself.")
+                self.p.say(f"  n keeps {self.prefix} with {them}."
+                           + ("" if self.failures else " Homebrew itself is already gone from it."))
+            if not self.p.confirm(f"Delete {self.prefix} with {'this item' if one else 'these items'}?"):
+                self.p.say(f"  {self.prefix} stays with {', '.join(names)}, as you answered.")
                 return
             entries = [os.path.join(self.prefix, n) for n in names]
             self.take([_Archive(e, [e]) for e in entries if not self.covered(e)])

@@ -58,8 +58,10 @@ class DedicatedPrefixTest(HomebrewTest):
         ask = b.Ask([True])
         lines = self.run_phase(inst, ask=ask)
         self.assertEqual(self.fake.archived(), [[p + "/var"], [p + "/etc"], [p + "/mydata"]])
-        self.assertEqual(len(ask.asked), 1)
-        self.assertIn(f"  {p} still holds etc, mydata, var", lines)
+        self.assertEqual(ask.asked, [f"Delete {p} with these items?"])
+        self.assertIn(f"  {p} still holds 3 items that Homebrew's own uninstall leaves: etc, mydata, var", lines)
+        self.assertIn(f"  y saves them in the run folder, then deletes them and {p} itself.", lines)
+        self.assertIn(f"  n keeps {p} with them. Homebrew itself is already gone from it.", lines)
         self.assertIn(stale, self.fake.removed())
         self.assertFalse(os.path.lexists(p))
         self.assertIn("6.delete." + state.slug(p), [e.get("action_id") for e in self.site.journal()])
@@ -74,7 +76,7 @@ class DedicatedPrefixTest(HomebrewTest):
             self.assertFalse(os.path.lexists(os.path.join(p, gone)), gone)
         for kept in ("mydata/notes.txt", "var/log/wget.log", "etc/wgetrc"):
             self.assertTrue(os.path.isfile(os.path.join(p, kept)), kept)
-        self.assertIn(f"  left in place: {p} with etc, mydata, var", lines)
+        self.assertIn(f"  {p} stays with etc, mydata, var, as you answered.", lines)
         self.assertEqual(self.fake.archived(), [[p + "/var"], [p + "/etc"]])
         self.assertFalse([e for e in self.site.journal() if str(e.get("action_id")).startswith("6.keep.")])
 
@@ -102,7 +104,8 @@ class RepositoryTest(HomebrewTest):
         self.assertEqual(repo, [[p + "/.git", p + "/Library/Homebrew/cmd/local.rb", p + "/untracked"]])
         self.assertTrue(os.path.isfile(self.site.archive(p + ".repository")))
         self.assertLess(self.fake.index(rm.TAR, p.lstrip("/") + "/.git"), self.fake.index(rm.RM))
-        self.assertIn(f"  the repository {p} holds local state (3 changed paths)", lines)
+        self.assertIn(f"  Homebrew's own files in {p} hold changes of yours (3 changed paths); they are saved too.",
+                      lines)
         self.assertFalse(os.path.lexists(p))
 
     def test_a_stash_alone_archives_the_git_directory(self):
@@ -110,21 +113,24 @@ class RepositoryTest(HomebrewTest):
         self.fake.git["rev-parse"] = r.FakeResponse(stdout="0123abcd\n")
         lines = self.run_phase(inst)
         self.assertIn([inst.prefix + "/.git"], self.fake.archived())
-        self.assertIn(f"  the repository {inst.prefix} holds local state (a stash)", lines)
+        self.assertIn(f"  Homebrew's own files in {inst.prefix} hold changes of yours (a stash); they are saved too.",
+                      lines)
 
     def test_local_commits_alone_archive_the_git_directory(self):
         inst = self.site.homebrew()
         self.fake.git["rev-list"] = r.FakeResponse(stdout="2\n")
         lines = self.run_phase(inst)
         self.assertIn([inst.prefix + "/.git"], self.fake.archived())
-        self.assertIn(f"  the repository {inst.prefix} holds local state (2 local commits)", lines)
+        self.assertIn(f"  Homebrew's own files in {inst.prefix} hold changes of yours (2 local commits); they are "
+                      "saved too.", lines)
 
     def test_unreadable_repository_archives_git_dir(self):
         inst = self.site.homebrew()
         self.fake.git["status"] = r.FakeResponse(exit=128, stderr="fatal: detected dubious ownership\n")
         lines = self.run_phase(inst)
         self.assertIn([inst.prefix + "/.git"], self.fake.archived())
-        self.assertIn(f"  the repository {inst.prefix} holds local state (git status exited 128)", lines)
+        self.assertIn(f"  Homebrew's own files in {inst.prefix} hold changes of yours (git status exited 128); they "
+                      "are saved too.", lines)
 
     def test_a_clean_repository_is_not_archived(self):
         inst = self.site.homebrew()
@@ -157,7 +163,8 @@ class UsrLocalTest(HomebrewTest):
             self.assertFalse(os.path.lexists(os.path.join(u, gone)), gone)
         self.assertTrue(os.path.isdir(u))
         self.assertNotIn(u, self.fake.removed())
-        self.assertIn(f"  left in {u} for its other installers: bin, etc, go, share, texlive, var", lines)
+        self.assertIn(f"  {u} stays, because other installers use it too. It still holds: bin, etc, go, share, "
+                      "texlive, var", lines)
 
     def test_usr_local_shared_directories_stay(self):
         inst = self.site.homebrew(usr_local=True, drivable=False)
@@ -190,7 +197,7 @@ class SystemFilesTest(HomebrewTest):
         lines = self.run_phase(inst)
         self.assertTrue(os.path.isfile(path))
         self.assertEqual(self.fake.ran(r.CP), [])
-        self.assertIn(f"  left in place: {path}, which names more than {inst.prefix}/bin", lines)
+        self.assertIn(f"  {path} stays: it names more than {inst.prefix}/bin.", lines)
 
     def test_application_links_go_other_apps_stay(self):
         inst = self.site.homebrew(drivable=False)
@@ -245,7 +252,7 @@ class CachesTest(HomebrewTest):
         lines = self.run_phase(inst, others=[other])
         for path in paths:
             self.assertTrue(os.path.isdir(path), path)
-        self.assertIn(f"the shared Homebrew caches stay: Homebrew at {other.prefix} survives", lines)
+        self.assertIn(f"  Homebrew's download folders stay: Homebrew at {other.prefix} uses them.", lines)
         self.assertTrue(os.path.isfile(os.path.join(other.prefix, "bin", "brew")))
 
     def test_moved_cache_directory_is_reported_and_kept(self):
@@ -253,8 +260,8 @@ class CachesTest(HomebrewTest):
         inst = self.site.homebrew(cache_dir=os.path.dirname(custom))
         lines = self.run_phase(inst)
         self.assertTrue(os.path.isfile(custom))
-        self.assertIn(f"Homebrew cache of {inst.prefix} left in place: {os.path.dirname(custom)} "
-                      "(set by HOMEBREW_CACHE)", lines)
+        self.assertIn(f"  {os.path.dirname(custom)} stays: it is the download folder you set with HOMEBREW_CACHE.",
+                      lines)
 
 
 class ServicesTest(HomebrewTest):
@@ -293,7 +300,8 @@ class ServicesTest(HomebrewTest):
             return original(argv, sudo)
         with mock.patch.object(self.fake, "launchctl", stubborn), self.assertRaises(rm.Stopped) as cm:
             self.run_phase(inst, [svc])
-        self.assertIn("a service did not stop", str(cm.exception))
+        self.assertIn(f"did not stop within 12 s; nothing of {inst.prefix} is deleted while it runs: stop it yourself, "
+                      "or quit what keeps it running", str(cm.exception))
         self.assertEqual(self.fake.removed(), [])
         self.assertTrue(os.path.isfile(plist))
 
@@ -303,8 +311,8 @@ class ServicesTest(HomebrewTest):
                              os.path.join(inst.prefix, "bin", "wget"))
         job = b.service("local.mine", mine, inst.prefix, owned=False, program=os.path.join(inst.prefix, "bin", "wget"))
         lines = self.run_phase(inst, [job])
-        self.assertIn(f"  will stop working: {mine} runs {inst.prefix}/bin/wget; edit or remove it by hand",
-                      lines)
+        self.assertIn(f"  Your own service file ~/Library/LaunchAgents/local.mine.plist runs {inst.prefix}/bin/wget, "
+                      "which is gone: edit or delete it.", lines)
         self.assertTrue(os.path.isfile(mine))
 
 
@@ -321,7 +329,7 @@ class CasksTest(HomebrewTest):
                                 companions=[], selections=[], variants_note=None, adopt=True)
         lines = self.run_phase(inst, mappings=[adopted],
                                path_removed={p: [("cask-adopted", "bar"), ("cask", "foo"), ("formula", "wget")]})
-        self.assertIn(f"  move to the Trash by hand: {trash_app} (cask foo)", lines)
+        self.assertIn(f"  {trash_app} stays: move the app of the cask foo to the Trash yourself.", lines)
         self.assertFalse([line for line in lines if "Bar.app" in line])
         self.assertTrue(os.path.isfile(os.path.join(trash_app, "Contents", "Info.plist")))
         self.assertTrue(os.path.isfile(os.path.join(adopted_app, "Contents", "Info.plist")))
@@ -341,16 +349,16 @@ class PreconditionTest(HomebrewTest):
         os.unlink(os.path.join(inst.prefix, "bin", "brew"))
         shutil.rmtree(os.path.join(inst.prefix, "Cellar"))
         lines = self.run_phase(inst)
-        self.assertIn(f"  left in place, nothing archived or deleted: {inst.prefix} holds neither bin/brew nor Cellar",
-                      lines)
+        self.assertIn(f"  Homebrew at {inst.prefix} stays, untouched: it holds neither bin/brew nor Cellar, so nothing "
+                      "shows that it is Homebrew.", lines)
         self.assertEqual(self.fake.commands, [])
 
     def test_prefix_without_phase_1_snapshot_stays(self):
         inst = self.site.homebrew()
         shutil.rmtree(snapshot.brew_dir(self.site.run_dir, inst.prefix))
         lines = self.run_phase(inst)
-        self.assertIn(f"  left in place, nothing archived or deleted: the phase 1 snapshot of {inst.prefix} lacks "
-                      "all-formulae.txt, casks.txt", lines)
+        self.assertIn(f"  Homebrew at {inst.prefix} stays, untouched: the record saved for undo lacks all-formulae.txt "
+                      "and casks.txt.", lines)
         self.assertEqual(self.fake.commands, [])
 
     def test_prefix_of_an_unaccepted_origin_stays(self):

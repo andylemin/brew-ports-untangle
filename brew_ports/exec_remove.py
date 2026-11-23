@@ -12,12 +12,13 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import plan_sets, servicectl, state, system
+from . import apply_report, plan_sets, servicectl, state, system
 from .exec_run import EXIT_ACTION, Stop, phase6_prefixes
 from .homebrew import actions as brew_actions, inventory as brew_inventory
 from .macports import actions as mp_actions, registry
 from .model import Action, Instance, Manager, OnFailure, Service
 from .plan_sets import name_key
+from .report import at, counted, some, tilde
 from .runner import RM
 
 CHSH = system.CHSH
@@ -156,9 +157,9 @@ class Removal:
     def items(self) -> list[str]:
         """Return a `<kind> <name>` line for every package left to remove, a port's with its version
 
-        @returns  the lines: adopted casks, casks, formulae, then ports
+        @returns  the lines: the records of adopted apps, casks, formulae, then ports
         """
-        return ([f"cask-adopted {t}" for t in self.adopted] + [f"cask {t}" for t in self.casks]
+        return ([f"the record of the app {t}" for t in self.adopted] + [f"cask {t}" for t in self.casks]
                 + [f"formula {f}" for f in self.formulae] + [f"port {s[0]} {s[1]}" for s in self.ports])
 
 
@@ -242,11 +243,11 @@ def _expand_ports(inst: Instance, pairs: Sequence[tuple[str, str]]) -> Removal:
     except registry.RegistryMissing:
         if inst.inventory_known:
             return out
-        raise Stop(EXIT_ACTION, [f"the registry of {inst.prefix} is missing and its packages are unknown: nothing was "
-                                 "removed from it"]) from None
+        raise Stop(EXIT_ACTION, [f"{at(inst)} has lost its record of what is installed, so what is left in it is "
+                                 "unknown", "  `brew-ports doctor` says how to repair it."]) from None
     except REGISTRY_ERRORS as exc:
-        raise Stop(EXIT_ACTION, [f"the registry of {inst.prefix} cannot be read ({type(exc).__name__}: {exc}): "
-                                 "nothing was removed from it"]) from None
+        raise Stop(EXIT_ACTION, [f"the record of what is installed in {at(inst)} cannot be read ({exc}), so what is "
+                                 "left in it is unknown", "  `brew-ports doctor` says how to repair it."]) from None
     with reg:
         rows = [r for r in reg.ports() if r.name.lower() in wanted]
         recorded = reg.dependencies()
@@ -280,7 +281,8 @@ def expand(run) -> list[Removal]:
             continue
         inst = run.fresh_instance(prefix)
         if inst is None:
-            raise Stop(EXIT_ACTION, [f"the source {prefix} is not found any more: nothing was removed from it"])
+            raise Stop(EXIT_ACTION, [f"no Homebrew or MacPorts is found in {prefix} any more, so nothing was "
+                                     "uninstalled from it", apply_report.MAKE_NEW_PLAN])
         out.append(_expand_brew(run, inst, pairs) if inst.manager is Manager.BREW else _expand_ports(inst, pairs))
     return out
 
@@ -366,14 +368,15 @@ def switch_shell(run, switch: ShellSwitch) -> None:
     @throws Stop   exit 4 when the target has no executable of the shell's name
     """
     if not os.access(switch.new, os.X_OK):
-        owner = switch.package or "a source prefix"
-        raise Stop(EXIT_ACTION, [f"the login shell {switch.old} belongs to {owner}, which this run removes, and the "
-                                 f"target has no executable {switch.new} to switch to: nothing was removed"])
+        owner = f"the package {switch.package}" if switch.package else "an installation"
+        raise Stop(EXIT_ACTION, [f"your login shell {switch.old} belongs to {owner} that this run uninstalls, and "
+                                 f"there is no {switch.new} to change to",
+                                 "  Change your login shell yourself first, for example: chsh -s /bin/zsh"])
     _write_shells(run, switch)
     run.journal({"action_id": "5.shell", "kind": "note", "user": switch.user, "from": switch.old, "to": switch.new})
-    run.runner.run(Action(action_id="5.shell", kind="command", argv=[CHSH, "-s", switch.new, switch.user], sudo=True,
-                          description=f"switch the login shell of {switch.user} from {switch.old} to {switch.new}"))
-    run.say(f"  login shell of {switch.user}: {switch.old} -> {switch.new}")
+    action = Action(action_id="5.shell", kind="command", argv=[CHSH, "-s", switch.new, switch.user], sudo=True,
+                    description=f"switch the login shell of {switch.user} from {switch.old} to {switch.new}")
+    run.result_line(action, run.runner.run(action))
 
 
 # Services -----------------------------------------------------------------------------------------
@@ -429,8 +432,12 @@ def restart_remaining(run, booted: Sequence[Service]) -> None:
     keys = installed_keys(run)
     remaining = [s for s in booted if keys is None or service_key(s) in keys]
     for service, ok in servicectl.restart(run.runner, remaining, run.instances, id_prefix="5"):
-        outcome = "started again" if ok else f"could NOT be started again from {service.plist}"
-        run.say(f"  {service.label} {outcome}")
+        if ok:
+            run.say(f"  Started the service {service.label} again.")
+        else:
+            run.say(f"  Could not start the service {service.label} again; start it yourself.")
+            run.todo.append(f"Start the service {service.label} again yourself; its service file is "
+                            f"{tilde(service.plist, run.home)}.")
 
 
 # The removal ---------------------------------------------------------------------------------------
@@ -516,31 +523,34 @@ def uninstall_actions(run, removal: Removal) -> list[Action]:
 
 def show_plan(run, steps: Sequence[tuple[Removal, list[Action]]], switch: ShellSwitch | None,
               services: Sequence[Service]) -> None:
-    """Print what phase 5 is about to run; `--dry-run` stops after it
+    """Print what phase 5 is about to do; `--dry-run` stops after it, and a run under `--yes` skips it
 
     @param run       the run
     @param steps     each source's removal with its actions
     @param switch    the login shell's switch, or None
     @param services  the services phase 5 stops
     """
+    if not run.dry_run and run.ctx.yes:
+        return
     if switch is not None:
-        run.say(f"  5.shell: add {switch.new} to {ETC_SHELLS} when it lacks it, then sudo {CHSH} -s {switch.new} "
-                f"{switch.user}")
-    for service in services:
-        where = service.domain or ("system" if service.scope == "system" else "gui/<uid> or user/<uid>")
-        sudo = "sudo " if where == "system" else ""
-        run.say(f"  5.stop.{service.label}: {sudo}launchctl bootout {where}/{service.label}, then wait for it to exit")
+        run.say(f"  Your login shell {switch.old} goes with its package, so it becomes {switch.new}, which "
+                f"{ETC_SHELLS} then lists.")
+    if services:
+        run.say(f"  Services to stop first: {some(s.label for s in services)}   (each service file is deleted once its "
+                "package is gone)")
     for removal, actions in steps:
         ids = {a.action_id for a in actions}
         for room in removal.adopted:
-            if f"5.adopted.{room}" not in ids:
-                token = adopted_token(run, removal.inst, removal.cask_tokens.get(room, room))
-                run.say(f"  5.adopted.{room}: the target's Caskroom does not hold {token}, so the record in "
-                        f"{removal.inst.prefix} stays")
+            if f"5.adopted.{room}" in ids:
+                continue
+            if run.dry_run:
+                run.say(f"  The record of the app {room} is deleted from {at(removal.inst)} once the Homebrew that "
+                        "stays has taken the app over.")
+            else:
+                run.say(f"  The record of the app {room} stays in {at(removal.inst)}: the Homebrew that stays has "
+                        "not taken the app over.")
         for action in actions:
             run.show(action)
-    if services:
-        run.say("  then the plists of the services whose packages are gone are deleted")
 
 
 def finish(run, services: Sequence[Service]) -> None:
@@ -555,14 +565,21 @@ def finish(run, services: Sequence[Service]) -> None:
     after = expand(run)
     left = {key for removal in after for key in removal.keys()}
     gone = [s for s in services if service_key(s) not in left]
-    for service, deleted in servicectl.delete_plists(run.runner, gone, id_prefix="5"):
-        if not deleted:
-            run.say(f"  could not delete the plist {service.plist}")
-    items = [f"{item} ({removal.inst.prefix})" for removal in after for item in removal.items()]
+    outcomes = servicectl.delete_plists(run.runner, gone, id_prefix="5")
+    deleted = [service for service, ok in outcomes if ok]
+    if deleted:
+        run.say(f"  Deleted {counted(len(deleted), 'service file')}.")
+    for service, ok in outcomes:
+        if not ok:
+            run.say(f"  Could not delete the service file {tilde(service.plist, run.home)}.")
+            run.todo.append(f"Delete the service file {tilde(service.plist, run.home)} yourself.")
+    items = [f"{item} in {at(removal.inst)}" for removal in after for item in removal.items()]
     if items:
-        raise Stop(EXIT_ACTION, [f"phase 5 left {len(items)} package(s) installed:"] + [f"  {i}" for i in items]
-                   + ["a dependent installed since the plan, or a bundle Homebrew cannot remove without sudo, can "
-                      "hold one back; their services were started again"])
+        raise Stop(EXIT_ACTION, [f"{counted(len(items), 'package')} could not be uninstalled"]
+                   + [f"    {item}" for item in items]
+                   + ["  A package installed after the plan was made may need one of them, or an app may need your "
+                      "password to be uninstalled.", "  Uninstall what holds them yourself, then continue with: "
+                      + apply_report.resume(run.run_dir.run_id)])
 
 
 def remove(run) -> None:
@@ -576,7 +593,6 @@ def remove(run) -> None:
     switch = shell_switch(run)
     services = selected_services(run)
     if not steps and switch is None and not services:
-        run.say("  nothing of the removal set is installed")
         return
     show_plan(run, steps, switch, services)
     if run.dry_run:
@@ -591,8 +607,10 @@ def remove(run) -> None:
         if stopped.error is not None:
             raise stopped.error
         if stopped.still_running:
-            raise Stop(EXIT_ACTION, [f"{s.label}: {why}" for s, why in stopped.still_running]
-                       + ["a service did not stop: nothing was removed"])
+            raise Stop(EXIT_ACTION, [why for _, why in stopped.still_running]
+                       + ["  Nothing is uninstalled while it runs: stop it yourself, or quit what keeps it running."])
+        for service in stopped.booted:
+            run.say(f"  Stopped the service {service.label}.")
         for _, actions in steps:
             for action in actions:
                 run.result_line(action, run.runner.run(action))

@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 from collections.abc import Callable
 
-from . import doctor, exec_env, exec_install, exec_remove, model, scan, snapshot, state, system
+from . import apply_report, doctor, exec_env, exec_install, exec_remove, model, scan, snapshot, state, system
+from .apply_report import MAKE_NEW_PLAN, NEW_PLAN
 from .context import Context
 from .exec_run import (DECLINED, EXIT_ACTION, EXIT_OK, EXIT_PREFLIGHT, EXIT_USAGE, EXIT_VERIFY, PLAN_FILE, SOURCE_BIN,
                        START, Run, Stop, module, phase6_prefixes)
 from .model import Instance, Manager, Plan, is_recorded_as
-from .report import at
+from .report import COMMAND_OF, at, counted, some, tilde, typed
 from .runner import ActionFailed, BaseRunner, EscalationFailed, Interrupted, PreflightError, command_runner
 
 # Phase 0 -------------------------------------------------------------------------------------
@@ -31,67 +33,67 @@ def plan_context(run: Run) -> doctor.PlanContext:
     pairs = list(plan.removal_set.items()) + list(plan.path_removed.items())
     casks = sorted({p for p, ps in pairs if any(kind in ("cask", "cask-adopted") for kind, _ in ps)})
     exempt = [p for p in list(plan.source_prefixes) + phase6_prefixes(plan) if run.phase6_begun(p)]
-    removed = [] if run.managers_stay else phase6_prefixes(plan)
     return doctor.PlanContext(
         target_prefix=run.fresh_prefix(plan.target_prefix),
         uninstall_prefixes=tuple(run.fresh_prefix(p) for p, ps in sorted(plan.removal_set.items()) if ps),
         cask_prefixes=tuple(run.fresh_prefix(p) for p in casks),
-        remove_prefixes=tuple(run.fresh_prefix(p) for p in removed),
+        remove_prefixes=tuple(run.fresh_prefix(p) for p in run.removed),
         exempt_prefixes=tuple(run.fresh_prefix(p) for p in exempt))
 
 
 def blocking_lines(run: Run) -> list[str]:
-    """Return the findings that block this plan (exit 3), each with its remedies
+    """Return the findings that stop this plan (exit 3), each with its fixes
 
     Low disk space does not count in a resumed run past phase 3, whose own installs used the space.
 
     @param run  the run, with the findings of its phase 0 scan
-    @returns    the lines to print; empty when nothing blocks
+    @returns    the lines to print; empty when nothing stops the plan
     """
     found = doctor.blocking(run.issues, plan_context(run))
     if run.resumed and run.past(3):
         found = [i for i in found if i.code != "system-low-disk-space"]
     lines = doctor.blocked_by_lines(found)
     if any((i.auto_fix or i.confirm_each) and any(not a.manual for a in i.remedies) for i in found):
-        lines.append("`brew-ports doctor --fix` applies the remedies the tool runs")
+        lines.append(f"  `brew-ports doctor --fix` runs the fixes it can; {NEW_PLAN} afterwards.")
     return lines
 
 
 def _repairs(run: Run, inst: Instance) -> str:
-    """Return how to repair an instance that cannot be driven: the findings `doctor --fix` repairs, else `doctor`
+    """Return how to repair an installation whose command cannot run: `doctor --fix` when it has a fix, else `doctor`
 
     @param run   the run, with the findings of its phase 0 scan
-    @param inst  the instance
-    @returns     the advice that ends the instance's line
+    @param inst  the installation
+    @returns     the advice under the installation's line
     """
-    codes = sorted({i.code for i in run.issues if i.instance_prefix == inst.prefix
-                    and (i.auto_fix or i.confirm_each) and i.remedies})
-    if codes:
-        return f"`brew-ports doctor --fix` repairs it ({', '.join(codes)})"
-    return "`brew-ports doctor` names the repair"
+    fixable = any(i.instance_prefix == inst.prefix and (i.auto_fix or i.confirm_each) and i.remedies
+                  for i in run.issues)
+    if fixable:
+        return f"`brew-ports doctor --fix` can repair it; {NEW_PLAN} afterwards."
+    return f"`brew-ports doctor` says what is wrong with it; {NEW_PLAN} once it is repaired."
 
 
 def drivability_lines(run: Run) -> list[str]:
-    """Return why the target, or a source the plan uninstalls from through its binary, cannot be driven
+    """Return why the plan cannot use the target, or an old installation it uninstalls from with its command
 
-    A source whose phase 6 deletion has begun is exempt.
+    An old installation whose phase 6 deletion has begun is exempt.
 
     @param run  the run, after its phase 0 scan
-    @returns    one line per instance that is gone or cannot be driven
+    @returns    a statement per installation that is gone or whose command cannot run, each with what to do
     """
     plan = run.plan
-    wanted = [(plan.target_prefix, "the target")]
+    wanted = [(plan.target_prefix, "installs into")]
     for prefix, pairs in sorted(plan.removal_set.items()):
         if any(kind != "cask-adopted" for kind, _ in pairs) and not run.phase6_begun(prefix):
-            wanted.append((prefix, "the source"))
+            wanted.append((prefix, "uninstalls from"))
     lines = []
-    for prefix, role in wanted:
+    for prefix, does in wanted:
         inst = run.fresh_instance(prefix)
         if inst is None:
-            lines.append(f"{role} {prefix} is not found on this host any more: re-plan")
+            lines += [f"the plan {does} {prefix}, where no Homebrew or MacPorts is found any more", MAKE_NEW_PLAN]
         elif not inst.drivable:
             detail = f": {inst.usability_detail}" if inst.usability_detail else ""
-            lines.append(f"{role} {prefix} cannot be driven ({inst.usability.value}{detail}): {_repairs(run, inst)}")
+            lines += [f"{at(inst)}: its `{COMMAND_OF[inst.manager]}` command cannot run{detail}",
+                      "  " + _repairs(run, inst)]
     return lines
 
 
@@ -107,7 +109,7 @@ def refused_lines(run: Run) -> list[str]:
         return []
     catalogue = run.bundle.catalogue(target.prefix)
     if catalogue is None:
-        run.say(f"  no Homebrew catalogue for {target.prefix}, so refused() is not asked")
+        run.say("  Could not check whether Homebrew has disabled a replacement: its package list is missing.")
         return []
     lines = []
     seen: set[tuple[str, str]] = set()
@@ -121,44 +123,46 @@ def refused_lines(run: Run) -> list[str]:
             why = catalogue.refused(name, kind)
             if why:
                 swap = why.get("replacement_formula") or why.get("replacement_cask")
-                hint = f"; plan with `--replace {m.source.name}={swap}`" if swap else ""
-                lines.append(f"Homebrew refuses to install {kind} {name}: disabled since {why.get('date')} "
-                             f"({why.get('because')}){hint}; re-plan")
+                hint = f" `--replace {m.source.name}={swap}` takes the one Homebrew names instead." if swap else ""
+                lines += [f"Homebrew has disabled {kind} {name} (since {why.get('date')}: {why.get('because')}), "
+                          "which the plan installs", MAKE_NEW_PLAN + hint]
     return lines
 
 
-def needs_sudo(run: Run) -> bool:
-    """Return whether anything of the plan escalates, so phase 0 runs `sudo -v`
+def sudo_reasons(run: Run) -> list[str]:
+    """Return what the run needs sudo for, so phase 0 can say it before `sudo -v` asks for the password
 
-    A source's line in `/etc/paths` counts, because phase 7 may rewrite that file.
+    A line of an old installation in `/etc/paths` counts, because phase 7 may rewrite that file.
 
     @param run  the run, after its phase 0 scan
-    @returns    True when a phase of the run calls sudo
+    @returns    the reasons, each a verb and its object; empty when no phase of the run calls sudo
     """
     plan = run.plan
-    if any(a.sudo for n in (2, 3) for a in run.actions(n)) or phase6_prefixes(plan):
-        return True
+    reasons = []
+    target = run.target
     starts = plan.options.get("start_services") == "true"
-    if plan.target is Manager.PORTS and (plan.target_upgrades or starts or any(m.selections for m in plan.mappings)):
-        return True
-    for prefix, pairs in plan.removal_set.items():
-        inst = run.instance(prefix)
-        if pairs and inst is not None and inst.manager is Manager.PORTS:
-            return True
-    if any(s.scope == "system" or s.domain == "system" for s in exec_remove.selected_services(run)):
-        return True
+    if any(a.sudo for n in (2, 3) for a in run.actions(n)) or (plan.target is Manager.PORTS and (
+            plan.target_upgrades or starts or any(m.selections for m in plan.mappings))):
+        reasons.append(f"change {at(target) if target is not None else plan.target_prefix}")
     if not snapshot.is_complete(run.run_dir) and any(
             inst.manager is Manager.PORTS and inst.drivable and "snapshot" in inst.features
             for inst in snapshot_instances(run)):
-        return True
+        reasons.append("save MacPorts' record of what is installed")
+    if any(pairs and (inst := run.instance(prefix)) is not None and inst.manager is Manager.PORTS
+           for prefix, pairs in plan.removal_set.items()):
+        reasons.append("uninstall ports")
+    if any(s.scope == "system" or s.domain == "system" for s in exec_remove.selected_services(run)):
+        reasons.append("stop a system service")
     if exec_remove.shell_switch(run) is not None:
-        return True
+        reasons.append("change your login shell")
+    if run.removed:
+        reasons.append(f"uninstall {apply_report.named(plan, run.removed)}")
     sources = {run.fresh_prefix(p) for p in plan.source_prefixes}
     for line in run.bundle.result.environment.get("etc_paths") or []:
         entry = (line or {}).get("entry") or {}
-        if not line.get("stock") and entry.get("instance_prefix") in sources:
-            return True
-    return False
+        if not line.get("stock") and entry.get("instance_prefix") in sources and "edit /etc/paths" not in reasons:
+            reasons.append("edit /etc/paths")
+    return reasons
 
 
 def record_source_bin(run: Run) -> None:
@@ -196,24 +200,25 @@ def preflight(run: Run) -> None:
     bundle = run.fresh_scan()
     if not run.dry_run:
         scan.write(bundle, run.run_dir)
-    run.say(f"  scan: {len(bundle.result.instances)} instance(s), {len(bundle.result.packages)} package(s)")
     run.issues = doctor.detect_all(bundle, run.runner)
     lines = blocking_lines(run) + drivability_lines(run) + refused_lines(run)
     if lines:
         if run.resumed and any("doctor --fix" in line for line in lines):
-            lines.append("a `brew-ports doctor --fix` repair changes the host, which makes this run's plan stale: "
-                         "plan again after it")
+            lines.append("  This run cannot be continued after `doctor --fix`: the new plan starts a new run.")
         raise Stop(EXIT_PREFLIGHT, lines)
-    run.say("  blocking findings: none")
+    run.say("  " + apply_report.NOTHING_STOPS)
     record_source_bin(run)
-    if run.dry_run:
+    reasons = sudo_reasons(run)
+    if reasons:
+        run.say("  " + apply_report.password(reasons, run.dry_run))
+    if run.dry_run or not reasons:
         return
-    if needs_sudo(run):
-        run.runner.sudo_preflight()
-        run.runner.keepalive(force=True)
-        if run.runner.keepalive_failed:
-            raise Stop(EXIT_PREFLIGHT, ["the first sudo keepalive failed: sudo caches no credentials"])
-        run.say("  sudo: credentials cached")
+    run.runner.sudo_preflight()
+    run.runner.keepalive(force=True)
+    if run.runner.keepalive_failed:
+        raise Stop(EXIT_PREFLIGHT, [
+            "sudo did not keep your password, so the commands that need it cannot run",
+            "  Check `timestamp_timeout` in the sudoers file: 0 makes sudo ask before every command."])
 
 
 # Phase 1 -------------------------------------------------------------------------------------
@@ -238,25 +243,43 @@ def rc_files(bundle) -> list[str]:
     return [f["path"] for f in files if isinstance(f, dict) and f.get("exists") and f.get("path")]
 
 
+def unsaved_parts(path: str | None) -> set[str]:
+    """Return the parts of the undo record that its notes file says could not be saved
+
+    @param path  the notes file, or None when the record has none
+    @returns     the different notes; none when there is no file or it cannot be read
+    """
+    if path is None:
+        return set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except OSError:
+        return set()
+
+
 def snapshot_phase(run: Run) -> None:
     """Run phase 1, skipped as a whole once its completion marker exists
 
-    Its files record the host before the run, so a resume never takes them again.
+    Its files record the Mac before the run, so a resume never takes them again. It asks nothing and leaves the
+    dirty marker alone: it uninstalls and deletes nothing, so a plan stays good after it.
 
     @param run  the run
     """
     if snapshot.is_complete(run.run_dir):
-        run.say("  the snapshot of this run is complete: not taken again")
         return
-    instances = snapshot_instances(run)
-    run.say(f"  snapshot of {', '.join((i.prefix for i in instances))} into {snapshot.snapshot_dir(run.run_dir)}")
     if run.dry_run:
+        run.say("  " + apply_report.record(True))
         return
-    run.confirm(1)
-    written = snapshot.write(run.runner, run.run_dir, run.bundle, instances, rc_files=rc_files(run.bundle),
-                             id_prefix="1", uid=run.uid)
-    if snapshot.NOTES in written:
-        run.say(f"  steps that failed are listed in {written[snapshot.NOTES]}")
+    with run.unmarked():
+        written = snapshot.write(run.runner, run.run_dir, run.bundle, snapshot_instances(run),
+                                 rc_files=rc_files(run.bundle), id_prefix="1", uid=run.uid)
+    run.say("  " + apply_report.record(False))
+    missing = unsaved_parts(written.get(snapshot.NOTES))
+    no_disk = {note for note in missing if note.startswith(snapshot.DISK_NOTE)}
+    if len(missing) > len(no_disk):
+        run.say("  " + apply_report.unsaved(len(missing) - len(no_disk)))
+    run.say("  " + (apply_report.NO_DISK_SNAPSHOT if no_disk else apply_report.DISK_SNAPSHOT))
 
 
 # Phase 4 -------------------------------------------------------------------------------------
@@ -266,7 +289,8 @@ def recovery_lines(run: Run, result) -> list[str]:
 
     @param run     the run
     @param result  the gate's result
-    @returns       the resume, re-plan and rollback commands
+    @returns       the command that continues the run, the plan that leaves the failed packages where they are,
+                   and the undo of a run that repaired something
     """
     roots: list[str] = []
     for m in run.plan.mappings:
@@ -274,11 +298,13 @@ def recovery_lines(run: Run, result) -> list[str]:
         if any(f.subject in subjects for f in result.failures) and m.source.name not in roots:
             roots.append(m.source.name)
     run_id = run.run_dir.run_id
-    keep = ",".join(roots) or "<root>"
-    return [f"fix the cause, then `brew-ports apply --resume {run_id}`",
-            f"or plan again and leave the failed ones where they are: `brew-ports plan --target "
-            f"{run.plan.target.value} --leave {keep}` (or an --only without them)",
-            f"or `brew-ports rollback {run_id}` reinstalls a target package a repair dropped"]
+    lines = [f"  Fix what the lines above name, then continue with: {apply_report.resume(run_id)}"]
+    if roots:
+        lines.append(f"  Or leave those packages where they are: make the plan again with `--leave {','.join(roots)}` "
+                     "added.")
+    if run.actions(2):
+        lines.append(f"  Or put back what the repairs of phase 2 uninstalled: brew-ports rollback {run_id}")
+    return lines
 
 
 def gate(run: Run) -> None:
@@ -291,16 +317,21 @@ def gate(run: Run) -> None:
     @throws Stop  exit 4 when the gate fails
     """
     if run.dry_run:
-        run.say("  replacements installed, commands provided and clean linkage over every root, companion and "
-                "the target, the packages active before the run still active, target_upgrades installed")
+        run.say(f"  Would check that {apply_report.GATE}.")
+        run.say("  No old package is uninstalled unless this passes.")
         return
     bundle = run.fresh_scan()
     result = module("verify").check(bundle, run.plan, run.runner, gate=True, run_dir=run.run_dir)
-    for line in result.lines():
-        run.say("  " + line)
-    if not result.ok:
-        run.journal({"action_id": "4.gate", "kind": "note", "failures": [f.line() for f in result.failures]})
-        raise Stop(EXIT_ACTION, ["the gate failed: no source package was removed"] + recovery_lines(run, result))
+    if result.ok:
+        run.say(f"  Passed: {apply_report.GATE}.")
+        return
+    for failure in result.failures:
+        run.say("  " + failure.line())
+    run.journal({"action_id": "4.gate", "kind": "note", "failures": [f.line() for f in result.failures]})
+    begun = any(entry.get("phase") == 5 for entry in run.entries)      # an earlier start uninstalled already
+    raise Stop(EXIT_ACTION, ["the check of the replacements failed" + (
+        ", so nothing more is uninstalled" if begun else ", so no old package was uninstalled")]
+        + recovery_lines(run, result))
 
 
 # Phase 6 -------------------------------------------------------------------------------------
@@ -318,29 +349,33 @@ def remove_managers(run: Run) -> None:
     """
     named = [p for p in run.plan.options.get("remove_manager", "").split(",") if p]
     if not named:
-        run.say("  no source manager is removed")
         return
     several = len(named) > 1
-    names = " and ".join(at(inst) if (inst := run.instance(p)) is not None else p for p in named)
+    names = apply_report.series(at(inst) if (inst := run.instance(p)) is not None else p for p in named)
     stays = f"  {names} {'stay' if several else 'stays'} installed, as you answered"
     if run.managers_stay:
-        run.say(stays)
+        run.say(stays + ".")
         return
-    phase = run.phase(6)
-    for action in phase.actions if phase else []:
-        run.say(f"  {action.action_id}: {doctor.describe(action)}")
+    if run.dry_run or not run.ctx.yes:
+        phase = run.phase(6)
+        for line in apply_report.preview(run.plan, phase.actions if phase else [], named):
+            run.say(line)
     if run.dry_run:
-        run.say("  (previews from the plan: phase 6 recomputes them from the live inventory)")
         return
-    if run.ctx.tty and not run.ctx.yes:
-        run.say(f"  a no leaves {names} installed, without {'their' if several else 'its'} packages, and the run "
-                "goes on")
-    if not run.agreed(6, f" for {', '.join(named)}"):
+    it, its = ("them", "their") if several else ("it", "its")
+    if run.asks:
+        run.say(f"  To undo this later, reinstall {it} first; `brew-ports rollback` then puts {its} packages back.")
+        run.say("  What is saved stays in the run folder, for you to copy back.")
+    whole = any(prefix in run.plan.path_removed for prefix in named)     # nothing was uninstalled from it
+    left = f"with what is still in {it}" if whole else f"without {its} packages"
+    if not run.agreed(6, f"Uninstall {names}?", f"n leaves {names} installed, {left}, and the run goes on."):
         if not run.ctx.tty:
             raise run.unconfirmed(6)
         run.journal({"action_id": DECLINED, "kind": "note", "prefixes": named})
-        run.say(f"{stays}; a new plan can uninstall {'them' if several else 'it'} later")
+        run.declined = True
+        run.say(f"{stays}; a new plan can uninstall {it} later.")
         return
+    run.flush()
     bundle = run.fresh_scan()                     # the host as phase 5 left it
     # remove_manager prints its lines as it makes them; they are kept here for report.md only.
     remove_manager = module("remove_manager")
@@ -354,29 +389,47 @@ def remove_managers(run: Run) -> None:
 
 # Phase 8 -------------------------------------------------------------------------------------
 
-def summary_lines(plan: Plan) -> list[str]:
-    """Return what the run leaves to the user: kept and left packages, manual casks, upgrades in place
+def summary_lines(run: Run) -> list[str]:
+    """Return the packages the run leaves in the old installations, and note what is left for the user to do
 
-    @param plan  the plan
-    @returns     the lines phase 8 prints before its checks
+    An app that only the user can uninstall joins the run's hand tasks.
+
+    @param run  the run
+    @returns    the lines phase 8 prints before its checks
     """
+    plan = run.plan
     lines = []
-    kept: dict[str, list[str]] = {}
-    for pkg in plan.kept:
-        kept.setdefault(pkg.instance_prefix, []).append(pkg.name)
-    for prefix, names in sorted(kept.items()):
-        lines.append(f"still provided by {prefix}: {', '.join(names)}")
-    left: dict[str, list[str]] = {}
-    for pkg in plan.left_in_place:
-        left.setdefault(pkg.instance_prefix, []).append(pkg.name)
-    for prefix, names in sorted(left.items()):
-        lines.append(f"left in place in {prefix}, which cannot be driven: {', '.join(names)}")
+    for packages, why in ((plan.kept, ""), (plan.left_in_place, ", whose `%s` command cannot run")):
+        held: dict[str, list[str]] = {}
+        for pkg in packages:
+            held.setdefault(pkg.instance_prefix, []).append(pkg.name)
+        for prefix, names in sorted(held.items()):
+            inst = run.instance(prefix)
+            where = at(inst) if inst is not None else prefix
+            reason = why % COMMAND_OF[inst.manager] if why and inst is not None else ""
+            lines.append(f"{counted(len(names), 'package')} stay{'s' if len(names) == 1 else ''} in {where}{reason}: "
+                         f"{some(names)}")
+    packages = run.bundle.result.packages if run.bundle is not None else []
+    sources = {run.fresh_prefix(prefix) for prefix in plan.source_prefixes}
     for token in plan.manual_casks:
-        lines.append("to run on a terminal after the migration (Homebrew calls sudo for it): `brew uninstall --cask "
-                     f"{token}`")
-    if plan.target_upgrades:
-        lines.append(f"upgraded in place in {plan.target_prefix}: {', '.join(plan.target_upgrades)}")
+        owner = next((p.instance_prefix for p in packages if p.kind == "cask" and p.name == token
+                      and p.instance_prefix in sources), None)
+        inst = run.instance(owner) if owner else None
+        brew = inst.binary if inst is not None and inst.binary else "brew"
+        task = (f"Uninstall the app {token} yourself, because Homebrew asks for your password: "
+                f"{typed([brew, 'uninstall', '--cask', token])}")
+        if task not in run.todo:
+            run.todo.append(task)
     return lines
+
+
+def uninstalled(run: Run) -> list[str]:
+    """Return the prefixes of the old installations that phase 6 was to uninstall and that are gone
+
+    @param run  the run, after its last scan
+    @returns    the prefixes where the scan finds no installation
+    """
+    return [prefix for prefix in run.removed if run.fresh_instance(prefix) is None]
 
 
 def verify_phase(run: Run) -> None:
@@ -385,19 +438,25 @@ def verify_phase(run: Run) -> None:
     @param run    the run
     @throws Stop  exit 5 when a check fails
     """
-    for line in summary_lines(run.plan):
+    for line in summary_lines(run):
         run.say("  " + line)
     if run.dry_run:
-        run.say("  verify over a fresh inventory, then report.md")
+        run.say("  Would check the result and write report.md to the run folder.")
         return
     bundle = run.fresh_scan()
     scan.write(bundle, run.run_dir)
     result = module("verify").check(bundle, run.plan, run.runner, run_dir=run.run_dir)
-    for line in result.lines():
-        run.say("  " + line)
+    if result.ok:
+        run.say("  Passed: the replacements are in place, and what the plan uninstalls is gone.")
+    for failure in result.failures:
+        run.say("  " + failure.line())
+    for note in result.reports:
+        run.say("  note " + note.line())
     if result.exit_code:
-        raise Stop(EXIT_VERIFY, [f"verify found {len(result.failures)} failure(s): `brew-ports verify "
-                                 f"{run.run_dir.sub(PLAN_FILE)}` checks again"])
+        raise Stop(EXIT_VERIFY, [
+            f"the final check found {counted(len(result.failures), 'failure')}, listed above",
+            "  Once they are settled, check again with: brew-ports verify "
+            + shlex.quote(run.run_dir.sub(PLAN_FILE))])
 
 
 PHASES: dict[int, Callable[[Run], None]] = {
@@ -424,20 +483,22 @@ def run_phases(run: Run) -> None:
     @throws Stop  exit 0 when `--stop-after` ends the run; a phase's own stop passes through
     """
     numbers = phase_numbers(run.plan)
+    run_id = run.run_dir.run_id
     for index, number in enumerate(numbers):
         run.header(number)
         PHASES[number](run)
+        run.heading = None
         if not run.dry_run:
             run.complete(number)
         following = numbers[index + 1] if index + 1 < len(numbers) else None
         if run.stop_after is not None and following is not None and following > run.stop_after:
-            dry = " --dry-run" if run.dry_run else ""
-            raise Stop(EXIT_OK, [f"apply{dry} stopped after phase {number} (--stop-after {run.stop_after})"])
-    run.say("")
+            raise Stop(EXIT_OK, apply_report.stopped_after(number, run.stop_after, run_id, run.dry_run), error=False)
     if run.dry_run:
-        run.say("apply --dry-run: nothing was changed and no marker was touched")
+        lines = apply_report.dry_finished(None if run.resumed else run.ctx.args.plan, run_id, run.todo)
     else:
-        run.say(f"apply: run {run.run_dir.run_id} finished")
+        lines = apply_report.finished(run.plan, uninstalled(run), run_id, run.todo)
+    for line in lines:
+        run.say(line)
 
 
 # Starting and resuming -----------------------------------------------------------------------
@@ -453,30 +514,33 @@ def read_plan(path: str) -> tuple[Plan, str]:
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
     except OSError as exc:
-        raise Stop(EXIT_USAGE, [f"cannot read {path}: {exc.strerror or exc}"]) from None
+        raise Stop(EXIT_USAGE, [f"cannot read {tilde(path)}: {exc.strerror or exc}",
+                                "  Give the file that `brew-ports plan` saved."]) from None
     try:
         data = json.loads(text)
-    except ValueError as exc:
-        raise Stop(EXIT_USAGE, [f"{path} is not JSON: {exc}"]) from None
+    except ValueError:
+        raise Stop(EXIT_USAGE, [f"{tilde(path)} is not a plan: it does not hold JSON", MAKE_NEW_PLAN]) from None
     if isinstance(data, dict) and "refused" in data:
         reasons = (data.get("refused") or {}).get("reasons") or []
-        raise Stop(EXIT_PREFLIGHT, [f"{path} is a refused plan (plan-refused.json): re-plan"]
-                   + [f"  {r}" for r in reasons])
+        raise Stop(EXIT_PREFLIGHT, [f"{tilde(path)} is not a plan: it holds the reasons why no plan was made"]
+                   + [f"    {r}" for r in reasons] + ["  Settle them, then " + NEW_PLAN + "."])
     try:
         plan = model.from_dict(Plan, data)
-    except (TypeError, KeyError, ValueError, AttributeError) as exc:
-        raise Stop(EXIT_USAGE, [f"{path} is not a plan: {exc}"]) from None
+    except (TypeError, KeyError, ValueError, AttributeError):
+        raise Stop(EXIT_USAGE, [f"{tilde(path)} is not a plan this version of brew-ports can read",
+                                MAKE_NEW_PLAN]) from None
     return plan, text
 
 
 def _marker_text(state_dir: state.StateDir) -> str:
-    """Return the command that last touched the dirty marker, and its run, as a refusal names them
+    """Return the command that last changed this Mac, and its run, as a refusal names them
 
     @param state_dir  the state directory
     @returns          the command in backticks, then its run id in parentheses
     """
     marker = state_dir.dirty() or {}
-    return f"`{marker.get('command') or 'a mutating command'}` (run {marker.get('run_id') or '?'})"
+    command = f"`brew-ports {marker['command']}`" if marker.get("command") else "another brew-ports command"
+    return f"{command} (run {marker.get('run_id') or '?'})"
 
 
 def new_run(ctx: Context, path: str, dry_run: bool) -> tuple[state.RunDir, Plan, str]:
@@ -494,8 +558,8 @@ def new_run(ctx: Context, path: str, dry_run: bool) -> tuple[state.RunDir, Plan,
     path = os.path.abspath(os.path.expanduser(path))
     plan, text = read_plan(path)
     if ctx.state.older_than_dirty(path):
-        raise Stop(EXIT_PREFLIGHT, [f"{path} is older than the last change to this host by "
-                                    f"{_marker_text(ctx.state)}: re-plan"])
+        raise Stop(EXIT_PREFLIGHT, [f"{tilde(path)} was made before {_marker_text(ctx.state)} changed this Mac, so it "
+                                    "may be out of date", MAKE_NEW_PLAN])
     run_dir = ctx.state.new_run()
     if not dry_run:
         run_dir.write_json(PLAN_FILE, text)
@@ -519,32 +583,84 @@ def resumed_run(ctx: Context, run_id: str) -> tuple[state.RunDir, Plan, str]:
     try:
         run_dir = ctx.state.run(run_id)
     except (ValueError, FileNotFoundError):
-        raise Stop(EXIT_USAGE, [f"no run {run_id} in {ctx.state.runs}"]) from None
+        raise Stop(EXIT_USAGE, [f"there is no run {run_id}",
+                                f"  Each run has a folder of its name in {tilde(ctx.state.runs)}."]) from None
     path = run_dir.sub(PLAN_FILE)
     if not os.path.isfile(path) or not any(e.get("action_id") == START for e in run_dir.journal.entries()):
-        raise Stop(EXIT_USAGE, [f"run {run_id} is not an apply run: `brew-ports apply PLAN` starts one"])
+        raise Stop(EXIT_USAGE, [f"run {run_id} is a dry run, or no run of `brew-ports apply`: there is nothing to "
+                                "continue",
+                                "  Start one with: brew-ports apply PLAN"])
     plan, _ = read_plan(path)
     if ctx.state.marker_blocks_resume(run_dir.run_id, os.stat(path).st_mtime_ns):
-        marker = _marker_text(ctx.state)
-        raise Stop(EXIT_PREFLIGHT, [f"{marker} changed this host after run {run_id} started, so its plan no longer "
-                                    "describes the host: re-plan"])
+        raise Stop(EXIT_PREFLIGHT, [f"{_marker_text(ctx.state)} changed this Mac after run {run_id} started, so the "
+                                    "run's plan may be out of date", MAKE_NEW_PLAN])
     return run_dir, plan, path
 
 
+def failure_lines(exc: Exception) -> list[str]:
+    """Return the error of a command or a check that stopped the run
+
+    @param exc  the runner's error, or phase 6's stop, which carries its own reason
+    @returns    the statement, and where a failed command's output is kept
+    """
+    reason = getattr(exc, "reason", None)
+    if reason:
+        return [str(reason)]
+    result = getattr(exc, "result", None)
+    if isinstance(exc, ActionFailed) and result is not None:
+        return [apply_report.failed(result), "  Its whole output is in the folder `out` of the run folder."]
+    return [str(exc)]
+
+
 def finish(run: Run, stop: Stop) -> int:
-    """Print why the run stopped and return its exit code; exit 4 and `--stop-after` name the resume command
+    """Print why the run stopped and return its exit code
+
+    A stop the user asked for prints as it is. Any other is an error under its phase's heading: each statement
+    under the tool's name, its indented lines below it, and last the command that continues the run when one does.
+    The hand tasks gathered so far follow, so a run that stops early does not lose them; a failed final check
+    is followed by the undo command and the report as well.
 
     @param run   the run
     @param stop  why it stopped
     @returns     the stop's exit code
     """
-    for line in stop.lines:
-        (run.say if stop.code == EXIT_OK else run.warn)(line)
-    if stop.code in (EXIT_OK, EXIT_ACTION) and not run.dry_run:
-        run.warn(f"`brew-ports apply --resume {run.run_dir.run_id}` continues the run")
+    lines = list(stop.lines)
+    run_id = run.run_dir.run_id
+    resume = apply_report.resume(run_id)
+    if stop.error and stop.code == EXIT_ACTION and not run.dry_run and not any(resume in line for line in lines):
+        lines.append(f"  Continue with: {resume}")
+    if stop.error:
+        run.flush()
+    for line in lines:
+        if not stop.error:
+            run.say(line)
+        elif line.startswith(" "):
+            run.warn(line)
+        else:
+            run.error(line)
+    if stop.code == EXIT_VERIFY:
+        left = apply_report.leftovers(run.plan, uninstalled(run), run_id, run.todo)
+    else:
+        left = apply_report.tasks(run.todo, run.dry_run)
+    for line in left:
+        run.say(line)
     run.journal({"action_id": f"{run.runner.phase}.stopped", "kind": "note", "exit": stop.code,
                  "lines": stop.lines})
     return stop.code
+
+
+def opening_lines(run: Run) -> list[str]:
+    """Return the first lines of a start: what moves where, or where a resumed run continues
+
+    @param run  the run
+    @returns    the lines; a dry run says first that nothing will change
+    """
+    folder = run.run_dir.path
+    if not run.resumed:
+        return apply_report.opening(run.plan, run.removed, folder, run.dry_run)
+    done = max((n for n in phase_numbers(run.plan) if n and run.completed(n)), default=None)
+    return (["Dry run: nothing will change."] if run.dry_run else []) + apply_report.continuing(
+        run.run_dir.run_id, done, folder)
 
 
 def cmd_apply(ctx: Context, make_runner: Callable[[Context, state.RunDir], BaseRunner] | None = None) -> int:
@@ -563,13 +679,15 @@ def cmd_apply(ctx: Context, make_runner: Callable[[Context, state.RunDir], BaseR
         run_dir, plan, path = resumed_run(ctx, resume) if resume else new_run(ctx, args.plan, dry_run)
     except Stop as stop:
         for line in stop.lines:
-            ctx.console.warn(f"brew-ports apply: {line}")
+            (ctx.console.warn if line.startswith(" ") else ctx.console.error)(line)
         return stop.code
     runner = (make_runner or command_runner)(ctx, run_dir)
     ctx.runner = runner
+    ctx.console.echo = False
     runner.phase = 0
     run = Run(ctx, runner, run_dir, plan, path, resumed=bool(resume), dry_run=dry_run, stop_after=args.stop_after)
-    run.say(f"apply {path}: run {run_dir.run_id}{' (resumed)' if resume else ''}")
+    for line in opening_lines(run):
+        run.say(line)
     code = EXIT_OK
     with runner.signals():
         try:
@@ -579,10 +697,10 @@ def cmd_apply(ctx: Context, make_runner: Callable[[Context, state.RunDir], BaseR
         except PreflightError as exc:
             code = finish(run, Stop(EXIT_PREFLIGHT, [str(exc)]))
         except (ActionFailed, EscalationFailed) as exc:
-            code = finish(run, Stop(EXIT_ACTION, [f"phase {runner.phase} stopped: {exc}"]))
+            code = finish(run, Stop(EXIT_ACTION, failure_lines(exc)))
         except Interrupted:
-            code = finish(run, Stop(EXIT_ACTION, [f"phase {runner.phase} was interrupted; the command that was "
-                                                  "running was waited for"]))
+            code = finish(run, Stop(EXIT_ACTION, ["interrupted; a command that was running got the interrupt too, and "
+                                                  "the run waited for it to end"]))
         finally:
             run.close()
             if not (dry_run and resume):          # a dry run of a resume keeps the run's own report

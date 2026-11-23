@@ -122,9 +122,9 @@ def _bootout(runner, service: Service, action: Action, booted: list[Service], *,
             break
         sleep(1.0)
     if present:
-        return f"launchd still holds {_target(service)} after {limit} s"
+        return f"the service {service.label} did not stop within {limit} s"
     if alive(service.pid):
-        return f"process {service.pid} of {service.label} is still running"
+        return f"process {service.pid} of the service {service.label} is still running"
     return None
 
 

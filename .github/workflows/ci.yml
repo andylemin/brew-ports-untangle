@@ -157,3 +157,45 @@ jobs:
           name: run-brew-to-ports
           path: ~/Library/Application Support/brew-ports/runs/
           if-no-files-found: warn
+
+  # A full move: every port goes into the runner's Homebrew, and the plan then
+  # uninstalls MacPorts itself, which empties it.
+  full-move:
+    name: integration (all of MacPorts into Homebrew)
+    needs: unit
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bundle
+        run: |
+          tools/build-release.sh "$(uname -m)"
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -xzf dist/brew-ports-*-macos-"$(uname -m)".tar.gz -C "$RUNNER_TEMP/bundle" --strip-components 1
+          echo "$RUNNER_TEMP/bundle/bin" >> "$GITHUB_PATH"
+      - name: Install MacPorts base
+        run: brew-ports bootstrap-ports --yes
+      - name: Ports
+        run: sudo /opt/local/bin/port -N -b install jq gsed wget
+      - name: plan
+        run: brew-ports plan --target brew --yes --out plan.json
+      - name: apply --dry-run
+        run: brew-ports apply plan.json --dry-run
+      - name: apply
+        run: brew-ports apply plan.json --yes
+      - name: verify
+        run: brew-ports verify plan.json
+      - name: MacPorts is gone, Homebrew holds the replacements
+        run: |
+          for path in /opt/local /Applications/MacPorts; do
+            if [ -e "$path" ]; then echo "$path is still there"; ls -la "$path"; exit 1; fi
+          done
+          if dscl . -read /Users/macports >/dev/null 2>&1; then echo "the macports user is still there"; exit 1; fi
+          brew list --formula jq gnu-sed wget
+      - name: Run directory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-full-move
+          path: ~/Library/Application Support/brew-ports/runs/
+          if-no-files-found: warn

@@ -135,8 +135,8 @@ The main `plan` options:
 
 ## How a migration runs
 
-`apply` runs a plan in phases, and asks before each phase unless you give
-`--yes`.
+`apply` runs a plan in phases. It asks before each phase that installs,
+uninstalls, or edits something, unless you give `--yes`.
 
 | Phase | Step |
 | --- | --- |
@@ -224,8 +224,9 @@ build/python/bin/python3 -B -m unittest discover -s tests/unit -t .
 ```
 
 The tests never run `brew`, `port`, or `sudo`: commands go through a fake
-runner. CI runs the quality gates and unit tests, and migrates a disposable
-runner with both managers in each direction.
+runner. CI runs the quality gates and unit tests, migrates a disposable
+runner with both managers in each direction, and moves all of MacPorts into
+Homebrew on a third, which must end without MacPorts.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) describes the gates, the conventions, and
 the releases. [docs/architecture.md](docs/architecture.md) shows how the modules

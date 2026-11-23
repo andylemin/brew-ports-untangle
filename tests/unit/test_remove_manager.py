@@ -10,6 +10,7 @@ import unittest
 
 from brew_ports import env, envclean, remove_manager as rm, runner as r, state, system
 from brew_ports.model import Manager
+from brew_ports.report import tilde
 from tests.unit.fixtures.macports.builders import make_registry, port
 from tests.unit.fixtures.remove_manager import builders as b
 from tests.unit.helpers import TempDirTest, make_instance
@@ -101,15 +102,39 @@ class RemovalTest(MacPortsTest):
         self.assertEqual(self.fake.archived(), [[p + "/var/db"], [p + "/etc"], [dot], [p + "/var/log"]])
         for path in (p + "/var/db", p + "/etc", dot, p + "/var/log"):
             self.assertTrue(os.path.isfile(self.site.archive(path)), path)
-        self.assertEqual(len(ask.asked), 1)
+        self.assertEqual(ask.asked, [f"Delete {p} with these items?"])
         self.assertIn(f"    {p}/var/log/", lines)
         self.assertIn(f"    {p}/etc/app.conf", lines)
+        self.assertIn(f"  y saves them in the run folder, then deletes them with {p}.", lines)
+        self.assertIn(f"  n keeps {p} with everything in it; what MacPorts put outside it is still deleted.", lines)
         self.assertFalse(os.path.lexists(p))
         self.assertFalse(os.path.lexists(dot))
         self.assertTrue(all(sudo for sudo, _ in self.fake.ran(rm.RM)))
         last_tar = max(i for i, (_, argv) in enumerate(self.fake.commands) if argv[0] == rm.TAR)
         self.assertLess(self.fake.index(rm.LSOF), self.fake.index(rm.TAR))
         self.assertLess(last_tar, self.fake.index(rm.RM))
+
+    def test_the_listing_counts_the_items_it_shows_and_their_files(self):
+        inst = self.source()
+        p = inst.prefix
+        for name in ("a.log", "b.log"):
+            b.write(os.path.join(p, "var", "log", name))
+        lines = self.run_phase(inst, ask=b.Ask([True]))
+        shown = sorted(line for line in lines if line.startswith("    "))
+        self.assertEqual(shown, [f"    {p}/etc/app.conf", f"    {p}/var/db/", f"    {p}/var/log/"])
+        self.assertIn(f"  3 items in {p} (5 files) were not installed by a port:", lines)
+
+    def test_quiet_still_prints_what_the_question_asks_about(self):
+        inst = self.source()
+        self.site.quiet = True
+        self.run_phase(inst, ask=b.Ask([True]))
+        self.assertIn(f"    {inst.prefix}/var/log/\n", self.site.runner.console.text)
+
+    def test_yes_says_that_it_answered_the_question(self):
+        inst = self.source()
+        lines = self.run_phase(inst)
+        self.assertIn(f"  --yes answers for you: they are saved in the run folder, then deleted with {inst.prefix}.",
+                      lines)
 
     def test_identity_journaled_before_first_deletion(self):
         inst = self.source()
@@ -133,8 +158,9 @@ class RemovalTest(MacPortsTest):
             self.run_phase(inst, [svc])
         exc = cm.exception
         self.assertIsInstance(exc, r.ActionFailed)
-        self.assertIn(f"1 process still uses {p}", str(exc))
-        self.assertIn(f"    PID 4321 /usr/bin/sqlite3: {p}/var/db/app, {p}/var/db/app/data.db", exc.lines)
+        self.assertEqual(str(exc), f"1 program still uses {p}, listed above; quit it first")
+        self.assertIn(f"    /usr/bin/sqlite3 (pid 4321): {p}/var/db/app, {p}/var/db/app/data.db", exc.lines)
+        self.assertFalse([line for line in exc.lines if "stopped" in line])
         self.assertEqual(self.fake.archived(), [])
         self.assertEqual(self.fake.removed(), [])
         bootout = self.fake.index(b.LAUNCHCTL, "bootout", "system/org.macports.app")
@@ -142,7 +168,7 @@ class RemovalTest(MacPortsTest):
         bootstrap = self.fake.index(b.LAUNCHCTL, "bootstrap", "system", svc.plist)
         self.assertLess(bootout, lsof)
         self.assertLess(lsof, bootstrap)
-        self.assertIn("  started again: org.macports.app", exc.lines)
+        self.assertIn("  Started the service org.macports.app again.", exc.lines)
         self.assertTrue(os.path.isfile(os.path.join(p, CONF)))
 
     def test_lsof_that_fails_stops_the_phase(self):
@@ -150,7 +176,7 @@ class RemovalTest(MacPortsTest):
         self.fake.lsof_exit = 2
         with self.assertRaises(rm.Stopped) as cm:
             self.run_phase(inst)
-        self.assertIn("sudo lsof exited 2", str(cm.exception))
+        self.assertIn("`sudo lsof` failed (exit 2)", str(cm.exception))
         self.assertEqual(self.fake.archived(), [])
 
     def test_too_little_space_stops_before_archives(self):
@@ -171,7 +197,7 @@ class RemovalTest(MacPortsTest):
         self.fake.du_missing = {inst.prefix + "/etc"}
         with self.assertRaises(rm.Stopped) as cm:
             self.run_phase(inst)
-        self.assertIn(f"sudo du gave no size for {inst.prefix}/etc", str(cm.exception))
+        self.assertIn(f"`sudo du` gave no size for {inst.prefix}/etc", str(cm.exception))
 
     def test_failed_archive_stops_before_deletion(self):
         inst = self.source(drivable=False)
@@ -202,7 +228,7 @@ class RemovalTest(MacPortsTest):
         self.fake.homes["/Users/macports"] = os.path.join(target.prefix, "var", "macports", "home")
         plan = self.site.plan(target, [target], [target])
         lines = self.site.run(plan, self.site.bundle([target]))
-        self.assertIn(f"  left in place, nothing archived or deleted: {target.prefix} is the target of this plan",
+        self.assertIn(f"  MacPorts at {target.prefix} stays, untouched: it is where this plan moves the packages.",
                       lines)
         self.assertEqual(self.fake.commands, [])
         self.assertTrue(os.path.isfile(os.path.join(target.prefix, CONF)))
@@ -235,7 +261,8 @@ class RemovalTest(MacPortsTest):
         inst = self.source()
         os.unlink(os.path.join(inst.prefix, CONF))
         lines = self.run_phase(inst)
-        self.assertIn(f"  left in place, nothing archived or deleted: {inst.prefix} holds no {CONF}", lines)
+        self.assertIn(f"  MacPorts at {inst.prefix} stays, untouched: it holds no {CONF}, so nothing shows that it is "
+                      "MacPorts.", lines)
         self.assertEqual(self.fake.commands, [])
         self.assertTrue(os.path.isdir(inst.prefix))
 
@@ -246,9 +273,9 @@ class RemovalTest(MacPortsTest):
         job = b.service("org.macports.mine", mine, inst.prefix, owned=False, scope="system",
                         program=os.path.join(inst.prefix, "bin", "mine"))
         lines = self.run_phase(inst, [job])
-        self.assertIn(f"  will stop working: {mine} runs {inst.prefix}/bin/mine; edit or remove it by hand",
+        self.assertIn(f"  Your own service file {mine} runs {inst.prefix}/bin/mine, which is gone: edit or delete it.",
                       lines)
-        self.assertIn(f"  never deleted: {mine} (no plist MacPorts owns, or one the tool could not read)", lines)
+        self.assertIn(f"  {mine} stays: it is not a service file of MacPorts, or it could not be read.", lines)
         self.assertTrue(os.path.isfile(mine))
         self.assertNotIn(mine, self.fake.removed())
 
@@ -277,7 +304,7 @@ class UnregisteredTest(MacPortsTest):
         self.assertEqual(self.deletes(rm.PKGUTIL, "--forget"), [])
         self.assertEqual(self.deletes(rm.DSCL, "-delete"), [])
         self.assertNotIn([p + "/var/log"], self.fake.archived())
-        self.assertIn(f"  kept: {p} stays with its unregistered entries; the rest of its delete list goes", lines)
+        self.assertIn(f"  {p} stays with everything in it, as you answered.", lines)
 
     def test_undrivable_registered_files_go_unarchived(self):
         inst = self.site.macports(drivable=False)
@@ -292,8 +319,7 @@ class UnregisteredTest(MacPortsTest):
         lines = self.run_phase(inst, ask=ask)
         archived = [path for call in self.fake.archived() for path in call]
         self.assertEqual(archived, [p + "/etc", stray])
-        self.assertIn(f"  1 unregistered entry in {p}, neither base's nor under var/macports nor registered to a port:",
-                      lines)
+        self.assertIn(f"  1 item in {p} (1 file) was not installed by a port:", lines)
         self.assertIn("    " + stray, lines)
         listing = [line for line in lines if line.startswith("    ")]
         self.assertFalse([line for line in listing if "wget" in line])
@@ -328,7 +354,7 @@ class MacPortsUserTest(MacPortsTest):
         self.assertLess(user, group)
         self.assertLess(group, prefix)
         self.assertTrue(self.fake.commands[user][0] and self.fake.commands[group][0])
-        self.assertIn("  deleted the macports user and group", lines)
+        self.assertIn("  Deleted the user macports and its group.", lines)
         self.assertFalse(os.path.lexists(p))
 
     def test_staying_macports_user_keeps_its_home(self):
@@ -344,8 +370,8 @@ class MacPortsUserTest(MacPortsTest):
         for gone in ("bin", "etc", "libexec", "var/db", "var/log", "var/macports/registry"):
             self.assertFalse(os.path.lexists(os.path.join(p, gone)), gone)
         self.assertNotIn(p, self.fake.removed())
-        self.assertIn("  the macports user stays, because another MacPorts instance survives", lines)
-        self.assertIn(f"  left in place: {home}, the home of the macports user, which stays", lines)
+        self.assertIn("  The user macports stays: another MacPorts uses it.", lines)
+        self.assertIn(f"  {home} stays: it is the home of the user macports, who stays.", lines)
         self.assertTrue(os.path.isdir(os.path.join(self.site.home, ".macports")))
 
     def test_a_user_whose_home_lies_elsewhere_is_left_alone(self):
@@ -376,8 +402,7 @@ class SecondInstanceTest(MacPortsTest):
         self.assertFalse(os.path.lexists(p))
         self.assertTrue(os.path.isfile(os.path.join(target.prefix, CONF)))
         self.assertTrue(os.path.isfile(theirs))
-        self.assertIn(f"  never deleted: {apps} (it holds entries no port of this instance registered: {theirs})",
-                      lines)
+        self.assertIn(f"  {apps} stays: it holds files that no port of {p} installed: {theirs}.", lines)
         self.assertTrue(os.path.isfile(legacy))
         self.assertTrue(os.path.isdir(dot))
         self.assertIn([dot], self.fake.archived())
@@ -408,14 +433,15 @@ class ReceiptTest(MacPortsTest):
         forget = self.fake.index(rm.PKGUTIL, "--forget", rm.PKG_ID)
         self.assertLess(self.fake.index(rm.RM, p), forget)
         self.assertTrue(self.fake.commands[forget][0])
-        self.assertIn(f"  forgot the installer receipt {rm.PKG_ID}", lines)
+        self.assertIn(f"  Deleted the record macOS keeps of the MacPorts installer ({rm.PKG_ID}).", lines)
 
     def test_a_receipt_for_another_prefix_stays(self):
         inst = self.source()
         self.fake.receipt = [self.site.path("opt", "elsewhere").lstrip("/") + "/bin/port"]
         lines = self.run_phase(inst)
         self.assertEqual(self.deletes(rm.PKGUTIL, "--forget"), [])
-        self.assertIn(f"  the MacPorts installer receipt names files outside {inst.prefix}: it stays", lines)
+        self.assertIn("  The record macOS keeps of the MacPorts installer stays: it names files outside "
+                      f"{inst.prefix}.", lines)
 
 
 class ResumeTest(MacPortsTest):
@@ -448,7 +474,7 @@ class ResumeTest(MacPortsTest):
         self.fake.commands.clear()
         lines = self.run_phase(inst, resumed=True)
         self.assertEqual(self.fake.archived(), [])
-        self.assertIn(f"  kept from the first attempt: {self.site.archive(dot)}", lines)
+        self.assertIn("  Saved by an earlier attempt: ~/.macports", lines)   # the home folder is written as ~
         self.assertTrue(self.fake.ran(rm.LSOF))
         self.assertFalse(os.path.lexists(apps))
         self.assertFalse(os.path.lexists(dot))
@@ -491,7 +517,8 @@ class ResumeTest(MacPortsTest):
         self.site.run_dir.journal.append({"phase": 6, "action_id": "6.identity." + state.slug(inst.prefix),
                                           "prefix": inst.prefix, "identity": [1, 2], "markers": [CONF]})
         lines = self.run_phase(inst, resumed=True)
-        self.assertIn(f"  left in place, nothing archived or deleted: {inst.prefix} holds no {CONF}", lines)
+        self.assertIn(f"  MacPorts at {inst.prefix} stays, untouched: it holds no {CONF}, so nothing shows that it is "
+                      "MacPorts.", lines)
         self.assertTrue(os.path.isdir(inst.prefix))
 
 
@@ -512,7 +539,7 @@ class SafetyTest(MacPortsTest):
                     for n, path in enumerate(sorted(refused)) if path != home]
         lines = self.run_phase(inst, services)
         for path, why in refused.items():
-            self.assertIn(f"  never deleted: {path} ({why})", lines)
+            self.assertIn(f"  {tilde(path, self.site.home)} stays: {why}.", lines)
             self.assertNotIn(path, self.fake.removed())
             self.assertTrue(os.path.lexists(path), path)
         self.assertFalse(os.path.lexists(inst.prefix))

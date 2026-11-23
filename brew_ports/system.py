@@ -127,7 +127,7 @@ def free_bytes(path: str) -> int | None:
     return st.f_frsize * st.f_bavail
 
 
-ROOT_MESSAGE = "brew-ports refuses to run as root or under sudo (system-running-as-root); run it as yourself"
+ROOT_MESSAGE = "it refuses to run as root or under sudo; run it as yourself"
 
 
 def running_as_root() -> bool:

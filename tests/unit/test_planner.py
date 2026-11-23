@@ -1084,8 +1084,8 @@ class PlanWordsTest(unittest.TestCase):
         action = model.Action(action_id="3.install.bottled", kind="command", argv=["/x/brew", "install"] + names,
                               sudo=False, description="install the replacements")
         whole = "/x/brew install " + " ".join(names)
-        self.assertEqual(plan_report._command(action, True), whole)
-        cut = plan_report._command(action, False)
+        self.assertEqual(plan_report.command(action, True), whole)
+        cut = plan_report.command(action, False)
         shown = cut.split(" ... ")[0]
         self.assertTrue(whole.startswith(shown + " ") and len(shown) <= plan_report.COMMAND_WIDTH, cut)
         left = len(whole.split()) - len(shown.split())

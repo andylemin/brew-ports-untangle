@@ -8,13 +8,15 @@ from __future__ import annotations
 import dataclasses
 import os
 
-from . import snapshot
+from . import apply_report, snapshot
+from .apply_report import series
 from .exec_run import EXIT_ACTION, Stop, module
 from .homebrew import actions as brew_actions
 from .homebrew.catalogue import Catalogue
 from .macports import actions as mp_actions
 from .model import Action, Manager, Mapping, OnFailure, Service
 from .plan_sets import name_key
+from .report import at, counted, some, tilde
 
 LANGUAGE_KINDS = ("pip", "npm", "gem", "cpan")
 
@@ -70,21 +72,27 @@ def selections(run) -> tuple[list[Action], list[str]]:
             if group in seen:
                 continue
             seen.add(group)
+            action = dataclasses.replace(mp_actions.select_set(target, run.runner.host_arch, f"7.select.{group}",
+                                                               group, option), on_failure=OnFailure.PROBE)
+            if run.dry_run:                 # only the run knows what the replacement offers and what was recorded
+                actions.append(action)
+                continue
             commands = select_commands(target.prefix, group, option)
             source = recorded.get(m.source.instance_prefix)
             if commands is None:
-                why = f"{target.prefix} has no select files for {group} {option}"
-            elif source is None:
-                why = f"the commands of {m.source.instance_prefix} were not recorded before the removal"
+                reported.append(f"{option} is not made the default `{group}`: MacPorts at {target.prefix} offers no "
+                                "such choice.")
+                continue
+            if source is None:
+                why = f"the commands {m.source.instance_prefix} provided were not recorded before the uninstall"
             else:
                 missing = [c for c in commands if c not in source]
-                why = f"{m.source.instance_prefix} did not put {', '.join(missing)} on PATH" if missing else ""
+                why = f"{m.source.instance_prefix} did not provide {series(missing)} either" if missing else ""
             if why:
-                reported.append(f"not set: `sudo port select --set {group} {option}` ({why})")
+                reported.append(f"{option} is not made the default `{group}`, because {why}. To do it yourself: sudo "
+                                f"port select --set {group} {option}")
                 continue
-            actions.append(dataclasses.replace(mp_actions.select_set(target, run.runner.host_arch,
-                                                                     f"7.select.{group}", group, option),
-                                               on_failure=OnFailure.PROBE))
+            actions.append(action)
     return actions, reported
 
 
@@ -100,22 +108,20 @@ def interpreter_notes(run) -> list[str]:
     target = run.target
     catalogue = run.bundle.catalogue(target.prefix) if target is not None and run.bundle is not None else None
     if target is not None and run.plan.target is Manager.BREW:
-        for m in run.plan.mappings:
-            name = m.target_name or ""
-            if m.target_kind != "formula" or "@" not in name:
+        for name in dict.fromkeys(m.target_name or "" for m in run.plan.mappings if m.target_kind == "formula"):
+            if "@" not in name:
                 continue
             base, version = name.split("@", 1)
             owner = catalogue.canonical(base) if catalogue is not None else None
             if owner == name:
                 continue
             versioned = [e for e in (catalogue.executables(name) if catalogue is not None else []) if version in e]
-            commands = f"{', '.join(versioned)}, or the commands in " if versioned else "the commands in "
-            out.append(f"{name}: the unversioned {base} belongs to {owner or 'another formula'}; run "
-                       f"{commands}{target.prefix}/opt/{name}/bin")
-    for m in run.plan.unmigratable:
-        if m.target_kind in LANGUAGE_KINDS:
-            why = m.evidence[0] if m.evidence else "a language package, not migrated"
-            out.append(f"{m.source.kind} {m.source.name}: {why}")
+            commands = f"{series(versioned)}, or the commands in " if versioned else "the commands in "
+            out.append(f"{name} does not provide plain `{base}`: that name belongs to {owner or 'another formula'}. "
+                       f"Use {commands}{target.prefix}/opt/{name}/bin.")
+    names = [m.source.name for m in run.plan.unmigratable if m.target_kind in LANGUAGE_KINDS]
+    if names:
+        out.append(f"{counted(len(names), 'language package')} did not move, as the plan said: {some(names)}")
     return out
 
 
@@ -201,12 +207,14 @@ def starts(run) -> tuple[list[Action], list[str]]:
     for svc in recorded_services(run):
         m = _mapping_of(run, svc)
         if m is None or m.target_kind not in ("formula", "port") or not m.target_name:
-            manual.append(f"{svc.label}: no replacement package in {target.prefix} starts it")
+            manual.append(f"The service {svc.label} is not started: no replacement in {at(target)} provides it.")
             continue
         if target.manager is Manager.BREW:
             if svc.scope == "system":
-                manual.append(f"`sudo brew services start {m.target_name}` (a system-scope service: starting it runs "
-                              "brew as root)")
+                task = (f"Start the system service of {m.target_name} yourself, because that runs Homebrew as root: "
+                        f"sudo brew services start {m.target_name}")
+                if task not in manual:
+                    manual.append(task)
                 continue
             label = _brew_label(run, target, m.target_name)
             action = brew_actions.services_start(target, host, f"7.start.{label}", m.target_name,
@@ -228,28 +236,36 @@ def environment(run) -> None:
     @throws Stop  exit 4 when a file is not written or a selection or start fails
     """
     envclean = module("envclean")
-    if run.dry_run:
-        run.say("  (a dry run weighs the host as it is now; the phase recomputes the survivor set after phases 5 "
-                "and 6)")
-    bundle = run.bundle if run.dry_run else run.fresh_scan()
-    surv = envclean.survivors(bundle, run.plan, run.run_dir.journal)
-    edits = envclean.compute(bundle, surv, run.home, run.environ)
-    for line in envclean.survivor_lines(surv):
-        run.say("  " + line)
-    for edit in edits:
-        for line in envclean.render(edit):
-            run.say("  " + line)
     selected, reported = selections(run)
     started, manual = starts(run)
+    notes = interpreter_notes(run)
+    if run.dry_run:
+        run.say("  Not shown in a dry run: what changes in your shell files depends on what phases 5 and 6 leave.")
+        run.say("  The run shows each change before it makes any, and asks unless --yes is given.")
+        for action in selected + started:
+            run.show(action)
+        if selected:
+            run.say("  A default is set only where the old installation provided the same commands.")
+        for line in notes:
+            run.say("  " + line)
+        run.todo += [task for task in manual if task not in run.todo]
+        return
+    bundle = run.fresh_scan()
+    surv = envclean.survivors(bundle, run.plan, run.run_dir.journal)
+    edits = envclean.compute(bundle, surv, run.home, run.environ)
+    shown = [line for edit in edits for line in envclean.render(edit)]
+    if shown:
+        for line in envclean.survivor_lines(surv) + shown:
+            run.say("  " + line)
     for action in selected + started:
         run.show(action)
-    for line in reported + manual + interpreter_notes(run):
+    for line in notes:
         run.say("  " + line)
+    run.todo += [task for task in reported + manual if task not in run.todo]
+    run.todo += [f"Make the change phase 7 showed for {tilde(e.path, run.home)}, which brew-ports does not edit."
+                 for e in edits if e.changed and e.manual]
     writable = [e for e in edits if e.changed and not e.manual]
     if not (writable or selected or started):
-        run.say("  nothing to change in the environment")
-        return
-    if run.dry_run:
         return
     run.confirm(7)
     failures: list[str] = []
@@ -258,13 +274,22 @@ def environment(run) -> None:
             run.runner.sudo_preflight()
         run.touch()
         result = envclean.apply(run.runner, run.run_dir, edits, run.root_files(), show=False)
-        failures += [f"not written: {path}" for path in result.failed]
+        created = {e.realpath or os.path.realpath(e.path) for e in edits if e.old_text is None}
+        for path in result.written:
+            if path in created:
+                run.say(f"  Created {tilde(path, run.home)}.")
+            else:
+                run.say(f"  Edited {tilde(path, run.home)}; the file as it was is kept in the run folder.")
+        for path in result.removed:
+            run.say(f"  Deleted {tilde(path, run.home)}.")
         for path in result.rejected:
-            run.say(f"  {path}: the shell's parser rejects the rewrite: apply its diff by hand")
+            run.say(f"  Not edited: {tilde(path, run.home)}. The shell could not read the new version.")
+            run.todo.append(f"Make the change phase 7 showed for {tilde(path, run.home)} yourself.")
+        failures += [f"{tilde(path, run.home)} could not be written" for path in result.failed]
     for action in selected + started:
         outcome = run.runner.run(action)
         run.result_line(action, outcome)
         if not outcome.ok:
-            failures.append(f"{action.action_id} exited {outcome.exit}")
+            failures.append(apply_report.failed(outcome))
     if failures:
-        raise Stop(EXIT_ACTION, [f"phase 7 did not finish: {'; '.join(failures)}"])
+        raise Stop(EXIT_ACTION, ["phase 7 did not finish"] + [f"    {f}" for f in failures])

@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest import mock
 
-from brew_ports import exec_install, executor, state
+from brew_ports import doctor, exec_install, executor, state
 from brew_ports.homebrew import actions as brew_actions
 from brew_ports.model import OnFailure
 from tests.unit.fixtures.executor import builders as b
@@ -62,9 +62,11 @@ class RepairTest(ApplyTest):
         results = self.results()
         self.assertEqual([results[(2, a.action_id)] for a in self.receipt], ["failed", "failed"])
         self.assertEqual(results[(2, self.dependency.action_id)], "ok")
-        self.assertIn("brew-keg-without-receipt wget: not repaired (the post-check of brew-keg-without-receipt found "
-                      "it unrepaired); the gate decides", self.out)
-        self.assertIn("brew-missing-dependency jq: repaired", self.out)
+        self.assertIn("  wget is not repaired (the problem is still there). Phase 4 checks whether that matters.\n",
+                      self.out)
+        self.assertNotIn("jq is not repaired", self.out)
+        for action in self.receipt + [self.dependency]:
+            self.assertIn(f"  {doctor.describe(action)} ... ok\n", self.out)
         self.assertEqual(self.checked[0][:3], ("brew-keg-without-receipt", "wget", self.target.prefix))
         self.assertEqual(self.checked[0][3], [a.action_id for a in self.receipt])
 
@@ -239,7 +241,11 @@ class RebuildTest(ApplyTest):
         self.assertEqual(self.reinstalls(), [["curl"], ["wget"]])
         results = self.results()
         self.assertEqual((results[(3, "3.curl.rebuild")], results[(3, "3.wget.rebuild")]), ("ok", "failed"))
-        self.assertIn("dependents of upgraded packages: 2 scanned, 2 to rebuild", self.out)
+        brew = self.target.binary
+        self.assertIn("  2 packages lost a library to an upgrade and will be installed again: curl, wget\n"
+                      f"  {brew} reinstall --formula curl ... ok\n"
+                      f"  {brew} reinstall --formula wget ... done, but wget still does not find a library it needs\n",
+                      self.out)
 
     def test_rebuild_ids_survive_a_shorter_rescan(self):
         self.assertEqual(self.apply(stop_after=3), executor.EXIT_OK, self.out)
@@ -247,7 +253,7 @@ class RebuildTest(ApplyTest):
         self.responder.log.clear()
         self.assertEqual(self.apply(resume=first, stop_after=3), executor.EXIT_OK, self.out)
         self.assertEqual(self.reinstalls(), [["wget"]])
-        self.assertIn("dependents of upgraded packages: 2 scanned, 1 to rebuild", self.out)
+        self.assertIn("  1 package lost a library to an upgrade and will be installed again: wget\n", self.out)
 
     def test_a_plan_rebuild_is_decided_by_its_rescan(self):
         rebuild = brew_actions.reinstall(self.target, "arm64", "3.tree.rebuild", ["tree"], on_failure=OnFailure.PROBE)
@@ -261,7 +267,8 @@ class RebuildTest(ApplyTest):
         self.save_plan(b.plan(self.target, [], phase3=[rebuild]))
         self.assertEqual(self.apply(stop_after=3), executor.EXIT_OK, self.out)
         self.assertEqual(self.results()[(3, "3.tree.rebuild")], "failed")
-        self.assertIn("3.tree.rebuild: failed (the rescan still finds a broken reference)", self.out)
+        self.assertIn(f"  {self.target.binary} reinstall --formula tree ... done, but tree still does not find a "
+                      "library it needs\n", self.out)
 
 
 if __name__ == "__main__":

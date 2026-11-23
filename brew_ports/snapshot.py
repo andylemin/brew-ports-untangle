@@ -38,6 +38,7 @@ PLISTS = "plists"
 RC_FILES = "rc"
 SNAPSHOT_TYPE = "org.macports/snapshot/v1"
 TMUTIL = "/usr/bin/tmutil"
+DISK_NOTE = "tmutil localsnapshot "   # how the note of a disk snapshot that failed begins
 RECEIPT = brew_inventory.RECEIPT
 PARTIAL = ".partial"
 
@@ -550,7 +551,7 @@ def _local_snapshot(writer: _Writer) -> None:
     action = system.probe(f"{writer.id_prefix}.snapshot.tmutil", [TMUTIL, "localsnapshot"], "APFS local snapshot")
     result = writer.runner.run(action)
     if result.exit != 0:
-        writer.note(f"tmutil localsnapshot exited {result.exit}: {result.stderr().strip()}")
+        writer.note(f"{DISK_NOTE}exited {result.exit}: {' '.join(result.stderr().split())}")
 
 
 def write(runner, run_dir: state.RunDir, bundle, instances: Sequence[Instance], *, rc_files: Sequence[str] = (),

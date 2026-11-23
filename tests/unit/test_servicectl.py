@@ -82,7 +82,7 @@ class StopTest(ServiceTest):
         result = self.stop(fake)
         self.assertFalse(result.ok)
         self.assertEqual([s.label for s, _ in result.still_running], [LABEL])
-        self.assertIn("after 15 s", result.still_running[0][1])
+        self.assertEqual(result.still_running[0][1], f"the service {LABEL} did not stop within 15 s")
         self.assertEqual(len(self.clock.sleeps), 15)
         self.assertEqual([s.label for s in result.booted], [LABEL])   # restarted by the caller
 

@@ -543,7 +543,8 @@ class BaseRunner:
         env = self.env_for(action)
         if action.sudo:
             if self.keepalive_failed:
-                raise EscalationFailed("the sudo keepalive failed; the cached credentials are gone")
+                raise EscalationFailed("sudo wants your password again, which cannot be asked for in the middle of "
+                                       "a run")
             self.keepalive(force=False)
             full = sudo_argv(argv, env, self.preserve_env_refused)
             self.console.command(full)
@@ -756,10 +757,11 @@ class CommandRunner(BaseRunner):
         if self._probe([SUDO, "-n", "true"]) != 0:
             if not has_tty and not askpass:
                 raise PreflightError(
-                    "sudo needs a password and there is no terminal and no SUDO_ASKPASS: set SUDO_ASKPASS, "
-                    "or run brew-ports from a terminal (a ticket made by another process is not this one's)")
+                    "sudo needs your password, and there is no terminal to ask on: run brew-ports in a Terminal "
+                    "window, or set SUDO_ASKPASS")
             raise PreflightError(
-                "sudo did not cache credentials (wrong password, or timestamp_timeout 0 in sudoers)")
+                "sudo did not accept or keep your password (a wrong password, or `timestamp_timeout` 0 in the sudoers "
+                "file); run the command again")
         self.sudo_ready = True
         self._last_keepalive = time.monotonic()
 
