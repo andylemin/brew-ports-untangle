@@ -60,10 +60,10 @@ Download your Mac's release with `curl` and unpack it:
 
 ```sh
 arch=$(uname -m)        # arm64 on Apple Silicon, x86_64 on Intel
-curl -LO "https://github.com/andylemin/brew-ports-untangle/releases/download/v0.1.0/brew-ports-0.1.0-macos-$arch.tar.gz"
+curl -LO "https://github.com/andylemin/brew-ports-untangle/releases/download/v0.2.0/brew-ports-0.2.0-macos-$arch.tar.gz"
 mkdir -p ~/.local
-tar -xzf "brew-ports-0.1.0-macos-$arch.tar.gz" -C ~/.local
-~/.local/brew-ports-0.1.0/bin/brew-ports scan
+tar -xzf "brew-ports-0.2.0-macos-$arch.tar.gz" -C ~/.local
+~/.local/brew-ports-0.2.0/bin/brew-ports scan
 ```
 
 - Use `curl`. A browser marks the download as quarantined, and

@@ -7,13 +7,14 @@ import stat
 import unittest
 from unittest import mock
 
-from brew_ports import runner as r
+from brew_ports import __version__, runner as r
 from brew_ports.macports import bootstrap, locate
 from brew_ports.model import Manager
 from tests.unit.fixtures.macports.builders import fake_runner, read_fixture
 from tests.unit.helpers import TempDirTest, make_instance, write_file
 
 SIGNER = "Developer ID Installer: Joshua Root (QTA3A3B7F3)"
+AGENT = "brew-ports/" + __version__     # how every download names the tool, at whatever version it is
 TAHOE = "https://github.com/macports/macports-base/releases/download/v2.12.7/MacPorts-2.12.7-26-Tahoe.pkg"
 TAG_PAGE = "https://github.com/macports/macports-base/releases/tag/v2.12.7"
 
@@ -163,9 +164,8 @@ class ProcedureTest(TempDirTest):
         @returns          the responses, keyed by argv
         """
         downloads = "<run>/downloads"
-        base = r.curl_argv(bootstrap.RELEASE_URL, downloads + "/macports-base-release.json",
-                           user_agent="brew-ports/0.1.0")
-        pkg = r.curl_argv(TAHOE, downloads + "/MacPorts-2.12.7-26-Tahoe.pkg", user_agent="brew-ports/0.1.0")
+        base = r.curl_argv(bootstrap.RELEASE_URL, downloads + "/macports-base-release.json", user_agent=AGENT)
+        pkg = r.curl_argv(TAHOE, downloads + "/MacPorts-2.12.7-26-Tahoe.pkg", user_agent=AGENT)
         return {
             tuple(base): self.curl(bootstrap.RELEASE_URL, read_fixture("release-latest.json")),
             tuple(pkg): self.curl(TAHOE, "xar! package bytes"),
@@ -192,10 +192,8 @@ class ProcedureTest(TempDirTest):
         @param effective  the URL curl ends at after the `releases/latest` redirect
         @returns          the responses, keyed by argv
         """
-        api = r.curl_argv(bootstrap.RELEASE_URL, "<run>/downloads/macports-base-release.json",
-                          user_agent="brew-ports/0.1.0")
-        latest = r.curl_argv(bootstrap.LATEST_URL, "<run>/downloads/macports-base-latest.html",
-                             user_agent="brew-ports/0.1.0")
+        api = r.curl_argv(bootstrap.RELEASE_URL, "<run>/downloads/macports-base-release.json", user_agent=AGENT)
+        latest = r.curl_argv(bootstrap.LATEST_URL, "<run>/downloads/macports-base-latest.html", user_agent=AGENT)
 
         def page(key):
             output = key[key.index("--output") + 1].replace("<run>", self.run_dir.path)
