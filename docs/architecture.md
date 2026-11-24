@@ -11,7 +11,7 @@ Each command lives in one module:
 | Command | Main module | What it adds |
 | --- | --- | --- |
 | `scan` | `scan.py` | The inventory of every instance and of the shell environment, written to `scan.json`. |
-| `doctor` | `doctor.py` | The findings: system and environment checks here, manager checks in `homebrew/health.py` and `macports/health.py`. |
+| `doctor` | `doctor.py` | The findings: system and environment checks here, manager checks in `homebrew/health.py` and `macports/health.py`. With `--target`, `doctor_target.py` picks the installation that stays and `duplicates.py` finds the packages that are installed twice. |
 | `recommend` | `recommend.py` | Both migration directions, scored from the scan and the findings. |
 | `bootstrap-ports` | `macports/bootstrap.py` | MacPorts base, installed from its signed package. |
 | `plan` | `planner.py` | `plan.json`, with the mappings, the package sets, and the phases, or `plan-refused.json` with its reasons. |

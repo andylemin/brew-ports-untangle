@@ -81,6 +81,20 @@ class RefusalTest(TempDirTest):
         self.assertEqual(run_cli(["apply"])[0], 2)
         self.assertEqual(run_cli(["apply", "p.json", "--resume", "R"])[0], 2)
 
+    def test_doctor_takes_the_manager_to_keep_as_plan_does(self):
+        parser = cli.build_parser()
+        plain = parser.parse_args(["doctor"])
+        self.assertEqual((plain.target, plain.target_prefix), (None, None))
+        for word, manager in (("brew", "brew"), ("Homebrew", "brew"), ("ports", "ports"), ("macports", "ports")):
+            given = parser.parse_args(["doctor", "--fix", "--target", word, "--target-prefix", "/x"])
+            self.assertEqual((given.target, given.target_prefix), (manager, "/x"))
+        self.assertEqual(run_cli(["doctor", "--target", "nix"])[0], 2)
+
+    def test_a_folder_to_keep_without_its_manager_is_a_usage_error(self):
+        code, _, err = run_cli(["doctor", "--target-prefix", "/opt/homebrew"])
+        self.assertEqual((code, err), (2, "brew-ports: --target-prefix gives the folder of the installation you keep, "
+                                          "so it needs its manager too: add --target brew or --target ports\n"))
+
     def test_delete_with_only_is_a_usage_error(self):
         code, _, err = run_cli(["plan", "--target", "brew", "--only", "jq", "--delete", "/opt/local"])
         self.assertEqual(code, 2)
@@ -157,7 +171,14 @@ class BootstrapPortsTest(TempDirTest):
             code, _, err = run_cli(["--state-dir", self.path("s"), "bootstrap-ports", "--dry-run"],
                                    environ={"HOME": self.tmp})
         self.assertEqual(code, 3)
-        self.assertIn("already installed at /opt/local", err)
+        self.assertEqual(err, "brew-ports: MacPorts is already installed at /opt/local; `brew-ports doctor --fix "
+                              "--target ports` repairs a broken base\n")
+        # With two of them, `doctor` needs the folder of the one to repair.
+        both = [make_instance(model.Manager.PORTS, prefix) for prefix in ("/opt/local", "/opt/ports")]
+        with no_managers(), mock.patch("brew_ports.macports.locate.find_instances", return_value=both):
+            err = run_cli(["--state-dir", self.path("s"), "bootstrap-ports"], environ={"HOME": self.tmp})[2]
+        self.assertIn("at /opt/local, /opt/ports; `brew-ports doctor --fix --target ports --target-prefix PATH` "
+                      "repairs a broken base\n", err)
 
     def test_dry_run_prints_the_steps_and_changes_nothing(self):
         with no_managers(), mock.patch("brew_ports.system.macos_version", return_value="15.7.1"):

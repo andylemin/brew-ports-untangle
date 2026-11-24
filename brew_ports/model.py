@@ -250,6 +250,7 @@ class DoctorResult:
     issues: list[Issue]
     blocks_apply: dict[str, list[str]]  # "brew" / "ports" -> codes that block a plain plan with that target
     notes: list[str] = field(default_factory=list)  # checks skipped or degraded, from the scan and the detectors
+    target_prefix: str | None = None    # `--target`: each issue's `blocks` are those that hold for the move into it
 
 
 @dataclass

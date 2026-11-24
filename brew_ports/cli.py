@@ -159,6 +159,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--deep", action="store_true")
     p.add_argument("--rescan", action="store_true", help="take a fresh inventory")
     p.add_argument("--fix", action="store_true", help="apply the remedies, confirmed on the terminal")
+    p.add_argument("--target", type=_manager, metavar="brew|ports",
+                   help="the manager you keep: brew (Homebrew) or ports (MacPorts). On a Mac with more than one "
+                        "installation, --fix and --dry-run need it and repair only the installation you keep; "
+                        "without --fix, the report also lists the packages that are installed twice")
+    p.add_argument("--target-prefix", metavar="PATH",
+                   help="the folder of the installation you keep, when this Mac has several of that manager")
     p.add_argument("--yes", action="store_true", help="answer the confirmations (never the per-item removals)")
     p.add_argument("--dry-run", action="store_true", help="print the remedies, run nothing")
 
@@ -227,8 +233,10 @@ def cmd_bootstrap_ports(ctx: Context) -> int:
     with runner.signals():
         existing = mp_locate.find_instances(runner, ctx.environ, runner.host_arch)
         if existing:
+            # With several MacPorts, `doctor` needs the folder of the one to repair.
+            folder = " --target-prefix PATH" if len(existing) > 1 else ""
             ctx.console.warn(f"brew-ports: MacPorts is already installed at {', '.join(i.prefix for i in existing)}; "
-                             "`brew-ports doctor --fix` repairs a broken base")
+                             f"`brew-ports doctor --fix --target ports{folder}` repairs a broken base")
             return EXIT_PREFLIGHT
         version = system.macos_version(runner)
         for line in mp_bootstrap.describe(mp_bootstrap.macos_major(version)):
@@ -328,12 +336,15 @@ def check_usage(args: argparse.Namespace) -> None:
     An option of `plan` that names nothing is refused, so that an empty `--only` never plans a full move.
 
     @param args         the parsed command line
-    @throws UsageError  for `apply` without exactly one of PLAN and `--resume`, a `plan` list option without a
-                        name, or `--delete` with `--only`
+    @throws UsageError  for `apply` without exactly one of PLAN and `--resume`, `doctor --target-prefix` without
+                        `--target`, a `plan` list option without a name, or `--delete` with `--only`
     """
     if args.command == "apply":
         if bool(args.plan) == bool(args.resume):
             raise UsageError("apply needs exactly one of PLAN or --resume RUN-ID")
+    if args.command == "doctor" and args.target_prefix and not args.target:
+        raise UsageError("--target-prefix gives the folder of the installation you keep, so it needs its manager "
+                         "too: add --target brew or --target ports")
     if args.command != "plan":
         return
     for flag, values, noun in (("--only", args.only, "package"), ("--leave", args.keep, "package"),

@@ -20,7 +20,7 @@ from .homebrew import locate as brew_locate
 from .macports import locate as mp_locate
 from .model import Confidence, Instance, Issue, Manager, Mapping, Plan
 from .plan_sets import DROPPED, KEPT, MIGRATED, UNMIGRATABLE, WITHDRAWN, Key, Root, SourceGraph, Unit
-from .report import COMMAND_OF, at, manager_name, place, possessive, some
+from .report import COMMAND_OF, at, has, manager_name, place, possessive, some
 from .runner import ActionFailed, BaseRunner, EscalationFailed, PreflightError, start_run
 
 EXIT_OK = 0
@@ -263,18 +263,6 @@ def listed(bundle: scan.ScanBundle, target: Instance) -> bool:
     return bundle.portindex(target.prefix) is not None
 
 
-def _has(found: Sequence[Instance], manager: str) -> str:
-    """Return what follows "there is no <manager> at <path>": the installations of it that this Mac has
-
-    @param found    its installations
-    @param manager  `Homebrew` or `MacPorts`
-    @returns        the rest of the sentence
-    """
-    if not found:
-        return f": {manager} is not installed"
-    return f": this Mac has {' and '.join(at(inst) for inst in found)}"
-
-
 def _elsewhere(manager: str, usual: str, found: Sequence[Instance]) -> str:
     """Return the error of a move into a manager that this Mac has, but not at its usual place
 
@@ -422,7 +410,7 @@ class _Composer:
             if target is None:
                 ports = [i for i in instances if i.manager is Manager.PORTS]
                 if prefix:
-                    text = f"there is no MacPorts at {prefix}" + _has(ports, "MacPorts")
+                    text = f"there is no MacPorts at {prefix}" + has(ports, "MacPorts")
                 elif ports:
                     text = _elsewhere("MacPorts", mp_locate.DEFAULT_PREFIX, ports)
                 else:
@@ -443,7 +431,7 @@ class _Composer:
         brews = [i for i in self.result.instances if i.manager is Manager.BREW]
         default = brew_locate.ARM64_PREFIX if self.host_arch == "arm64" else brew_locate.USR_LOCAL
         if prefix:
-            return f"there is no Homebrew at {prefix}" + _has(brews, "Homebrew")
+            return f"there is no Homebrew at {prefix}" + has(brews, "Homebrew")
         if not brews:
             return "Homebrew is not installed. Install it (https://brew.sh), then plan again"
         here = next((i for i in brews if i.prefix == default), None)
@@ -709,7 +697,7 @@ class _Composer:
             detail = f" ({first[0].rstrip(':')})" if first else ""
             lines.append(f"nothing can move into {at(self.target)}: its `{COMMAND_OF[self.manager]}` command cannot "
                          f"run{detail}. `brew-ports doctor` shows the fix")
-        lines += doctor.blocked_by_lines(found, self.result.instances)
+        lines += doctor.blocked_by_lines(found, self.result.instances, self.target)
         if lines:
             raise _Stop(EXIT_PREFLIGHT, lines, found)
 

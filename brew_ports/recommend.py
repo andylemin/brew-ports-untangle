@@ -162,7 +162,7 @@ def _target(instances: Sequence[Instance], direction: str, host_arch: str,
     return mp_locate.choose_target(instances, host_arch, None)
 
 
-def _context(bundle: scan.ScanBundle, direction: str, target: Instance | None) -> resolver.Context:
+def resolver_context(bundle: scan.ScanBundle, direction: str, target: Instance | None) -> resolver.Context:
     """Return a plain plan's resolver context, offline: no runner for PyPI lookups and no Repology client
 
     @param bundle     the scan
@@ -247,7 +247,7 @@ class _Direction:
         self.prefix = self.target.prefix if self.target is not None else None
         self.sources = [inst for inst in result.instances if inst.prefix != self.prefix]
         self.roots = roots(bundle, direction, self.prefix)
-        self.ctx = _context(bundle, direction, self.target)
+        self.ctx = resolver_context(bundle, direction, self.target)
         self.ctx.python_version = resolver.plan_python([r.package for r in self.roots], self.ctx)
         self.mapped: list[tuple[Root, model.Mapping, bool]] = []
         for root in self.roots:

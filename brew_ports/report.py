@@ -73,6 +73,18 @@ def place(inst: model.Instance) -> str:
     return f"{name} at {inst.prefix}" + (f" ({', '.join(notes)})" if notes else "")
 
 
+def has(found: Sequence[model.Instance], manager: str) -> str:
+    """Return what follows "there is no <manager> at <path>": the installations of it that this Mac has
+
+    @param found    its installations
+    @param manager  `Homebrew` or `MacPorts`
+    @returns        the rest of the sentence
+    """
+    if not found:
+        return f": {manager} is not installed"
+    return f": this Mac has {' and '.join(at(inst) for inst in found)}"
+
+
 def counted(number: int, noun: str, plural: str | None = None) -> str:
     """Return a count with its noun
 

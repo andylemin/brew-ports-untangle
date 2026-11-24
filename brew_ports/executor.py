@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import os
 import shlex
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
-from . import apply_report, doctor, exec_env, exec_install, exec_remove, model, scan, snapshot, state, system
+from . import (apply_report, doctor, doctor_report, exec_env, exec_install, exec_remove, model, scan, snapshot, state,
+               system)
 from .apply_report import MAKE_NEW_PLAN, NEW_PLAN
 from .context import Context
 from .exec_run import (DECLINED, EXIT_ACTION, EXIT_OK, EXIT_PREFLIGHT, EXIT_USAGE, EXIT_VERIFY, PLAN_FILE, SOURCE_BIN,
@@ -53,24 +54,47 @@ def blocking_lines(run: Run) -> list[str]:
     found = doctor.blocking(run.issues, plan_context(run))
     if run.resumed and run.past(3):
         found = [i for i in found if i.code != "system-low-disk-space"]
-    lines = doctor.blocked_by_lines(found, run.bundle.result.instances if run.bundle is not None else run.instances)
-    if any((i.auto_fix or i.confirm_each) and any(not a.manual for a in i.remedies) for i in found):
-        lines.append(f"  After `brew-ports doctor --fix`, {NEW_PLAN}.")
+    instances = run.bundle.result.instances if run.bundle is not None else run.instances
+    by_prefix = doctor_report.known(instances)
+    target = by_prefix.get(run.fresh_prefix(run.plan.target_prefix))
+    lines = doctor.blocked_by_lines(found, instances, target)
+    if any((i.auto_fix or i.confirm_each) and any(not a.manual for a in i.remedies)
+           and doctor_report.in_kept(i, target, by_prefix) for i in found):
+        lines.append(f"  After `{doctor_report.FIX}{_target_options(run, instances)}`, {NEW_PLAN}.")
     return lines
 
 
+def _target_options(run: Run, instances: Sequence[Instance]) -> str:
+    """Return the `doctor` options that name the plan's target as the installation that stays
+
+    @param run        the run
+    @param instances  the installations of the scan the findings come from
+    @returns          the options, as `doctor_report.keeps` gives them; none on a Mac with one installation
+    """
+    by_prefix = doctor_report.known(instances)
+    target = by_prefix.get(run.fresh_prefix(run.plan.target_prefix))
+    return doctor_report.keeps(target, by_prefix) if target is not None else ""
+
+
 def _repairs(run: Run, inst: Instance) -> str:
-    """Return how to repair an installation whose command cannot run: `doctor --fix` when it has a fix, else `doctor`
+    """Return what to do about an installation whose command cannot run
+
+    `doctor --fix` repairs only the installation that stays, so it is named for the plan's target alone. What a
+    move out of an old installation can still do depends on what is wrong with it, which `doctor` says.
 
     @param run   the run, with the findings of its phase 0 scan
     @param inst  the installation
     @returns     the advice under the installation's line
     """
+    options = _target_options(run, run.fresh)
+    if inst.prefix != run.fresh_prefix(run.plan.target_prefix):
+        return (f"`brew-ports doctor{options}` says what is wrong with it, and what a move out of it can still do; "
+                f"{NEW_PLAN} afterwards.")
     fixable = any(i.instance_prefix == inst.prefix and (i.auto_fix or i.confirm_each) and i.remedies
                   for i in run.issues)
     if fixable:
-        return f"`brew-ports doctor --fix` can repair it; {NEW_PLAN} afterwards."
-    return f"`brew-ports doctor` says what is wrong with it; {NEW_PLAN} once it is repaired."
+        return f"`{doctor_report.FIX}{options}` can repair it; {NEW_PLAN} afterwards."
+    return f"`brew-ports doctor{options}` says what is wrong with it; {NEW_PLAN} once it is repaired."
 
 
 def drivability_lines(run: Run) -> list[str]:

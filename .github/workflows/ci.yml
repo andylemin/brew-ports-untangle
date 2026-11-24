@@ -96,12 +96,27 @@ jobs:
           test "$code" -le 1
           grep -q '^Checked ' doctor.out.txt
           if [ "$code" -eq 1 ]; then tail -n 1 doctor.out.txt | grep -q '^Exit status 1: '; fi
-          code=0; brew-ports doctor --fix --dry-run > doctor.dry.txt || code=$?
+      - name: doctor --fix (needs the manager to keep, and repairs only that one)
+        run: |
+          code=0; brew-ports doctor --fix --dry-run 2> doctor.none.txt || code=$?
+          cat doctor.none.txt
+          test "$code" -eq 2
+          grep -q 'add --target brew for Homebrew at .* or --target ports for MacPorts at /opt/local' doctor.none.txt
+          code=0; brew-ports doctor --fix --dry-run --target brew > doctor.dry.txt || code=$?
           cat doctor.dry.txt
           test "$code" -le 1
           grep -q '^Checked ' doctor.dry.txt
+          grep -q '^The installation you keep: Homebrew at ' doctor.dry.txt
           grep -q '^Dry run: nothing changes\.$' doctor.dry.txt
           if [ "$code" -eq 1 ]; then tail -n 1 doctor.dry.txt | grep -q '^Exit status 1: '; fi
+      - name: doctor --target (jq and wget are installed twice, which is broken)
+        run: |
+          code=0; brew-ports doctor --target brew > doctor.brew.txt || code=$?
+          cat doctor.brew.txt
+          test "$code" -eq 1
+          grep -Eq '^  [0-9]+ packages? of MacPorts at /opt/local (is|are) installed in Homebrew at ' doctor.brew.txt
+          grep -q 'Fix: brew-ports plan --target brew (plans the move out of MacPorts at /opt/local' doctor.brew.txt
+          tail -n 1 doctor.brew.txt | grep -q '^Exit status 1: '
       - name: doctor --json (exit 1 exactly when a finding stops a move or is broken)
         run: |
           code=0; brew-ports doctor --json > doctor.out.json || code=$?

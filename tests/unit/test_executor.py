@@ -433,7 +433,8 @@ class PreflightTest(ApplyTest):
         self.assertEqual(self.apply(stop_after=0), executor.EXIT_PREFLIGHT)
         self.assertIn("this stops the move: system-low-disk-space title", self.out)
 
-    def test_undrivable_source_names_the_repair(self):
+    def test_an_old_installation_that_cannot_run_needs_a_new_plan(self):
+        """`doctor --fix` repairs only the installation that stays, so it is not named for the one that goes"""
         self.scenario_brew()
         self.source.drivable = False
         self.source.usability = model.Usability.DAMAGED_REGISTRY
@@ -441,7 +442,27 @@ class PreflightTest(ApplyTest):
         self.issues[0].confirm_each = True
         self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
         self.assertIn(f"brew-ports: MacPorts at {self.source.prefix}: its `port` command cannot run\n"
-                      "  `brew-ports doctor --fix` can repair it; make a new plan with `brew-ports plan` afterwards.\n",
+                      "  `brew-ports doctor --target brew` says what is wrong with it, and what a move out of it can "
+                      "still do; make a new plan with `brew-ports plan` afterwards.\n", self.out)
+        self.assertNotIn("doctor --fix", self.out)
+
+    def test_a_target_that_cannot_run_names_its_repair(self):
+        self.scenario_brew()
+        self.target.drivable = False
+        self.issues = [self.issue("brew-unusable-or-dirty", self.target.prefix, ())]
+        self.issues[0].confirm_each = True
+        self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
+        self.assertIn(f"brew-ports: Homebrew at {self.target.prefix}: its `brew` command cannot run\n"
+                      "  `brew-ports doctor --fix --target brew` can repair it; make a new plan with `brew-ports "
+                      "plan` afterwards.\n", self.out)
+
+    def test_a_fix_of_what_stops_the_move_names_the_target(self):
+        self.scenario_brew()
+        self.issues = [self.issue("brew-unusable-or-dirty", self.target.prefix, (Blocks.TARGET,))]
+        self.issues[0].confirm_each = True
+        self.issues[0].remedies[0].manual = False
+        self.assertEqual(self.apply(), executor.EXIT_PREFLIGHT)
+        self.assertIn("\n  After `brew-ports doctor --fix --target brew`, make a new plan with `brew-ports plan`.\n",
                       self.out)
 
     def test_a_refused_homebrew_target_exits_3(self):

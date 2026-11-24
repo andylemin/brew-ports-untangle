@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from . import doctor_report, env, envclean, model, progress, scan, servicectl, snapshot, state, system
+from . import doctor_report, doctor_target, env, envclean, model, progress, scan, servicectl, snapshot, state, system
 from .context import Context
 from .env import interpreters as env_interpreters, linkage as env_linkage, shell as env_shell
 from .homebrew import actions as brew_actions, inventory as brew_inventory, locate as brew_locate
@@ -25,6 +25,7 @@ from .runner import ActionFailed, BaseRunner, EscalationFailed, Interrupted, Pre
 # The exit codes of cli.py.
 EXIT_OK = 0
 EXIT_FINDINGS = 1
+EXIT_USAGE = 2
 EXIT_PREFLIGHT = 3
 EXIT_ACTION = 4
 
@@ -392,8 +393,10 @@ def _shadowed_commands(host: _Host) -> list[Issue]:
     return [_issue("env-shadowed-commands", Severity.MEDIUM, f"{counted(len(shadowed), 'command')} "
                    f"{'exists' if len(shadowed) == 1 else 'exist'} in more than one installation", None, None,
                    evidence=evidence,
-                   remedies=[note("env-shadowed-commands", None, "Nothing to do: after a move, the installation you "
-                                  "keep comes first on your PATH.")])]
+                   remedies=[note("env-shadowed-commands", None, "While a command exists twice, typing it finds only "
+                                  "one copy. Fix: move into one installation (`brew-ports recommend`, then "
+                                  "`brew-ports plan`); the move uninstalls the other copy of each package it "
+                                  "moves.")])]
 
 
 def cross_reference(ref: dict[str, Any], owner_prefix: str | None, index: env.PrefixIndex) -> bool:
@@ -1058,11 +1061,13 @@ def blocking(issues: Iterable[Issue], plan_context: PlanContext) -> list[Issue]:
     return out
 
 
-def blocked_by_lines(found: Sequence[Issue], instances: Sequence[Instance]) -> list[str]:
+def blocked_by_lines(found: Sequence[Issue], instances: Sequence[Instance],
+                     target: Instance | None = None) -> list[str]:
     """Return a line for each finding that stops the move, with what was found and how to fix it
 
     @param found      the blocking findings
     @param instances  the installations of the scan the findings come from
+    @param target     the installation the packages move into, which is the one `doctor --fix` repairs
     @returns          the lines; the evidence and the remedies are indented under their finding
     """
     by_prefix = doctor_report.known(instances)
@@ -1073,7 +1078,8 @@ def blocked_by_lines(found: Sequence[Issue], instances: Sequence[Instance]) -> l
         more = len(issue.evidence) - EVIDENCE_SHOWN
         if more > 0:
             lines.append(f"    and {counted(more, 'more line')} (`brew-ports doctor --verbose` shows them)")
-        lines.extend(f"    {line}" for line in doctor_report.fix_lines(issue, doctor_report.refused(issue, found)))
+        lines.extend(f"    {line}" for line in doctor_report.fix_lines(
+            issue, doctor_report.refused(issue, found), doctor_report.fix_offer(issue, by_prefix, target)))
     return lines
 
 
@@ -1157,6 +1163,16 @@ def findings_exit(issues: Sequence[Issue]) -> int:
     return EXIT_FINDINGS if doctor_report.problems(issues) else EXIT_OK
 
 
+def duplicates() -> Any:
+    """Return the module that finds the packages installed twice, imported on first use
+
+    It imports the planner's modules, which import this one.
+
+    @returns  `brew_ports.duplicates`
+    """
+    return importlib.import_module("brew_ports.duplicates")
+
+
 # --fix -------------------------------------------------------------------------------
 
 class _Stopped(Exception):
@@ -1206,10 +1222,12 @@ def _brew_owner(prefix: str, path: str) -> tuple[str, str] | None:
 class _Fixer:
     """`doctor --fix`: the `auto_fix` remedies behind one question, then each `confirm_each` one by one
 
-    A finding about a package that an earlier remedy of the run changed is skipped, and the output says so.
+    Only the installation that stays is repaired. A finding about a package that an earlier remedy of the run
+    changed is skipped, and the output says so.
     """
 
-    def __init__(self, ctx: Context, runner, run_dir: state.RunDir, bundle, issues: Sequence[Issue]) -> None:
+    def __init__(self, ctx: Context, runner, run_dir: state.RunDir, bundle, issues: Sequence[Issue], *,
+                 target: Instance | None = None, doubles: Sequence[Any] = ()) -> None:
         """Prepare a `--fix` run over the report's findings
 
         @param ctx      the command context: the arguments, the console, the prompts and the state
@@ -1217,6 +1235,9 @@ class _Fixer:
         @param run_dir  the run's directory, for the snapshots and the journal
         @param bundle   the scan
         @param issues   the report's findings
+        @param target   the installation that stays; None on a Mac without one
+        @param doubles  the packages of the other installations that the target has too, as `duplicates.find`
+                        gives them
         """
         self.ctx: Context = ctx
         self.runner = runner
@@ -1224,6 +1245,14 @@ class _Fixer:
         self.bundle = bundle
         self.issues = list(issues)
         self.instances = {inst.prefix: inst for inst in bundle.result.instances}
+        self.target = target
+        # The options that name the target, for the commands the output tells the user to run next.
+        self.chosen = doctor_report.keeps(target, self.instances) if target is not None else ""
+        kind = "formula" if target is not None and target.manager is Manager.BREW else "port"
+        self.copies: dict[tuple[str, str], list[Any]] = {}      # a package of the target -> its copies elsewhere
+        for double in doubles:
+            self.copies.setdefault((kind, name_key(kind, double.kept)), []).append(double)
+        self.warned: list[Any] = []                             # the copies a fix of this run has named
         uid = bundle.result.system.get("uid")
         self.uid = uid if isinstance(uid, int) else os.getuid()
         self.dry_run = ctx.args.dry_run
@@ -1440,7 +1469,7 @@ class _Fixer:
         self.say()
         self.say(f"Skipped: {self.named(issue)}")
         self.say(f"  An earlier fix of this run changed {what}, so this finding may be out of date. `brew-ports "
-                 "doctor` checks again.")
+                 f"doctor{self.chosen}` checks again.")
         return True
 
     # Prompts -------------------------------------------------------------------
@@ -1483,6 +1512,37 @@ class _Fixer:
         data = sorted({d for s in services for d in s.data_dirs})
         if pair and data:
             lines.append(f"  The data of {pair[1]} is in {series(data)}.")
+        return lines + [f"  {line}" for line in self.copies_of(issue)]
+
+    def copies_of(self, issue: Issue) -> list[str]:
+        """Return the warnings of a repair whose package another installation has too
+
+        While both copies are installed, one of them is broken, so the user is told how to uninstall the other
+        once the repair has worked. A copy is named once in a run. A fix that removes something gets no warning:
+        it may be this copy that goes.
+
+        @param issue  a finding about the installation that stays
+        @returns      a line per copy elsewhere: where it is, and the command that uninstalls it or the move that
+                      does
+        """
+        if self.target is None or not self.copies or needs_terminal_answer(issue):
+            return []
+        catalogue = self.bundle.catalogue(self.target.prefix) if self.target.manager is Manager.BREW else None
+        mine: list[tuple[str, str]] = []
+        for prefix, kind, key in sorted(self.packages_of(issue)):
+            if prefix == self.target.prefix:
+                # A formula that Homebrew renamed is installed under its old name and listed under its new one.
+                current = catalogue.canonical(key) if catalogue is not None and kind == "formula" else None
+                mine += [(kind, name) for name in (key, current) if name and (kind, name) not in mine]
+        lines = []
+        for double in [d for key in mine for d in self.copies.get(key, [])]:
+            if any(double is seen for seen in self.warned):
+                continue
+            self.warned.append(double)
+            reasons = double.reasons()
+            step = (duplicates().move_out(self.chosen, double.other) if reasons
+                    else duplicates().uninstall(double, self.runner.host_arch))
+            lines.append(doctor_report.copy(double.kept, double.name, double.other, reasons, step))
         return lines
 
     def ask(self, issue: Issue) -> bool:
@@ -1684,17 +1744,42 @@ class _Fixer:
 
     # The run -------------------------------------------------------------------
 
+    def kept(self, issue: Issue) -> bool:
+        """Return whether a finding is about the installation that stays, or about none
+
+        @param issue  a finding
+        @returns      True when `--fix` may repair what it is about
+        """
+        return doctor_report.in_kept(issue, self.target, self.instances)
+
+    def asked_each(self, issue: Issue) -> bool:
+        """Return whether a finding has a fix that takes an answer of its own
+
+        @param issue  a finding
+        @returns      True for a `confirm_each` finding with a command to run, or with a manager repair
+        """
+        return issue.confirm_each and not issue.auto_fix and bool(_runnable(issue) or self.is_manager_repair(issue))
+
+    def elsewhere(self) -> list[str]:
+        """Return the lines about the installations that the user moves out of, where `--fix` repairs nothing
+
+        @returns  how many of their fixes are left out, and what there stops the move or a part of it
+        """
+        others = [i for i in self.issues if not self.kept(i)]
+        fixes = [i for i in others if (i.auto_fix and _runnable(i)) or self.asked_each(i)]
+        return doctor_report.elsewhere(fixes, [i for i in others if doctor_report.stops(i)], self.instances,
+                                       self.chosen)
+
     def candidates(self) -> tuple[list[Issue], list[Issue], list[Issue]]:
         """Return the fixes `--fix` makes after one answer for them all, and those it asks about one by one
 
         A single fix of the first kind is asked about like the others.
 
         @returns  both lists, ordered, and the findings whose brew remedy `brew-env-override` refuses, which are in
-                  neither
+                  neither; all are about the installation that stays, or about none
         """
-        auto = [i for i in self.issues if i.auto_fix and _runnable(i)]
-        each = [i for i in self.issues if i.confirm_each and not i.auto_fix
-                and (_runnable(i) or self.is_manager_repair(i))]
+        auto = [i for i in self.issues if i.auto_fix and _runnable(i) and self.kept(i)]
+        each = [i for i in self.issues if self.asked_each(i) and self.kept(i)]
         kept_auto, kept_each, refused = [], [], []
         for issue in auto + each:
             if self.refused(issue):
@@ -1715,7 +1800,8 @@ class _Fixer:
         """
         if auto:
             self.say()
-            for line in doctor_report.together(auto, self.instances, False, self.ctx.yes):
+            notes = [self.copies_of(issue) for issue in auto]
+            for line in doctor_report.together(auto, self.instances, False, self.ctx.yes, notes):
                 self.say(line)
         for issue in each:
             self.say()
@@ -1734,14 +1820,17 @@ class _Fixer:
         asked = self.ctx.tty and not self.ctx.yes
         self.say()
         if not self.ctx.yes:
-            for line in doctor_report.together(auto, self.instances, asked):
+            notes = [self.copies_of(issue) for issue in auto]
+            for line in doctor_report.together(auto, self.instances, asked, notes=notes):
                 self.say(line)
         if not self.ctx.confirm(doctor_report.QUESTIONS % len(auto), default=False):
             return
         for issue in auto:
             if not self.skipped(issue):
                 if not asked:
-                    self.say(self.named(issue))
+                    # Under --yes the list above is not printed, so what it says of each fix goes here.
+                    for line in [self.named(issue)] + [f"  {line}" for line in self.copies_of(issue)]:
+                        self.say(line)
                 self.apply(issue)
 
     def one_by_one(self, each: Sequence[Issue]) -> None:
@@ -1772,17 +1861,19 @@ class _Fixer:
         @throws PreflightError  sudo caches no credentials for a remedy that escalates
         """
         auto, each, refused = self.candidates()
+        aside = doctor_report.not_offered(refused, self.instances) + self.elsewhere()
         if self.dry_run:
             self.say(doctor_report.DRY_RUN)
         if not auto and not each:
-            self.say(doctor_report.NOTHING_TO_FIX)
-            for line in doctor_report.not_offered(refused, self.instances) + doctor_report.unchanged(self.issues):
+            self.say(doctor_report.nothing_to_fix(self.target, self.chosen))
+            for line in aside + doctor_report.unchanged(self.issues):
                 self.say(line)
             return None
         # Without a terminal and without --yes no fix is made, so no password is asked for.
         sudo = self.needs_sudo(auto + each) and (self.ctx.tty or self.ctx.yes)
-        opening = doctor_report.fix_opening(len(auto) + len(each), sudo, self.dry_run, self.ctx.yes, self.ctx.tty)
-        for line in opening + doctor_report.not_offered(refused, self.instances):
+        opening = doctor_report.fix_opening(len(auto) + len(each), sudo, self.dry_run, self.ctx.yes, self.ctx.tty,
+                                            chosen=self.chosen)
+        for line in opening + aside:
             self.say(line)
         if self.dry_run:
             self.listed(auto, each)
@@ -1800,12 +1891,12 @@ class _Fixer:
         except _Stopped as exc:
             self.ctx.console.error(str(exc))
             undo = self.run_dir.run_id if self.snapshotted else None
-            for line in doctor_report.fix_stopped(tilde(self.run_dir.path), len(self.fixed), undo):
+            for line in doctor_report.fix_stopped(tilde(self.run_dir.path), len(self.fixed), undo, self.chosen):
                 self.ctx.console.warn(line)
             return EXIT_ACTION
         left = [i for i in self.issues if id(i) not in self.fixed and id(i) not in self.superseded]
         undo = self.run_dir.run_id if self.snapshotted else None
-        for line in doctor_report.fix_closing(len(self.fixed), left, undo):
+        for line in doctor_report.fix_closing(len(self.fixed), left, undo, self.chosen):
             self.say(line)
         return EXIT_FINDINGS if doctor_report.problems(left) else EXIT_OK
 
@@ -1829,14 +1920,21 @@ class _Fixer:
 
 # The command -------------------------------------------------------------------------
 
-def _report(ctx: Context, runner, run_dir: state.RunDir, bundle, reused: bool) -> list[Issue]:
+def _report(ctx: Context, runner, run_dir: state.RunDir, bundle, reused: bool, *,
+            target: Instance | None = None, doubles: Sequence[Any] | None = ()) -> list[Issue]:
     """Detect every finding, write `doctor.json` and print the report, as text or under `--json`
+
+    With a target, the findings are weighed for the move into it, and its packages that another installation
+    has too are findings of their own.
 
     @param ctx      the command context
     @param runner   the runner the detectors probe through
     @param run_dir  the run's directory, which receives `doctor.json`
     @param bundle   the scan
     @param reused   whether the scan is a recent one reused, whose requirements files this run writes again
+    @param target   the installation that stays, on a Mac with several; None without that choice
+    @param doubles  the packages of the other installations that the target has too; None when they could not
+                    be looked for, which the report then lists among the checks that could not run
     @returns        the findings, sorted
     """
     if reused:
@@ -1849,21 +1947,31 @@ def _report(ctx: Context, runner, run_dir: state.RunDir, bundle, reused: bool) -
     instances = bundle.result.instances
     blocks = blocks_apply(issues, instances, host_arch=runner.host_arch, environ=ctx.environ,
                           packages=bundle.result.packages)
+    if target is not None:
+        if doubles is None:
+            bundle.notes.append(doctor_report.TWICE_UNKNOWN % at(target))
+        else:
+            bundle.notes.extend(doctor_report.TWICE_UNREAD % at(inst) for inst in instances
+                                if inst.prefix != target.prefix and not inst.inventory_known)
+        issues = sort_issues(issues + duplicates().findings(doubles or (), target, instances, runner.host_arch))
+        doctor_target.weigh_for(issues, target, instances)
     # The detectors add their notes to the bundle, so both are read after detect_all.
-    result = model.DoctorResult(created=state.now_iso(), issues=issues, blocks_apply=blocks, notes=list(bundle.notes))
+    result = model.DoctorResult(created=state.now_iso(), issues=issues, blocks_apply=blocks, notes=list(bundle.notes),
+                                target_prefix=target.prefix if target is not None else None)
     data = model.to_plain(result)
     run_dir.write_json("doctor.json", model.to_json(data))
+    keeping = [doctor_report.keeping(target)] if target is not None else []
     if ctx.args.json:
         if reused:
             ctx.console.info(SCAN_REUSED)
         ctx.console.json(data)
     elif ctx.args.fix or ctx.args.dry_run:
-        for line in [doctor_report.checked(instances)] + ([SCAN_REUSED] if reused else []):
+        for line in [doctor_report.checked(instances)] + keeping + ([SCAN_REUSED] if reused else []):
             ctx.console.out(line)
     else:
         lines = doctor_report.render(issues, instances, bundle.notes[len(scan_notes):], reused=reused,
-                                     verbose=ctx.console.verbose, scan_notes=scan_notes)
-        for line in lines + doctor_report.closing(issues, len(instances) > 1):
+                                     verbose=ctx.console.verbose, scan_notes=scan_notes, target=target)
+        for line in lines + doctor_report.closing(issues, instances, target):
             ctx.console.out(line)
     return issues
 
@@ -1872,6 +1980,7 @@ def cmd_doctor(ctx: Context, make_runner: Callable[[Context, state.RunDir], Base
     """Run `brew-ports doctor`: the scan, `doctor.json`, the report, then `--fix` or `--dry-run`
 
     A scan younger than ten minutes is reused unless a mutating command ran since or `--rescan` or `--deep` is given.
+    On a Mac with several installations, `--fix` repairs the one that `--target` names and stops without it.
 
     @param ctx          the command context
     @param make_runner  makes the run's runner from the context and the run directory; None for the command runner
@@ -1884,12 +1993,24 @@ def cmd_doctor(ctx: Context, make_runner: Callable[[Context, state.RunDir], Base
         bundle, reused = scan.obtain(ctx.state, run_dir, runner, ctx.environ, rescan=args.rescan or args.deep,
                                      deep=args.deep)
         try:
-            issues = _report(ctx, runner, run_dir, bundle, reused)
+            instances = bundle.result.instances
+            try:
+                target = doctor_target.kept_instance(args, instances, runner.host_arch, ctx.environ)
+            except doctor_target.NoTarget as exc:
+                ctx.console.error(str(exc))
+                return EXIT_USAGE if exc.usage else EXIT_PREFLIGHT
+            # On a Mac with one installation there is no other to weigh it against.
+            chosen = target if len(instances) > 1 else None
+            doubles = None
+            if chosen is not None:
+                progress.step("packages that are installed twice")
+                doubles = duplicates().find(bundle, chosen)
+            issues = _report(ctx, runner, run_dir, bundle, reused, target=chosen, doubles=doubles)
             code = findings_exit(issues)
             if not (args.fix or args.dry_run):
                 return code
             try:
-                fixed = _Fixer(ctx, runner, run_dir, bundle, issues).run()
+                fixed = _Fixer(ctx, runner, run_dir, bundle, issues, target=target, doubles=doubles or ()).run()
             except PreflightError as exc:
                 ctx.console.error(str(exc))
                 return EXIT_PREFLIGHT

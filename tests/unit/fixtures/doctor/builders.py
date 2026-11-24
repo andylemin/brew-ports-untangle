@@ -275,7 +275,7 @@ def args(**kw: Any) -> argparse.Namespace:
     @returns   the namespace
     """
     values: dict[str, Any] = {"command": "doctor", "json": False, "deep": False, "rescan": False, "fix": False,
-                              "yes": False, "dry_run": False}
+                              "target": None, "target_prefix": None, "yes": False, "dry_run": False}
     values.update(kw)
     return argparse.Namespace(**values)
 

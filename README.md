@@ -87,6 +87,7 @@ A typical session migrates MacPorts packages to Homebrew, with the release's
 ```sh
 brew-ports doctor                                   # health of both managers
 brew-ports recommend                                # which manager to keep
+brew-ports doctor --fix --target brew               # repair the one you keep
 brew-ports plan --target brew --out plan.json       # what will be installed, kept and removed
 brew-ports apply plan.json --dry-run                # every command, nothing run
 brew-ports apply plan.json                          # confirm each phase as it runs
@@ -100,7 +101,7 @@ brew-ports has nine commands:
 | Command | What it does |
 | --- | --- |
 | `scan` | Inventory every prefix: packages, services, taps, shell setup, cross-prefix linkage, language packages. |
-| `doctor [--fix]` | Health checks for both managers. `--fix` offers the fixes it can make and asks before each. |
+| `doctor [--fix] [--target brew\|ports]` | Health checks for both managers. `--fix` offers the fixes it can make and asks before each. On a Mac with more than one installation, `--fix` needs `--target` and repairs only the installation you keep. |
 | `recommend` | Score both directions by package coverage, casks, bottles, services, and work, and recommend one. |
 | `bootstrap-ports` | Install MacPorts from its signed installer package on a Mac without it. |
 | `plan --target brew\|ports` | Find a replacement for each package you installed yourself, ask about the uncertain ones, and write `plan.json`. |
@@ -244,6 +245,27 @@ to do: a line that starts with `Fix:`, one that says there is nothing to do,
 or one that says why brew-ports offers no fix. `Fix: brew-ports doctor --fix`
 marks a fix that `doctor --fix` makes for you, after it asks. Checks that
 could not run come last.
+
+On a Mac with more than one installation, `doctor --fix` repairs only the one
+you keep. Name it with `--target brew` or `--target ports`, and with
+`--target-prefix PATH` where the Mac has two of that manager; without
+`--target`, `doctor --fix` stops and names the options. Until you choose, the
+line of such a fix says which installation it is for: `Fix, if you keep
+MacPorts at /opt/local: brew-ports doctor --fix --target ports`. In another
+installation `doctor --fix` repairs nothing; it counts the fixes it leaves out
+and names what there stops the move.
+
+With `--target`, each finding says what it stops for the move into that
+installation, and a finding about another installation says that no fix is
+offered. The report also lists, under `Broken or at risk`, the packages of the
+other installations that the one you keep has too. While a package is
+installed twice, one copy is broken: typing its command or building with it
+finds only one of the two. `plan --target` plans the move that uninstalls the
+other copies, except those that a package staying there still needs. Where a
+copy can go alone, the finding gives the command for one of them. When
+`doctor --fix` offers to repair such a package, it says where the other copy
+is and how to uninstall it once the repair has worked. A fix that only removes
+something says nothing of the kind.
 
 `doctor` exits 1 only when a finding is in one of the first two groups.
 

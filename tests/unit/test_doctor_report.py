@@ -39,8 +39,10 @@ class ReportTest(unittest.TestCase):
         lines = doctor_report.render([], BOTH, reused=True)
         self.assertEqual(lines[1:], ["Using the scan taken in the last ten minutes (--rescan takes a new one).", "",
                                      "No problems found."])
-        self.assertEqual(doctor_report.closing([], True), ["", "Next: brew-ports recommend"])
-        self.assertEqual(doctor_report.closing([], False), [])
+        self.assertEqual(doctor_report.closing([], BOTH), ["", "Next: brew-ports recommend"])
+        self.assertEqual(doctor_report.closing([], [BREW]), [])
+        # Once the installation to keep is chosen, the plan of the move into it comes next.
+        self.assertEqual(doctor_report.closing([], BOTH, PORTS), ["", "Next: brew-ports plan --target ports"])
 
     def test_the_answer_comes_second_and_counts_the_rest(self):
         found = [issue("env-dead-path-entries", Severity.LOW, "Your PATH lists 2 folders that do not exist"),
@@ -68,9 +70,11 @@ class ReportTest(unittest.TestCase):
             "      This stops a move out of MacPorts at /opt/local and uninstalling MacPorts at /opt/local itself.",
             "  brew-ports runs from inside Homebrew",
             "      This stops every move."])
-        self.assertEqual(doctor_report.closing(found, True), [
+        self.assertEqual(doctor_report.closing(found, BOTH), [
             "", "Next: fix what is listed first, then brew-ports doctor",
             "Exit status 1: something needs a fix before a move, or is broken."])
+        self.assertEqual(doctor_report.closing(found, BOTH, BREW)[1],
+                         "Next: fix what is listed first, then brew-ports doctor --target brew")
         self.assertEqual(doctor.findings_exit(found), 1)
 
     def test_the_answer_says_what_is_stopped_when_it_is_one_thing(self):
@@ -89,7 +93,37 @@ class ReportTest(unittest.TestCase):
         low = [issue("env-dead-path-entries", Severity.LOW, "x"), issue("env-shadowed-commands", Severity.MEDIUM, "y")]
         self.assertEqual(doctor.findings_exit(low), 0)
         self.assertEqual(doctor.findings_exit(low + [issue("env-login-shell", Severity.HIGH, "z")]), 1)
-        self.assertEqual(doctor_report.closing(low, True), ["", "Next: brew-ports recommend"])
+        self.assertEqual(doctor_report.closing(low, BOTH), ["", "Next: brew-ports recommend"])
+
+    def test_a_mac_with_two_managers_chooses_before_it_fixes(self):
+        """`doctor --fix` repairs the installation that stays, so each one with fixes gets the command for them"""
+        found = [issue(code, Severity.LOW, "t", "jq", prefix, confirm_each=True,
+                       remedies=[FindingTest.delete("/x/" + code)])
+                 for code, prefix in (("brew-x", BREW.prefix), ("ports-x", PORTS.prefix), ("ports-y", PORTS.prefix))]
+        self.assertEqual(doctor_report.closing(found, BOTH), [
+            "", "Next: brew-ports recommend   (it compares a move in each direction)",
+            "Then the fixes of the installation you keep:",
+            "  Homebrew at /opt/homebrew: brew-ports doctor --fix --target brew   (it offers 1 fix)",
+            "  MacPorts at /opt/local: brew-ports doctor --fix --target ports   (it offers 2 fixes)"])
+        self.assertEqual(doctor_report.closing(found, BOTH, PORTS),
+                         ["", "Next: brew-ports doctor --fix --target ports   (it offers 2 fixes)"])
+        self.assertEqual(doctor_report.closing(found[:1], [BREW]),
+                         ["", "Next: brew-ports doctor --fix   (it offers 1 fix)"])
+
+    def test_two_of_a_manager_are_told_apart_by_their_folder(self):
+        intel = make_instance(Manager.BREW, "/usr/local", version="5.0.2", arch="x86_64")
+        three = doctor_report.known([BREW, intel, PORTS])
+        self.assertEqual([doctor_report.keeps(inst, three) for inst in three.values()], [
+            " --target brew --target-prefix /opt/homebrew", " --target brew --target-prefix /usr/local",
+            " --target ports"])
+        self.assertEqual(doctor_report.keeps(BREW, doctor_report.known([BREW])), "")
+        # A finding about no installation gets its fix whichever stays, so its command names one of them.
+        self.assertEqual(doctor_report.fix_command(issue("env-x", Severity.LOW, "t"), doctor_report.known(BOTH)),
+                         "brew-ports doctor --fix --target brew")
+
+    def test_the_report_names_the_installation_that_stays(self):
+        lines = doctor_report.render([], BOTH, target=PORTS)
+        self.assertEqual(lines[1:], ["The installation you keep: MacPorts at /opt/local.", "", "No problems found."])
 
     def test_checks_that_could_not_run_are_listed_last(self):
         unrun = "How much disk space MacPorts at /opt/local uses: `du` gave no sizes"
@@ -208,9 +242,16 @@ class FindingTest(unittest.TestCase):
                   for name in ("node", "vim")]
         self.assertEqual(doctor_report.render(found, BOTH)[5:], [
             "  2 formulae have more than one version installed: jq, wget",
-            "      Fix: brew-ports doctor --fix (asks about each)",
+            "      Fix, if you keep Homebrew at /opt/homebrew: brew-ports doctor --fix --target brew (asks about each)",
             "  2 formulae have more than one version installed: node, vim",
             "      Nothing to do."])
+        # Once the user has said which installation stays, the condition is met or the fix is not offered.
+        self.assertEqual(doctor_report.render(found, BOTH, target=BREW)[7],
+                         "      Fix: brew-ports doctor --fix --target brew (asks about each)")
+        self.assertEqual(doctor_report.render(found, BOTH, target=PORTS)[7],
+                         "      No fix offered: doctor --fix repairs only the installation you keep.")
+        # On a Mac with one installation there is nothing to choose, so the command names none.
+        self.assertIn("      Fix: brew-ports doctor --fix (asks about each)", doctor_report.render(found, [BREW]))
         # Two findings about one formula count that formula once, in the singular.
         self.assertEqual(doctor_report.several(found[:2]), [
             "  1 formula has more than one version installed: jq",
@@ -224,9 +265,16 @@ class FindingTest(unittest.TestCase):
                  for path in ("/opt/local/bin/a", "/opt/local/bin/b")]
         self.assertEqual((doctor_report.fix_lines(found[0]), doctor_report.does(found[0])),
                          ([f"Fix: brew-ports doctor --fix (asks, then {says})"], says))
+        if_kept = "Fix, if you keep MacPorts at /opt/local: brew-ports doctor --fix --target ports"
         self.assertEqual(doctor_report.render(found, BOTH)[5:], [
             "  2 files were not installed by any port: bin/a, bin/b",
-            f"      Fix: brew-ports doctor --fix (asks about each, then {says})"])
+            f"      {if_kept} (asks about each, then {says})"])
+        by_prefix = doctor_report.known(BOTH)
+        fix = [doctor_report.finding(found[0], by_prefix, target=target)[1] for target in (None, PORTS, BREW)]
+        self.assertEqual(fix, [
+            f"      {if_kept} (asks, then {says})",
+            f"      Fix: brew-ports doctor --fix --target ports (asks, then {says})",
+            "      No fix offered: doctor --fix repairs only the installation you keep."])
 
 
 class FixTest(unittest.TestCase):
@@ -286,6 +334,9 @@ class FixTest(unittest.TestCase):
                          ["These 2 fixes take one answer:"] + listed + ["  y makes them; n changes nothing."])
         self.assertEqual(doctor_report.together([self.reinstall] * 2, one, False, True),
                          ["With --yes, these 2 fixes are made without a question:"] + listed)
+        # What else there is to know about one of them goes under that one.
+        noted = doctor_report.together([self.reinstall] * 2, one, False, notes=[["jq is also installed there."], []])
+        self.assertEqual(noted[1:], listed[:2] + ["      jq is also installed there."] + listed[2:])
 
     def test_the_last_lines_say_what_was_done_and_what_is_next(self):
         undo = "If a fix of this run uninstalled something you want back: brew-ports rollback 20261123-1"
@@ -298,6 +349,9 @@ class FixTest(unittest.TestCase):
                    "  The fix made before it stays. Fix the cause, then run `brew-ports doctor --fix` again."]
         self.assertEqual(doctor_report.fix_stopped("~/runs/1", 1), stopped)
         self.assertEqual(doctor_report.fix_stopped("~/runs/1", 1, "20261123-1"), stopped + ["  " + undo])
+        # On a Mac with several installations, the command to run again names the one that stays.
+        self.assertEqual(doctor_report.fix_stopped("~/runs/1", 0, None, " --target ports")[1],
+                         "  Fix the cause, then run `brew-ports doctor --fix --target ports` again.")
 
     def test_env_cleanup_is_the_fix_only_for_what_it_keeps(self):
         by_hand = "Fix, if this is the Homebrew you keep: put %s/bin in front of /usr/bin in your shell's login file."
